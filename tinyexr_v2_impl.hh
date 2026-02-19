@@ -521,48 +521,116 @@ static inline uint16_t LogToHalf(uint16_t log_val) {
   return g_b44_log_table[log_val & 0x3FFF];
 }
 
-// Unpack one 4x4 block from B44 compressed data
+// Unpack one 4x4 block from B44 compressed 14 bytes (matches OpenEXR unpack14)
 static void UnpackB44Block(uint16_t dst[16], const uint8_t src[14]) {
-  // B44 packs 16 half values into 14 bytes using log-space delta encoding
-  // Format: 2 bytes base (14-bit log) + 12 bytes for 15 6-bit deltas (90 bits)
+  // Extract t[0] (stored as ordered-magnitude value)
+  uint16_t s0 = (static_cast<uint16_t>(src[0]) << 8) | src[1];
 
-  InitB44Tables();
+  // Extract shift and compute bias
+  uint16_t shift = src[2] >> 2;
+  uint16_t bias = static_cast<uint16_t>(0x20u << shift);
 
-  // Read 14-bit base value (big-endian, packed into 2 bytes)
-  uint16_t base_log = (static_cast<uint16_t>(src[0]) << 8) | src[1];
-  base_log &= 0x3FFF;  // 14-bit mask
+  // Reconstruct t values using running differences
+  // Pattern: s[0]->s[4]->s[8]->s[12], then s[0]->s[1], s[4]->s[5], etc.
 
-  // First pixel uses base directly
-  dst[0] = LogToHalf(base_log);
+  uint16_t s4 = static_cast<uint16_t>(
+    static_cast<uint32_t>(s0) +
+    static_cast<uint32_t>(((static_cast<uint32_t>(src[2]) << 4) |
+                           (static_cast<uint32_t>(src[3]) >> 4)) & 0x3fu) * (1u << shift) - bias);
 
-  // Decode the 15 6-bit deltas from remaining 12 bytes
-  const uint8_t* delta_ptr = src + 2;
-  int bit_pos = 0;
+  uint16_t s8 = static_cast<uint16_t>(
+    static_cast<uint32_t>(s4) +
+    static_cast<uint32_t>(((static_cast<uint32_t>(src[3]) << 2) |
+                           (static_cast<uint32_t>(src[4]) >> 6)) & 0x3fu) * (1u << shift) - bias);
 
-  for (int i = 1; i < 16; i++) {
-    int byte_idx = bit_pos / 8;
-    int bit_offset = bit_pos % 8;
+  uint16_t s12 = static_cast<uint16_t>(
+    static_cast<uint32_t>(s8) +
+    static_cast<uint32_t>(src[4] & 0x3fu) * (1u << shift) - bias);
 
-    // Read 6 bits spanning potentially 2 bytes
-    uint32_t bits = delta_ptr[byte_idx];
-    if (byte_idx + 1 < 12) {
-      bits |= (static_cast<uint32_t>(delta_ptr[byte_idx + 1]) << 8);
+  uint16_t s1 = static_cast<uint16_t>(
+    static_cast<uint32_t>(s0) +
+    static_cast<uint32_t>(src[5] >> 2) * (1u << shift) - bias);
+
+  uint16_t s5 = static_cast<uint16_t>(
+    static_cast<uint32_t>(s4) +
+    static_cast<uint32_t>(((static_cast<uint32_t>(src[5]) << 4) |
+                           (static_cast<uint32_t>(src[6]) >> 4)) & 0x3fu) * (1u << shift) - bias);
+
+  uint16_t s9 = static_cast<uint16_t>(
+    static_cast<uint32_t>(s8) +
+    static_cast<uint32_t>(((static_cast<uint32_t>(src[6]) << 2) |
+                           (static_cast<uint32_t>(src[7]) >> 6)) & 0x3fu) * (1u << shift) - bias);
+
+  uint16_t s13 = static_cast<uint16_t>(
+    static_cast<uint32_t>(s12) +
+    static_cast<uint32_t>(src[7] & 0x3fu) * (1u << shift) - bias);
+
+  uint16_t s2 = static_cast<uint16_t>(
+    static_cast<uint32_t>(s1) +
+    static_cast<uint32_t>(src[8] >> 2) * (1u << shift) - bias);
+
+  uint16_t s6 = static_cast<uint16_t>(
+    static_cast<uint32_t>(s5) +
+    static_cast<uint32_t>(((static_cast<uint32_t>(src[8]) << 4) |
+                           (static_cast<uint32_t>(src[9]) >> 4)) & 0x3fu) * (1u << shift) - bias);
+
+  uint16_t s10 = static_cast<uint16_t>(
+    static_cast<uint32_t>(s9) +
+    static_cast<uint32_t>(((static_cast<uint32_t>(src[9]) << 2) |
+                           (static_cast<uint32_t>(src[10]) >> 6)) & 0x3fu) * (1u << shift) - bias);
+
+  uint16_t s14 = static_cast<uint16_t>(
+    static_cast<uint32_t>(s13) +
+    static_cast<uint32_t>(src[10] & 0x3fu) * (1u << shift) - bias);
+
+  uint16_t s3 = static_cast<uint16_t>(
+    static_cast<uint32_t>(s2) +
+    static_cast<uint32_t>(src[11] >> 2) * (1u << shift) - bias);
+
+  uint16_t s7 = static_cast<uint16_t>(
+    static_cast<uint32_t>(s6) +
+    static_cast<uint32_t>(((static_cast<uint32_t>(src[11]) << 4) |
+                           (static_cast<uint32_t>(src[12]) >> 4)) & 0x3fu) * (1u << shift) - bias);
+
+  uint16_t s11 = static_cast<uint16_t>(
+    static_cast<uint32_t>(s10) +
+    static_cast<uint32_t>(((static_cast<uint32_t>(src[12]) << 2) |
+                           (static_cast<uint32_t>(src[13]) >> 6)) & 0x3fu) * (1u << shift) - bias);
+
+  uint16_t s15 = static_cast<uint16_t>(
+    static_cast<uint32_t>(s14) +
+    static_cast<uint32_t>(src[13] & 0x3fu) * (1u << shift) - bias);
+
+  // Store t values
+  dst[0] = s0;   dst[1] = s1;   dst[2] = s2;   dst[3] = s3;
+  dst[4] = s4;   dst[5] = s5;   dst[6] = s6;   dst[7] = s7;
+  dst[8] = s8;   dst[9] = s9;   dst[10] = s10; dst[11] = s11;
+  dst[12] = s12; dst[13] = s13; dst[14] = s14; dst[15] = s15;
+
+  // Convert from ordered-magnitude to half-float
+  for (int i = 0; i < 16; i++) {
+    if (dst[i] & 0x8000) {
+      dst[i] &= 0x7fff;  // Positive: clear sign bit
+    } else {
+      dst[i] = static_cast<uint16_t>(~dst[i]);  // Negative: invert all bits
     }
-    bits >>= bit_offset;
-    bits &= 0x3F;  // 6 bits
+  }
+}
 
-    // Convert 6-bit unsigned to signed delta (-31 to +32)
-    int delta = static_cast<int>(bits) - 31;
+// Unpack a 3-byte flat block (all pixels same value)
+static void UnpackB44FlatBlock(uint16_t dst[16], const uint8_t src[3]) {
+  uint16_t t = (static_cast<uint16_t>(src[0]) << 8) | src[1];
 
-    // Apply delta in log space
-    int result_log = static_cast<int>(base_log) + delta;
-    if (result_log < 0) result_log = 0;
-    if (result_log > 16383) result_log = 16383;
+  // Convert from ordered-magnitude to half-float
+  uint16_t h;
+  if (t & 0x8000) {
+    h = t & 0x7fff;
+  } else {
+    h = static_cast<uint16_t>(~t);
+  }
 
-    // Convert back to half-float
-    dst[i] = LogToHalf(static_cast<uint16_t>(result_log));
-
-    bit_pos += 6;
+  for (int i = 0; i < 16; i++) {
+    dst[i] = h;
   }
 }
 
@@ -639,26 +707,26 @@ static bool DecompressB44V2(uint8_t* dst, size_t expected_size,
       for (int bx = 0; bx < num_blocks_x; bx++) {
         uint16_t block[16];
 
-        if (is_b44a && in_ptr + 3 <= in_end) {
-          // Check for flat block (3 bytes: 1 flag + 2 value)
-          // If flag byte has high bit set, it's a flat block
-          if (in_ptr[0] & 0x80) {
-            uint16_t flat_val = (static_cast<uint16_t>(in_ptr[1]) << 8) | in_ptr[2];
-            for (int i = 0; i < 16; i++) {
-              block[i] = flat_val;
-            }
-            in_ptr += 3;
-          } else if (in_ptr + 14 <= in_end) {
-            UnpackB44Block(block, in_ptr);
-            in_ptr += 14;
-          } else {
-            return false;
-          }
-        } else if (in_ptr + 14 <= in_end) {
+        if (in_ptr + 3 > in_end) return false;
+
+        // Check for flat block (shift >= 13, i.e. in_ptr[2] >= (13 << 2))
+        if (in_ptr[2] >= (13 << 2)) {
+          // 3-byte flat block
+          UnpackB44FlatBlock(block, in_ptr);
+          in_ptr += 3;
+        } else {
+          // Regular 14-byte block
+          if (in_ptr + 14 > in_end) return false;
           UnpackB44Block(block, in_ptr);
           in_ptr += 14;
-        } else {
-          return false;
+        }
+
+        // Apply p_linear conversion (log table) if needed
+        if (channels[c].p_linear) {
+          InitB44Tables();
+          for (int i = 0; i < 16; i++) {
+            block[i] = g_b44_log_table[block[i]];
+          }
         }
 
         // Copy block to temp buffer (with bounds checking for edge blocks)
@@ -694,61 +762,115 @@ static bool DecompressB44V2(uint8_t* dst, size_t expected_size,
   return true;
 }
 
-// Pack 16 half values into a 14-byte B44 block using log-space encoding
-static void PackB44Block(uint8_t dst[14], const uint16_t src[16]) {
-  // B44 format:
-  // - 2 bytes: base value in log-space (big-endian, 14-bit)
-  // - 12 bytes: 15 6-bit deltas (90 bits packed) in log-space
-
-  InitB44Tables();
-
-  // Convert first value to log space and use as base
-  uint16_t base_log = HalfToLog(src[0]);
-  dst[0] = static_cast<uint8_t>(base_log >> 8);
-  dst[1] = static_cast<uint8_t>(base_log & 0xFF);
-
-  // Initialize delta bytes to zero
-  for (int i = 2; i < 14; i++) {
-    dst[i] = 0;
-  }
-
-  // Pack 15 6-bit deltas in log space
-  uint8_t* delta_ptr = dst + 2;
-  int bit_pos = 0;
-
-  for (int i = 1; i < 16; i++) {
-    // Calculate delta in log space (clamped to 6-bit range: -31 to +32)
-    uint16_t val_log = HalfToLog(src[i]);
-    int delta = static_cast<int>(val_log) - static_cast<int>(base_log);
-
-    // Clamp to representable range
-    if (delta < -31) delta = -31;
-    if (delta > 32) delta = 32;
-
-    // Convert signed delta to unsigned 6-bit value (bias by 31)
-    uint32_t bits = static_cast<uint32_t>(delta + 31) & 0x3F;
-
-    // Write 6 bits at current bit position
-    int byte_idx = bit_pos / 8;
-    int bit_offset = bit_pos % 8;
-
-    delta_ptr[byte_idx] |= static_cast<uint8_t>(bits << bit_offset);
-    if (bit_offset > 2 && byte_idx + 1 < 12) {
-      // Bits overflow into next byte
-      delta_ptr[byte_idx + 1] |= static_cast<uint8_t>(bits >> (8 - bit_offset));
-    }
-
-    bit_pos += 6;
-  }
+// Shift and round for B44 pack (matches OpenEXR's shiftAndRound)
+static inline int B44ShiftAndRound(int x, int shift) {
+  // Compute y = x * pow(2, -shift), rounded to nearest integer
+  // In case of a tie, round to the even one
+  x <<= 1;
+  int a = (1 << shift) - 1;
+  shift += 1;
+  int b = (x >> shift) & 1;
+  return (x + a + b) >> shift;
 }
 
-// Check if a 4x4 block has all identical values (for B44A optimization)
-static bool IsB44FlatBlock(const uint16_t src[16]) {
-  uint16_t val = src[0];
-  for (int i = 1; i < 16; i++) {
-    if (src[i] != val) return false;
+// Pack a 4x4 block of HALF values into 14 bytes (matches OpenEXR's pack())
+// Returns the number of bytes written (14 for normal, 3 for flat if flatfields=true)
+static int PackB44Block(uint8_t* out, const uint16_t* block, bool flatfields, bool exactmax) {
+  int d[16];
+  int r[15];
+  int rMin, rMax;
+  uint16_t t[16];
+  uint16_t tMax;
+  int shift = -1;
+
+  const int bias = 0x20;
+
+  // Convert half-float values to ordered-magnitude representation
+  // This ensures that if t[i] > t[j], then half[i] > half[j] as floats
+  for (int i = 0; i < 16; ++i) {
+    if ((block[i] & 0x7c00) == 0x7c00) {
+      t[i] = 0x8000;  // NaN/Inf -> neutral value
+    } else if (block[i] & 0x8000) {
+      t[i] = ~block[i];  // Negative: invert all bits
+    } else {
+      t[i] = block[i] | 0x8000;  // Positive: set sign bit
+    }
   }
-  return true;
+
+  // Find maximum t value
+  tMax = 0;
+  for (int i = 0; i < 16; ++i) {
+    if (tMax < t[i]) tMax = t[i];
+  }
+
+  // Compute running differences and find valid shift
+  do {
+    shift += 1;
+
+    // Compute absolute differences from tMax, shifted and rounded
+    for (int i = 0; i < 16; ++i) {
+      d[i] = B44ShiftAndRound(tMax - t[i], shift);
+    }
+
+    // Convert to running differences (specific pattern for B44)
+    r[0] = d[0] - d[4] + bias;
+    r[1] = d[4] - d[8] + bias;
+    r[2] = d[8] - d[12] + bias;
+
+    r[3] = d[0] - d[1] + bias;
+    r[4] = d[4] - d[5] + bias;
+    r[5] = d[8] - d[9] + bias;
+    r[6] = d[12] - d[13] + bias;
+
+    r[7]  = d[1] - d[2] + bias;
+    r[8]  = d[5] - d[6] + bias;
+    r[9]  = d[9] - d[10] + bias;
+    r[10] = d[13] - d[14] + bias;
+
+    r[11] = d[2] - d[3] + bias;
+    r[12] = d[6] - d[7] + bias;
+    r[13] = d[10] - d[11] + bias;
+    r[14] = d[14] - d[15] + bias;
+
+    rMin = r[0];
+    rMax = r[0];
+    for (int i = 1; i < 15; ++i) {
+      if (rMin > r[i]) rMin = r[i];
+      if (rMax < r[i]) rMax = r[i];
+    }
+  } while (rMin < 0 || rMax > 0x3f);
+
+  // Check for flat block (all pixels same value)
+  if (rMin == bias && rMax == bias && flatfields) {
+    // Encode as 3 bytes: t[0] and marker 0xfc
+    out[0] = static_cast<uint8_t>(t[0] >> 8);
+    out[1] = static_cast<uint8_t>(t[0]);
+    out[2] = 0xfc;  // Flat block marker (shift >= 13)
+    return 3;
+  }
+
+  if (exactmax) {
+    // Adjust t[0] so the max pixel is represented accurately
+    t[0] = tMax - static_cast<uint16_t>(d[0] << shift);
+  }
+
+  // Pack t[0], shift, and r[0]..r[14] into 14 bytes
+  out[0]  = static_cast<uint8_t>(t[0] >> 8);
+  out[1]  = static_cast<uint8_t>(t[0]);
+  out[2]  = static_cast<uint8_t>((shift << 2) | (r[0] >> 4));
+  out[3]  = static_cast<uint8_t>((r[0] << 4) | (r[1] >> 2));
+  out[4]  = static_cast<uint8_t>((r[1] << 6) | r[2]);
+  out[5]  = static_cast<uint8_t>((r[3] << 2) | (r[4] >> 4));
+  out[6]  = static_cast<uint8_t>((r[4] << 4) | (r[5] >> 2));
+  out[7]  = static_cast<uint8_t>((r[5] << 6) | r[6]);
+  out[8]  = static_cast<uint8_t>((r[7] << 2) | (r[8] >> 4));
+  out[9]  = static_cast<uint8_t>((r[8] << 4) | (r[9] >> 2));
+  out[10] = static_cast<uint8_t>((r[9] << 6) | r[10]);
+  out[11] = static_cast<uint8_t>((r[11] << 2) | (r[12] >> 4));
+  out[12] = static_cast<uint8_t>((r[12] << 4) | (r[13] >> 2));
+  out[13] = static_cast<uint8_t>((r[13] << 6) | r[14]);
+
+  return 14;
 }
 
 // Compress data using B44/B44A algorithm
@@ -844,18 +966,10 @@ static bool CompressB44V2(const uint8_t* src, size_t src_size,
           }
         }
 
-        // Check for flat block optimization (B44A only)
-        if (is_b44a && IsB44FlatBlock(block)) {
-          // Write 3-byte flat block: 0x80 flag + 2 bytes value
-          dst.push_back(0x80);
-          dst.push_back(static_cast<uint8_t>(block[0] >> 8));
-          dst.push_back(static_cast<uint8_t>(block[0] & 0xFF));
-        } else {
-          // Write 14-byte regular block
-          uint8_t packed[14];
-          PackB44Block(packed, block);
-          dst.insert(dst.end(), packed, packed + 14);
-        }
+        // Pack the block (14 bytes for normal, 3 bytes for flat if B44A)
+        uint8_t packed[14];
+        int packed_size = PackB44Block(packed, block, is_b44a, false);
+        dst.insert(dst.end(), packed, packed + packed_size);
       }
     }
   }
@@ -3428,8 +3542,15 @@ Result<std::vector<uint8_t>> SaveToMemory(const ImageData& image, int compressio
 
       case COMPRESSION_PIZ: {
         // PIZ compression: wavelet + Huffman
-        // Ensure output buffer is large enough (worst case: uncompressed + overhead)
-        compress_buffer.resize(actual_bytes + actual_bytes / 100 + 1024);
+        // Buffer needs to be large enough for:
+        // - 4 bytes min/max bitmap range
+        // - Up to 8192 bytes bitmap
+        // - 4 bytes Huffman length
+        // - 20 bytes Huffman header
+        // - Up to ~50KB Huffman encoding table (65537 entries * 6 bits packed)
+        // - Encoded data (could be larger than input in worst case)
+        // Use actual_bytes * 2 + 65536 to be safe
+        compress_buffer.resize(actual_bytes * 2 + 65536);
         auto piz_result = tinyexr::piz::CompressPizV2(
             compress_buffer.data(), compress_buffer.size(),
             scanline_buffer.data(), actual_bytes,
@@ -3723,7 +3844,8 @@ static bool WriteTile(Writer& writer, const float* image_data,
 
     case COMPRESSION_PIZ: {
       // PIZ compression: wavelet + Huffman
-      compress_buffer.resize(actual_tile_size + actual_tile_size / 100 + 1024);
+      // Same buffer sizing as scanline PIZ (see comment there)
+      compress_buffer.resize(actual_tile_size * 2 + 65536);
       auto piz_result = tinyexr::piz::CompressPizV2(
           compress_buffer.data(), compress_buffer.size(),
           tile_buffer.data(), actual_tile_size,
@@ -4601,6 +4723,561 @@ Result<void> SaveDeepToFile(const char* filename, const DeepImageData& deep, int
   }
 
   // Write to file
+  FILE* fp = fopen(filename, "wb");
+  if (!fp) {
+    return Result<void>::error(
+      ErrorInfo(ErrorCode::IOError, "Failed to open file for writing",
+                filename, 0));
+  }
+
+  size_t written = fwrite(mem_result.value.data(), 1, mem_result.value.size(), fp);
+  fclose(fp);
+
+  if (written != mem_result.value.size()) {
+    return Result<void>::error(
+      ErrorInfo(ErrorCode::IOError, "Failed to write all data to file",
+                filename, 0));
+  }
+
+  Result<void> result = Result<void>::ok();
+  result.warnings = mem_result.warnings;
+  return result;
+}
+
+// ============================================================================
+// Deep Tiled Image Writing
+// ============================================================================
+
+Result<std::vector<uint8_t>> SaveDeepTiledToMemory(const DeepImageData& deep, int compression_level) {
+  std::vector<uint8_t> output;
+  std::vector<std::string> warnings;
+
+  // Validate input
+  if (deep.width <= 0 || deep.height <= 0) {
+    return Result<std::vector<uint8_t>>::error(
+      ErrorInfo(ErrorCode::InvalidArgument, "Invalid deep image dimensions",
+                "SaveDeepTiledToMemory", 0));
+  }
+
+  if (deep.sample_counts.size() != static_cast<size_t>(deep.width) * deep.height) {
+    return Result<std::vector<uint8_t>>::error(
+      ErrorInfo(ErrorCode::InvalidArgument,
+                "Sample counts array size mismatch with dimensions",
+                "SaveDeepTiledToMemory", 0));
+  }
+
+  if (deep.header.channels.empty()) {
+    return Result<std::vector<uint8_t>>::error(
+      ErrorInfo(ErrorCode::InvalidArgument, "No channels specified",
+                "SaveDeepTiledToMemory", 0));
+  }
+
+  // Verify total_samples matches sum of sample_counts
+  size_t counted_samples = 0;
+  for (size_t i = 0; i < deep.sample_counts.size(); i++) {
+    counted_samples += deep.sample_counts[i];
+  }
+  if (counted_samples != deep.total_samples) {
+    return Result<std::vector<uint8_t>>::error(
+      ErrorInfo(ErrorCode::InvalidArgument,
+                "total_samples doesn't match sum of sample_counts",
+                "SaveDeepTiledToMemory", 0));
+  }
+
+  // Verify channel_data sizes
+  for (size_t c = 0; c < deep.header.channels.size(); c++) {
+    if (deep.channel_data.size() <= c || deep.channel_data[c].size() != deep.total_samples) {
+      return Result<std::vector<uint8_t>>::error(
+        ErrorInfo(ErrorCode::InvalidArgument,
+                  "Channel data size mismatch for channel " + std::to_string(c),
+                  "SaveDeepTiledToMemory", 0));
+    }
+  }
+
+  int width = deep.width;
+  int height = deep.height;
+
+  // Create header copy with deep tiled settings
+  Header header = deep.header;
+  header.type = "deeptile";
+  header.tiled = true;
+  header.is_deep = true;
+
+  // Default tile size if not specified
+  if (header.tile_size_x <= 0) header.tile_size_x = 64;
+  if (header.tile_size_y <= 0) header.tile_size_y = 64;
+  header.tile_level_mode = TILE_ONE_LEVEL;  // Only single level for now
+  header.tile_rounding_mode = 0;
+
+  if (header.data_window.max_x == 0 && header.data_window.max_y == 0) {
+    header.data_window.min_x = 0;
+    header.data_window.min_y = 0;
+    header.data_window.max_x = width - 1;
+    header.data_window.max_y = height - 1;
+    header.display_window = header.data_window;
+  }
+  if (header.pixel_aspect_ratio <= 0.0f) {
+    header.pixel_aspect_ratio = 1.0f;
+  }
+  if (header.screen_window_width <= 0.0f) {
+    header.screen_window_width = 1.0f;
+  }
+
+  // Default to ZIP compression for deep if none specified
+  if (header.compression == COMPRESSION_NONE) {
+    header.compression = COMPRESSION_ZIP;
+  }
+  // Deep only supports NONE, RLE, ZIPS, ZIP
+  if (header.compression != COMPRESSION_NONE &&
+      header.compression != COMPRESSION_RLE &&
+      header.compression != COMPRESSION_ZIPS &&
+      header.compression != COMPRESSION_ZIP) {
+    warnings.push_back("Compression type not supported for deep images, using ZIP");
+    header.compression = COMPRESSION_ZIP;
+  }
+
+  int miniz_level = compression_level;
+  if (miniz_level < 1) miniz_level = 1;
+  if (miniz_level > 9) miniz_level = 9;
+
+  // Calculate tile counts
+  int num_x_tiles = (width + header.tile_size_x - 1) / header.tile_size_x;
+  int num_y_tiles = (height + header.tile_size_y - 1) / header.tile_size_y;
+  int total_tiles = num_x_tiles * num_y_tiles;
+  header.chunk_count = total_tiles;
+
+  // Calculate bytes per sample for each channel
+  std::vector<int> channel_sizes;
+  for (size_t c = 0; c < header.channels.size(); c++) {
+    int sz = 4;  // Default FLOAT
+    switch (header.channels[c].pixel_type) {
+      case PIXEL_TYPE_UINT:  sz = 4; break;
+      case PIXEL_TYPE_HALF:  sz = 2; break;
+      case PIXEL_TYPE_FLOAT: sz = 4; break;
+      default: sz = 4; break;
+    }
+    channel_sizes.push_back(sz);
+  }
+
+  // Create version (deep tiled = tiled + non_image flags set)
+  Version version;
+  version.version = 2;
+  version.tiled = true;
+  version.long_name = false;
+  version.non_image = true;  // Deep data flag
+  version.multipart = false;
+
+  // Reserve space for output
+  output.reserve(1024 * 1024);  // 1MB initial
+
+  // Write magic number
+  output.push_back(0x76);
+  output.push_back(0x2f);
+  output.push_back(0x31);
+  output.push_back(0x01);
+
+  // Write version
+  uint32_t version_bits = version.version;
+  if (version.tiled) version_bits |= 0x200;
+  if (version.long_name) version_bits |= 0x400;
+  if (version.non_image) version_bits |= 0x800;
+  if (version.multipart) version_bits |= 0x1000;
+  output.push_back(static_cast<uint8_t>(version_bits & 0xFF));
+  output.push_back(static_cast<uint8_t>((version_bits >> 8) & 0xFF));
+  output.push_back(static_cast<uint8_t>((version_bits >> 16) & 0xFF));
+  output.push_back(static_cast<uint8_t>((version_bits >> 24) & 0xFF));
+
+  // Helper lambdas
+  auto write_bytes = [&output](const void* data, size_t len) {
+    const uint8_t* ptr = static_cast<const uint8_t*>(data);
+    output.insert(output.end(), ptr, ptr + len);
+  };
+
+  auto write_string = [&output](const std::string& s) {
+    output.insert(output.end(), s.begin(), s.end());
+    output.push_back(0);
+  };
+
+  auto write_u32 = [&output](uint32_t v) {
+    output.push_back(static_cast<uint8_t>(v & 0xFF));
+    output.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+    output.push_back(static_cast<uint8_t>((v >> 16) & 0xFF));
+    output.push_back(static_cast<uint8_t>((v >> 24) & 0xFF));
+  };
+
+  auto write_i32 = [&output](int32_t v) {
+    uint32_t u;
+    std::memcpy(&u, &v, 4);
+    output.push_back(static_cast<uint8_t>(u & 0xFF));
+    output.push_back(static_cast<uint8_t>((u >> 8) & 0xFF));
+    output.push_back(static_cast<uint8_t>((u >> 16) & 0xFF));
+    output.push_back(static_cast<uint8_t>((u >> 24) & 0xFF));
+  };
+
+  auto write_u64 = [&output](uint64_t v) {
+    for (int i = 0; i < 8; i++) {
+      output.push_back(static_cast<uint8_t>((v >> (i * 8)) & 0xFF));
+    }
+  };
+
+  auto write_float = [&output](float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    output.push_back(static_cast<uint8_t>(u & 0xFF));
+    output.push_back(static_cast<uint8_t>((u >> 8) & 0xFF));
+    output.push_back(static_cast<uint8_t>((u >> 16) & 0xFF));
+    output.push_back(static_cast<uint8_t>((u >> 24) & 0xFF));
+  };
+
+  auto write_attribute = [&](const std::string& name, const std::string& type,
+                              const void* data, size_t size) {
+    write_string(name);
+    write_string(type);
+    write_u32(static_cast<uint32_t>(size));
+    write_bytes(data, size);
+  };
+
+  // Write header attributes
+
+  // channels (chlist)
+  {
+    std::vector<uint8_t> chlist;
+    for (const auto& ch : header.channels) {
+      for (char c : ch.name) chlist.push_back(static_cast<uint8_t>(c));
+      chlist.push_back(0);
+      uint32_t pt = ch.pixel_type;
+      chlist.push_back(static_cast<uint8_t>(pt & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((pt >> 8) & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((pt >> 16) & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((pt >> 24) & 0xFF));
+      chlist.push_back(0); chlist.push_back(0);
+      chlist.push_back(0); chlist.push_back(0);
+      int32_t xs = ch.x_sampling > 0 ? ch.x_sampling : 1;
+      chlist.push_back(static_cast<uint8_t>(xs & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((xs >> 8) & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((xs >> 16) & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((xs >> 24) & 0xFF));
+      int32_t ys = ch.y_sampling > 0 ? ch.y_sampling : 1;
+      chlist.push_back(static_cast<uint8_t>(ys & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((ys >> 8) & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((ys >> 16) & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((ys >> 24) & 0xFF));
+    }
+    chlist.push_back(0);
+    write_attribute("channels", "chlist", chlist.data(), chlist.size());
+  }
+
+  // compression
+  {
+    uint8_t comp = static_cast<uint8_t>(header.compression);
+    write_attribute("compression", "compression", &comp, 1);
+  }
+
+  // dataWindow
+  {
+    int32_t dw[4] = {header.data_window.min_x, header.data_window.min_y,
+                     header.data_window.max_x, header.data_window.max_y};
+    write_attribute("dataWindow", "box2i", dw, 16);
+  }
+
+  // displayWindow
+  {
+    int32_t dw[4] = {header.display_window.min_x, header.display_window.min_y,
+                     header.display_window.max_x, header.display_window.max_y};
+    write_attribute("displayWindow", "box2i", dw, 16);
+  }
+
+  // lineOrder
+  {
+    uint8_t lo = static_cast<uint8_t>(header.line_order);
+    write_attribute("lineOrder", "lineOrder", &lo, 1);
+  }
+
+  // pixelAspectRatio
+  {
+    write_attribute("pixelAspectRatio", "float", &header.pixel_aspect_ratio, 4);
+  }
+
+  // screenWindowCenter
+  {
+    float swc[2] = {header.screen_window_center[0], header.screen_window_center[1]};
+    write_attribute("screenWindowCenter", "v2f", swc, 8);
+  }
+
+  // screenWindowWidth
+  {
+    write_attribute("screenWindowWidth", "float", &header.screen_window_width, 4);
+  }
+
+  // tiles (tiledesc) - required for tiled images
+  {
+    std::vector<uint8_t> tiledesc(9);
+    uint32_t tx = header.tile_size_x;
+    uint32_t ty = header.tile_size_y;
+    tiledesc[0] = static_cast<uint8_t>(tx & 0xFF);
+    tiledesc[1] = static_cast<uint8_t>((tx >> 8) & 0xFF);
+    tiledesc[2] = static_cast<uint8_t>((tx >> 16) & 0xFF);
+    tiledesc[3] = static_cast<uint8_t>((tx >> 24) & 0xFF);
+    tiledesc[4] = static_cast<uint8_t>(ty & 0xFF);
+    tiledesc[5] = static_cast<uint8_t>((ty >> 8) & 0xFF);
+    tiledesc[6] = static_cast<uint8_t>((ty >> 16) & 0xFF);
+    tiledesc[7] = static_cast<uint8_t>((ty >> 24) & 0xFF);
+    uint8_t mode = static_cast<uint8_t>(header.tile_level_mode & 0x0F);
+    mode |= static_cast<uint8_t>((header.tile_rounding_mode & 0x01) << 4);
+    tiledesc[8] = mode;
+    write_attribute("tiles", "tiledesc", tiledesc.data(), 9);
+  }
+
+  // type (required for deep)
+  {
+    write_attribute("type", "string", header.type.data(), header.type.size());
+  }
+
+  // chunkCount (required for multipart/deep)
+  {
+    int32_t cc = header.chunk_count;
+    write_attribute("chunkCount", "int", &cc, 4);
+  }
+
+  // version (deep data version = 1)
+  {
+    int32_t ver = 1;
+    write_attribute("version", "int", &ver, 4);
+  }
+
+  // Custom attributes
+  for (const auto& attr : header.custom_attributes) {
+    if (attr.name.empty()) continue;
+    write_string(attr.name);
+    write_string(attr.type);
+    write_u32(static_cast<uint32_t>(attr.data.size()));
+    if (!attr.data.empty()) {
+      write_bytes(attr.data.data(), attr.data.size());
+    }
+  }
+
+  // End of header
+  output.push_back(0);
+
+  // Reserve space for tile offset table
+  size_t offset_table_pos = output.size();
+  std::vector<uint64_t> tile_offsets(static_cast<size_t>(total_tiles), 0);
+  for (int i = 0; i < total_tiles; i++) {
+    write_u64(0);  // Placeholder
+  }
+
+  // Build cumulative sample index for quick lookup
+  std::vector<size_t> cumulative_samples(static_cast<size_t>(width) * height + 1);
+  cumulative_samples[0] = 0;
+  for (size_t i = 0; i < deep.sample_counts.size(); i++) {
+    cumulative_samples[i + 1] = cumulative_samples[i] + deep.sample_counts[i];
+  }
+
+  // Write each tile
+  int tile_idx = 0;
+  for (int tile_y = 0; tile_y < num_y_tiles; tile_y++) {
+    for (int tile_x = 0; tile_x < num_x_tiles; tile_x++) {
+      tile_offsets[static_cast<size_t>(tile_idx)] = output.size();
+
+      // Tile coordinates
+      int tile_start_x = tile_x * header.tile_size_x;
+      int tile_start_y = tile_y * header.tile_size_y;
+      int tile_end_x = std::min(tile_start_x + header.tile_size_x, width);
+      int tile_end_y = std::min(tile_start_y + header.tile_size_y, height);
+      int tile_w = tile_end_x - tile_start_x;
+      int tile_h = tile_end_y - tile_start_y;
+      size_t num_tile_pixels = static_cast<size_t>(tile_w) * tile_h;
+
+      // Write tile header: tile_x, tile_y, level_x, level_y
+      write_i32(tile_x);
+      write_i32(tile_y);
+      write_i32(0);  // level_x (always 0 for ONE_LEVEL)
+      write_i32(0);  // level_y
+
+      // Gather sample counts for this tile
+      std::vector<uint32_t> tile_counts(num_tile_pixels);
+      size_t tile_total_samples = 0;
+
+      for (int y = tile_start_y; y < tile_end_y; y++) {
+        for (int x = tile_start_x; x < tile_end_x; x++) {
+          size_t pixel_idx = static_cast<size_t>(y) * width + x;
+          size_t tile_pixel_idx = static_cast<size_t>(y - tile_start_y) * tile_w + (x - tile_start_x);
+          tile_counts[tile_pixel_idx] = deep.sample_counts[pixel_idx];
+          tile_total_samples += deep.sample_counts[pixel_idx];
+        }
+      }
+
+      // Compress sample counts
+      std::vector<uint8_t> counts_raw(num_tile_pixels * 4);
+      std::memcpy(counts_raw.data(), tile_counts.data(), num_tile_pixels * 4);
+
+      std::vector<uint8_t> counts_compressed;
+      uint64_t unpacked_count_size = num_tile_pixels * 4;
+      uint64_t packed_count_size = unpacked_count_size;
+
+      if (header.compression != COMPRESSION_NONE) {
+#if defined(TINYEXR_USE_MINIZ)
+        mz_ulong compressed_size = static_cast<mz_ulong>(unpacked_count_size + unpacked_count_size / 1000 + 128);
+        counts_compressed.resize(compressed_size);
+        int z_result = mz_compress2(counts_compressed.data(), &compressed_size,
+                                    counts_raw.data(), static_cast<mz_ulong>(unpacked_count_size),
+                                    miniz_level);
+        if (z_result == MZ_OK && compressed_size < unpacked_count_size) {
+          counts_compressed.resize(compressed_size);
+          packed_count_size = compressed_size;
+        } else {
+          counts_compressed = counts_raw;
+          packed_count_size = unpacked_count_size;
+        }
+#elif defined(TINYEXR_USE_ZLIB)
+        uLongf compressed_size = compressBound(static_cast<uLong>(unpacked_count_size));
+        counts_compressed.resize(compressed_size);
+        int z_result = compress2(counts_compressed.data(), &compressed_size,
+                                  counts_raw.data(), static_cast<uLong>(unpacked_count_size),
+                                  miniz_level);
+        if (z_result == Z_OK && compressed_size < unpacked_count_size) {
+          counts_compressed.resize(compressed_size);
+          packed_count_size = compressed_size;
+        } else {
+          counts_compressed = counts_raw;
+          packed_count_size = unpacked_count_size;
+        }
+#else
+        counts_compressed = counts_raw;
+        packed_count_size = unpacked_count_size;
+#endif
+      } else {
+        counts_compressed = counts_raw;
+      }
+
+      // Gather sample data for this tile (channel by channel)
+      size_t unpacked_data_size = 0;
+      for (size_t c = 0; c < header.channels.size(); c++) {
+        unpacked_data_size += tile_total_samples * channel_sizes[c];
+      }
+
+      std::vector<uint8_t> data_raw(unpacked_data_size);
+      uint8_t* data_ptr = data_raw.data();
+
+      for (size_t c = 0; c < header.channels.size(); c++) {
+        int ch_size = channel_sizes[c];
+        // For each pixel in tile, write its samples
+        for (int y = tile_start_y; y < tile_end_y; y++) {
+          for (int x = tile_start_x; x < tile_end_x; x++) {
+            size_t pixel_idx = static_cast<size_t>(y) * width + x;
+            size_t sample_start = cumulative_samples[pixel_idx];
+            uint32_t num_samples = deep.sample_counts[pixel_idx];
+
+            for (uint32_t s = 0; s < num_samples; s++) {
+              float val = deep.channel_data[c][sample_start + s];
+
+              if (ch_size == 2) {
+                uint16_t h = FloatToHalf(val);
+                std::memcpy(data_ptr, &h, 2);
+                data_ptr += 2;
+              } else if (header.channels[c].pixel_type == PIXEL_TYPE_UINT) {
+                uint32_t u = static_cast<uint32_t>(val);
+                std::memcpy(data_ptr, &u, 4);
+                data_ptr += 4;
+              } else {
+                std::memcpy(data_ptr, &val, 4);
+                data_ptr += 4;
+              }
+            }
+          }
+        }
+      }
+
+      // Compress sample data
+      std::vector<uint8_t> data_compressed;
+      uint64_t packed_data_size = unpacked_data_size;
+
+      if (header.compression != COMPRESSION_NONE && unpacked_data_size > 0) {
+#if defined(TINYEXR_USE_MINIZ)
+        mz_ulong compressed_size = static_cast<mz_ulong>(unpacked_data_size + unpacked_data_size / 1000 + 128);
+        data_compressed.resize(compressed_size);
+        int z_result = mz_compress2(data_compressed.data(), &compressed_size,
+                                    data_raw.data(), static_cast<mz_ulong>(unpacked_data_size),
+                                    miniz_level);
+        if (z_result == MZ_OK && compressed_size < unpacked_data_size) {
+          data_compressed.resize(compressed_size);
+          packed_data_size = compressed_size;
+        } else {
+          data_compressed = data_raw;
+          packed_data_size = unpacked_data_size;
+        }
+#elif defined(TINYEXR_USE_ZLIB)
+        uLongf compressed_size = compressBound(static_cast<uLong>(unpacked_data_size));
+        data_compressed.resize(compressed_size);
+        int z_result = compress2(data_compressed.data(), &compressed_size,
+                                  data_raw.data(), static_cast<uLong>(unpacked_data_size),
+                                  miniz_level);
+        if (z_result == Z_OK && compressed_size < unpacked_data_size) {
+          data_compressed.resize(compressed_size);
+          packed_data_size = compressed_size;
+        } else {
+          data_compressed = data_raw;
+          packed_data_size = unpacked_data_size;
+        }
+#else
+        data_compressed = data_raw;
+        packed_data_size = unpacked_data_size;
+#endif
+      } else {
+        data_compressed = data_raw;
+      }
+
+      // Write tile data: packed_count_size, unpacked_count_size, packed_data_size
+      write_u64(packed_count_size);
+      write_u64(unpacked_count_size);
+      write_u64(packed_data_size);
+
+      // Write compressed sample counts
+      write_bytes(counts_compressed.data(), packed_count_size);
+
+      // Write compressed sample data
+      if (packed_data_size > 0) {
+        write_bytes(data_compressed.data(), packed_data_size);
+      }
+
+      tile_idx++;
+    }
+  }
+
+  // Go back and write offset table
+  for (int i = 0; i < total_tiles; i++) {
+    size_t offset_pos = offset_table_pos + static_cast<size_t>(i) * 8;
+    uint64_t offset = tile_offsets[static_cast<size_t>(i)];
+    for (int j = 0; j < 8; j++) {
+      output[offset_pos + j] = static_cast<uint8_t>((offset >> (j * 8)) & 0xFF);
+    }
+  }
+
+  auto result = Result<std::vector<uint8_t>>::ok(std::move(output));
+  result.warnings = warnings;
+  return result;
+}
+
+Result<std::vector<uint8_t>> SaveDeepTiledToMemory(const DeepImageData& deep) {
+  return SaveDeepTiledToMemory(deep, 6);
+}
+
+Result<void> SaveDeepTiledToFile(const char* filename, const DeepImageData& deep, int compression_level) {
+  if (!filename) {
+    return Result<void>::error(
+      ErrorInfo(ErrorCode::InvalidArgument, "Null filename",
+                "SaveDeepTiledToFile", 0));
+  }
+
+  auto mem_result = SaveDeepTiledToMemory(deep, compression_level);
+  if (!mem_result.success) {
+    Result<void> result;
+    result.success = false;
+    result.errors = mem_result.errors;
+    result.warnings = mem_result.warnings;
+    return result;
+  }
+
   FILE* fp = fopen(filename, "wb");
   if (!fp) {
     return Result<void>::error(
@@ -6060,6 +6737,739 @@ Result<MultipartImageData> LoadMultipartFromMemory(const uint8_t* data, size_t s
   }
 
   return Result<MultipartImageData>::ok(mp_data);
+}
+
+// ============================================================================
+// Spectral Image I/O
+// ============================================================================
+
+// Check if header contains spectral layout attributes
+bool IsSpectralEXR(const Header& header) {
+  return header.has_attribute("spectralLayoutVersion");
+}
+
+// Save spectral image to memory
+Result<std::vector<uint8_t>> SaveSpectralToMemory(const SpectralImageData& spectral, int compression_level) {
+  if (spectral.width <= 0 || spectral.height <= 0) {
+    return Result<std::vector<uint8_t>>::error(
+      ErrorInfo(ErrorCode::InvalidArgument, "Invalid spectral image dimensions",
+                "SaveSpectralToMemory", 0));
+  }
+
+  if (spectral.wavelengths.empty()) {
+    return Result<std::vector<uint8_t>>::error(
+      ErrorInfo(ErrorCode::InvalidArgument, "No wavelengths specified",
+                "SaveSpectralToMemory", 0));
+  }
+
+  bool is_polarised = (spectral.spectrum_type & SPECTRUM_POLARISED) != 0;
+  bool is_reflective = (spectral.spectrum_type & SPECTRUM_REFLECTIVE) != 0 &&
+                       (spectral.spectrum_type & SPECTRUM_EMISSIVE) == 0;
+
+  // Verify data size
+  size_t num_pixels = static_cast<size_t>(spectral.width) * spectral.height;
+  size_t num_wavelengths = spectral.wavelengths.size();
+
+  if (is_polarised) {
+    if (spectral.stokes_data.size() != 4) {
+      return Result<std::vector<uint8_t>>::error(
+        ErrorInfo(ErrorCode::InvalidArgument,
+                  "Polarised image requires 4 Stokes components",
+                  "SaveSpectralToMemory", 0));
+    }
+    for (size_t s = 0; s < 4; s++) {
+      if (spectral.stokes_data[s].size() != num_wavelengths) {
+        return Result<std::vector<uint8_t>>::error(
+          ErrorInfo(ErrorCode::InvalidArgument,
+                    "Stokes component " + std::to_string(s) + " wavelength count mismatch",
+                    "SaveSpectralToMemory", 0));
+      }
+      for (size_t w = 0; w < num_wavelengths; w++) {
+        if (spectral.stokes_data[s][w].size() != num_pixels) {
+          return Result<std::vector<uint8_t>>::error(
+            ErrorInfo(ErrorCode::InvalidArgument,
+                      "Stokes " + std::to_string(s) + " wavelength " + std::to_string(w) +
+                      " pixel count mismatch",
+                      "SaveSpectralToMemory", 0));
+        }
+      }
+    }
+  } else {
+    if (spectral.spectral_data.size() != num_wavelengths) {
+      return Result<std::vector<uint8_t>>::error(
+        ErrorInfo(ErrorCode::InvalidArgument,
+                  "Spectral data wavelength count mismatch",
+                  "SaveSpectralToMemory", 0));
+    }
+    for (size_t w = 0; w < num_wavelengths; w++) {
+      if (spectral.spectral_data[w].size() != num_pixels) {
+        return Result<std::vector<uint8_t>>::error(
+          ErrorInfo(ErrorCode::InvalidArgument,
+                    "Wavelength " + std::to_string(w) + " pixel count mismatch",
+                    "SaveSpectralToMemory", 0));
+      }
+    }
+  }
+
+  // Build ImageData with spectral channels
+  ImageData image;
+  image.width = spectral.width;
+  image.height = spectral.height;
+  image.header = spectral.header;
+
+  // Set up header
+  if (image.header.data_window.max_x == 0 && image.header.data_window.max_y == 0) {
+    image.header.data_window.min_x = 0;
+    image.header.data_window.min_y = 0;
+    image.header.data_window.max_x = spectral.width - 1;
+    image.header.data_window.max_y = spectral.height - 1;
+    image.header.display_window = image.header.data_window;
+  }
+  if (image.header.pixel_aspect_ratio <= 0.0f) {
+    image.header.pixel_aspect_ratio = 1.0f;
+  }
+  if (image.header.screen_window_width <= 0.0f) {
+    image.header.screen_window_width = 1.0f;
+  }
+  if (image.header.compression == COMPRESSION_NONE) {
+    image.header.compression = COMPRESSION_ZIP;
+  }
+
+  // Clear existing channels and rebuild
+  image.header.channels.clear();
+
+  // Add RGB preview channels first (if available)
+  bool has_rgb = !spectral.rgb_preview.empty() &&
+                 spectral.rgb_preview.size() == num_pixels * 3;
+  if (has_rgb) {
+    Channel ch_r, ch_g, ch_b;
+    ch_r.name = "R"; ch_r.pixel_type = PIXEL_TYPE_FLOAT; ch_r.x_sampling = 1; ch_r.y_sampling = 1;
+    ch_g.name = "G"; ch_g.pixel_type = PIXEL_TYPE_FLOAT; ch_g.x_sampling = 1; ch_g.y_sampling = 1;
+    ch_b.name = "B"; ch_b.pixel_type = PIXEL_TYPE_FLOAT; ch_b.x_sampling = 1; ch_b.y_sampling = 1;
+    image.header.channels.push_back(ch_b);
+    image.header.channels.push_back(ch_g);
+    image.header.channels.push_back(ch_r);
+  }
+
+  // Add spectral channels
+  if (is_polarised) {
+    // Stokes components S0-S3 for each wavelength
+    for (int s = 0; s < 4; s++) {
+      for (size_t w = 0; w < num_wavelengths; w++) {
+        Channel ch;
+        ch.name = SpectralChannelName(spectral.wavelengths[w], s);
+        ch.pixel_type = PIXEL_TYPE_FLOAT;
+        ch.x_sampling = 1;
+        ch.y_sampling = 1;
+        image.header.channels.push_back(ch);
+      }
+    }
+  } else {
+    // Single component per wavelength
+    for (size_t w = 0; w < num_wavelengths; w++) {
+      Channel ch;
+      if (is_reflective) {
+        ch.name = ReflectiveChannelName(spectral.wavelengths[w]);
+      } else {
+        ch.name = SpectralChannelName(spectral.wavelengths[w], 0);
+      }
+      ch.pixel_type = PIXEL_TYPE_FLOAT;
+      ch.x_sampling = 1;
+      ch.y_sampling = 1;
+      image.header.channels.push_back(ch);
+    }
+  }
+
+  // Sort channels by name (EXR requirement)
+  std::sort(image.header.channels.begin(), image.header.channels.end(),
+            [](const Channel& a, const Channel& b) { return a.name < b.name; });
+
+  // Build RGBA data (we'll use a custom approach since SaveToMemory expects RGBA)
+  // Instead, we'll build the raw channel data directly
+
+  // Calculate total channels
+  size_t total_channels = image.header.channels.size();
+  image.num_channels = static_cast<int>(total_channels);
+
+  // Create rgba array - but this is tricky since SaveToMemory expects RGBA format
+  // We need to pack spectral data appropriately
+  // For simplicity, let's use a modified approach: pack all channel data into rgba
+
+  // Actually, let's create a custom save that handles spectral data directly
+  // by using the raw channel format
+
+  // Build raw pixel data per channel (sorted by channel name)
+  std::vector<std::vector<float>> channel_data(total_channels);
+  for (size_t c = 0; c < total_channels; c++) {
+    channel_data[c].resize(num_pixels);
+    const std::string& ch_name = image.header.channels[c].name;
+
+    if (ch_name == "R" && has_rgb) {
+      for (size_t i = 0; i < num_pixels; i++) {
+        channel_data[c][i] = spectral.rgb_preview[i * 3 + 0];
+      }
+    } else if (ch_name == "G" && has_rgb) {
+      for (size_t i = 0; i < num_pixels; i++) {
+        channel_data[c][i] = spectral.rgb_preview[i * 3 + 1];
+      }
+    } else if (ch_name == "B" && has_rgb) {
+      for (size_t i = 0; i < num_pixels; i++) {
+        channel_data[c][i] = spectral.rgb_preview[i * 3 + 2];
+      }
+    } else {
+      // Spectral channel
+      float wl = ParseSpectralChannelWavelength(ch_name);
+      int stokes = GetStokesComponent(ch_name);
+
+      // Find wavelength index
+      int wl_idx = -1;
+      for (size_t w = 0; w < num_wavelengths; w++) {
+        if (std::abs(spectral.wavelengths[w] - wl) < 0.001f) {
+          wl_idx = static_cast<int>(w);
+          break;
+        }
+      }
+
+      if (wl_idx >= 0) {
+        if (is_polarised && stokes >= 0 && stokes < 4) {
+          channel_data[c] = spectral.stokes_data[stokes][wl_idx];
+        } else if (!is_polarised) {
+          channel_data[c] = spectral.spectral_data[wl_idx];
+        }
+      }
+    }
+  }
+
+  // Now pack into RGBA format expected by SaveToMemory
+  // We need to create an image with all channels as "RGBA"
+  // Actually, SaveToMemory uses the header.channels for writing, not just RGBA
+  // So we need to populate image.rgba with the interleaved channel data
+
+  // For spectral data, use raw data approach
+  // Pack channels in sorted order (which they already are in channel_data)
+  image.rgba.resize(num_pixels * 4, 0.0f);  // RGBA for compatibility
+
+  // Since SaveToMemory writes data based on header.channels, we need a different approach
+  // Let's write directly using a custom spectral writer
+
+  // Actually, we can reuse SaveToMemory by ensuring rgba contains data for all channels
+  // The issue is SaveToMemory expects rgba to be in a specific format
+
+  // Let's create a simplified approach: convert spectral to ImageData with raw_channels
+  // and use a modified save
+
+  // For now, let's just fill rgba with the first 4 spectral bands as a workaround
+  // and rely on the existing SaveToMemory which writes based on header.channels
+
+  // Better approach: Create the output directly similar to SaveToMemory
+  // but with proper handling of FLOAT channels
+
+  std::vector<uint8_t> output;
+  output.reserve(1024 * 1024);
+
+  // Helper lambdas for writing
+  auto write_bytes = [&output](const void* data, size_t len) {
+    const uint8_t* ptr = static_cast<const uint8_t*>(data);
+    output.insert(output.end(), ptr, ptr + len);
+  };
+
+  auto write_string = [&output](const std::string& s) {
+    output.insert(output.end(), s.begin(), s.end());
+    output.push_back(0);
+  };
+
+  auto write_u32 = [&output](uint32_t v) {
+    output.push_back(static_cast<uint8_t>(v & 0xFF));
+    output.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+    output.push_back(static_cast<uint8_t>((v >> 16) & 0xFF));
+    output.push_back(static_cast<uint8_t>((v >> 24) & 0xFF));
+  };
+
+  auto write_float = [&output](float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    output.push_back(static_cast<uint8_t>(u & 0xFF));
+    output.push_back(static_cast<uint8_t>((u >> 8) & 0xFF));
+    output.push_back(static_cast<uint8_t>((u >> 16) & 0xFF));
+    output.push_back(static_cast<uint8_t>((u >> 24) & 0xFF));
+  };
+
+  auto write_attribute = [&](const std::string& name, const std::string& type,
+                              const void* data, size_t size) {
+    write_string(name);
+    write_string(type);
+    write_u32(static_cast<uint32_t>(size));
+    write_bytes(data, size);
+  };
+
+  // Write magic number
+  output.push_back(0x76);
+  output.push_back(0x2f);
+  output.push_back(0x31);
+  output.push_back(0x01);
+
+  // Write version (scanline, not tiled)
+  uint32_t version_bits = 2;  // version 2
+  output.push_back(static_cast<uint8_t>(version_bits & 0xFF));
+  output.push_back(static_cast<uint8_t>((version_bits >> 8) & 0xFF));
+  output.push_back(static_cast<uint8_t>((version_bits >> 16) & 0xFF));
+  output.push_back(static_cast<uint8_t>((version_bits >> 24) & 0xFF));
+
+  // Write header attributes manually
+
+  // channels (chlist)
+  {
+    std::vector<uint8_t> chlist;
+    for (const auto& ch : image.header.channels) {
+      for (char c : ch.name) chlist.push_back(static_cast<uint8_t>(c));
+      chlist.push_back(0);
+      uint32_t pt = ch.pixel_type;
+      chlist.push_back(static_cast<uint8_t>(pt & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((pt >> 8) & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((pt >> 16) & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((pt >> 24) & 0xFF));
+      chlist.push_back(0); chlist.push_back(0);
+      chlist.push_back(0); chlist.push_back(0);
+      int32_t xs = ch.x_sampling > 0 ? ch.x_sampling : 1;
+      chlist.push_back(static_cast<uint8_t>(xs & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((xs >> 8) & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((xs >> 16) & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((xs >> 24) & 0xFF));
+      int32_t ys = ch.y_sampling > 0 ? ch.y_sampling : 1;
+      chlist.push_back(static_cast<uint8_t>(ys & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((ys >> 8) & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((ys >> 16) & 0xFF));
+      chlist.push_back(static_cast<uint8_t>((ys >> 24) & 0xFF));
+    }
+    chlist.push_back(0);
+    write_attribute("channels", "chlist", chlist.data(), chlist.size());
+  }
+
+  // compression
+  {
+    uint8_t comp = static_cast<uint8_t>(image.header.compression);
+    write_attribute("compression", "compression", &comp, 1);
+  }
+
+  // dataWindow
+  {
+    int32_t dw[4] = {image.header.data_window.min_x, image.header.data_window.min_y,
+                     image.header.data_window.max_x, image.header.data_window.max_y};
+    write_attribute("dataWindow", "box2i", dw, 16);
+  }
+
+  // displayWindow
+  {
+    int32_t dw[4] = {image.header.display_window.min_x, image.header.display_window.min_y,
+                     image.header.display_window.max_x, image.header.display_window.max_y};
+    write_attribute("displayWindow", "box2i", dw, 16);
+  }
+
+  // lineOrder
+  {
+    uint8_t lo = static_cast<uint8_t>(image.header.line_order);
+    write_attribute("lineOrder", "lineOrder", &lo, 1);
+  }
+
+  // pixelAspectRatio
+  {
+    write_attribute("pixelAspectRatio", "float", &image.header.pixel_aspect_ratio, 4);
+  }
+
+  // screenWindowCenter
+  {
+    float swc[2] = {image.header.screen_window_center[0], image.header.screen_window_center[1]};
+    write_attribute("screenWindowCenter", "v2f", swc, 8);
+  }
+
+  // screenWindowWidth
+  {
+    write_attribute("screenWindowWidth", "float", &image.header.screen_window_width, 4);
+  }
+
+  // Custom attributes (includes spectral attributes)
+  for (const auto& attr : image.header.custom_attributes) {
+    if (attr.name.empty()) continue;
+    write_string(attr.name);
+    write_string(attr.type);
+    write_u32(static_cast<uint32_t>(attr.data.size()));
+    if (!attr.data.empty()) {
+      write_bytes(attr.data.data(), attr.data.size());
+    }
+  }
+
+  // End of header
+  output.push_back(0);
+
+  // Scanline blocks
+  int scanlines_per_block = GetScanlinesPerBlock(image.header.compression);
+  int num_blocks = (spectral.height + scanlines_per_block - 1) / scanlines_per_block;
+
+  // Reserve space for offset table
+  size_t offset_table_pos = output.size();
+  std::vector<uint64_t> block_offsets(static_cast<size_t>(num_blocks));
+  for (int i = 0; i < num_blocks; i++) {
+    for (int j = 0; j < 8; j++) {
+      output.push_back(0);  // Placeholder
+    }
+  }
+
+  // Calculate bytes per scanline
+  size_t bytes_per_scanline = 0;
+  for (const auto& ch : image.header.channels) {
+    int ch_bytes = (ch.pixel_type == PIXEL_TYPE_HALF) ? 2 : 4;
+    bytes_per_scanline += static_cast<size_t>(spectral.width) * ch_bytes;
+  }
+
+  // Buffers for compression
+  std::vector<uint8_t> scanline_buffer;
+  std::vector<uint8_t> reorder_buffer;
+  std::vector<uint8_t> compress_buffer;
+
+  int miniz_level = compression_level;
+  if (miniz_level < 1) miniz_level = 1;
+  if (miniz_level > 9) miniz_level = 9;
+
+  // Write each block
+  for (int block = 0; block < num_blocks; block++) {
+    block_offsets[static_cast<size_t>(block)] = output.size();
+
+    int block_start_y = block * scanlines_per_block;
+    int block_end_y = std::min(block_start_y + scanlines_per_block, spectral.height);
+    int num_lines = block_end_y - block_start_y;
+
+    size_t block_data_size = bytes_per_scanline * num_lines;
+    scanline_buffer.resize(block_data_size);
+
+    // Pack channel data into scanline buffer (channel by channel, line by line)
+    uint8_t* dst = scanline_buffer.data();
+    for (int y = block_start_y; y < block_end_y; y++) {
+      for (size_t c = 0; c < total_channels; c++) {
+        int ch_bytes = (image.header.channels[c].pixel_type == PIXEL_TYPE_HALF) ? 2 : 4;
+        for (int x = 0; x < spectral.width; x++) {
+          float val = channel_data[c][y * spectral.width + x];
+          if (ch_bytes == 2) {
+            uint16_t h = FloatToHalf(val);
+            std::memcpy(dst, &h, 2);
+            dst += 2;
+          } else {
+            std::memcpy(dst, &val, 4);
+            dst += 4;
+          }
+        }
+      }
+    }
+
+    // Compress
+    size_t compressed_size = block_data_size;
+    const uint8_t* data_to_write = scanline_buffer.data();
+
+    if (image.header.compression == COMPRESSION_ZIP ||
+        image.header.compression == COMPRESSION_ZIPS) {
+      reorder_buffer.resize(block_data_size);
+      ReorderBytesForCompression(scanline_buffer.data(), reorder_buffer.data(), block_data_size);
+      ApplyDeltaPredictorEncode(reorder_buffer.data(), block_data_size);
+
+#if defined(TINYEXR_USE_MINIZ)
+      compress_buffer.resize(block_data_size + block_data_size / 100 + 128);
+      mz_ulong comp_size = static_cast<mz_ulong>(compress_buffer.size());
+      int z_result = mz_compress2(compress_buffer.data(), &comp_size,
+                                  reorder_buffer.data(), static_cast<mz_ulong>(block_data_size),
+                                  miniz_level);
+      if (z_result == MZ_OK && comp_size < block_data_size) {
+        compressed_size = comp_size;
+        data_to_write = compress_buffer.data();
+      } else {
+        data_to_write = scanline_buffer.data();
+      }
+#elif defined(TINYEXR_USE_ZLIB)
+      compress_buffer.resize(compressBound(static_cast<uLong>(block_data_size)));
+      uLongf comp_size = static_cast<uLongf>(compress_buffer.size());
+      int z_result = compress2(compress_buffer.data(), &comp_size,
+                               reorder_buffer.data(), static_cast<uLong>(block_data_size),
+                               miniz_level);
+      if (z_result == Z_OK && comp_size < block_data_size) {
+        compressed_size = comp_size;
+        data_to_write = compress_buffer.data();
+      } else {
+        data_to_write = scanline_buffer.data();
+      }
+#else
+      data_to_write = scanline_buffer.data();
+#endif
+    }
+
+    // Write block: y_coord (4 bytes) + data_size (4 bytes) + data
+    int32_t y_coord = image.header.data_window.min_y + block_start_y;
+    uint32_t yu;
+    std::memcpy(&yu, &y_coord, 4);
+    output.push_back(static_cast<uint8_t>(yu & 0xFF));
+    output.push_back(static_cast<uint8_t>((yu >> 8) & 0xFF));
+    output.push_back(static_cast<uint8_t>((yu >> 16) & 0xFF));
+    output.push_back(static_cast<uint8_t>((yu >> 24) & 0xFF));
+
+    uint32_t data_size = static_cast<uint32_t>(compressed_size);
+    output.push_back(static_cast<uint8_t>(data_size & 0xFF));
+    output.push_back(static_cast<uint8_t>((data_size >> 8) & 0xFF));
+    output.push_back(static_cast<uint8_t>((data_size >> 16) & 0xFF));
+    output.push_back(static_cast<uint8_t>((data_size >> 24) & 0xFF));
+
+    output.insert(output.end(), data_to_write, data_to_write + compressed_size);
+  }
+
+  // Write offset table
+  for (int i = 0; i < num_blocks; i++) {
+    size_t offset_pos = offset_table_pos + static_cast<size_t>(i) * 8;
+    uint64_t offset = block_offsets[static_cast<size_t>(i)];
+    for (int j = 0; j < 8; j++) {
+      output[offset_pos + j] = static_cast<uint8_t>((offset >> (j * 8)) & 0xFF);
+    }
+  }
+
+  return Result<std::vector<uint8_t>>::ok(std::move(output));
+}
+
+Result<std::vector<uint8_t>> SaveSpectralToMemory(const SpectralImageData& spectral) {
+  return SaveSpectralToMemory(spectral, 6);
+}
+
+Result<void> SaveSpectralToFile(const char* filename, const SpectralImageData& spectral, int compression_level) {
+  if (!filename) {
+    return Result<void>::error(
+      ErrorInfo(ErrorCode::InvalidArgument, "Null filename",
+                "SaveSpectralToFile", 0));
+  }
+
+  auto mem_result = SaveSpectralToMemory(spectral, compression_level);
+  if (!mem_result.success) {
+    Result<void> result;
+    result.success = false;
+    result.errors = mem_result.errors;
+    result.warnings = mem_result.warnings;
+    return result;
+  }
+
+  FILE* fp = fopen(filename, "wb");
+  if (!fp) {
+    return Result<void>::error(
+      ErrorInfo(ErrorCode::IOError, "Failed to open file for writing",
+                filename, 0));
+  }
+
+  size_t written = fwrite(mem_result.value.data(), 1, mem_result.value.size(), fp);
+  fclose(fp);
+
+  if (written != mem_result.value.size()) {
+    return Result<void>::error(
+      ErrorInfo(ErrorCode::IOError, "Failed to write all data to file",
+                filename, 0));
+  }
+
+  Result<void> result = Result<void>::ok();
+  result.warnings = mem_result.warnings;
+  return result;
+}
+
+Result<SpectralImageData> LoadSpectralFromMemory(const uint8_t* data, size_t size) {
+  // First load as regular image with raw channels
+  LoadOptions opts;
+  opts.preserve_raw_channels = true;
+  opts.convert_to_rgba = false;
+
+  auto load_result = LoadFromMemory(data, size, opts);
+  if (!load_result.success) {
+    Result<SpectralImageData> result;
+    result.success = false;
+    result.errors = load_result.errors;
+    return result;
+  }
+
+  const ImageData& img = load_result.value;
+  SpectralImageData spectral;
+  spectral.width = img.width;
+  spectral.height = img.height;
+  spectral.header = img.header;
+
+  // Detect spectral channels and extract wavelengths
+  std::vector<float> wavelengths_set;
+  bool has_stokes[4] = {false, false, false, false};
+  bool is_reflective = false;
+
+  for (const auto& ch : img.header.channels) {
+    float wl = ParseSpectralChannelWavelength(ch.name);
+    if (wl > 0.0f) {
+      // Check if already in set
+      bool found = false;
+      for (float existing : wavelengths_set) {
+        if (std::abs(existing - wl) < 0.001f) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        wavelengths_set.push_back(wl);
+      }
+
+      int stokes = GetStokesComponent(ch.name);
+      if (stokes >= 0 && stokes < 4) {
+        has_stokes[stokes] = true;
+      } else if (stokes == -1) {
+        is_reflective = true;
+      }
+    }
+  }
+
+  if (wavelengths_set.empty()) {
+    return Result<SpectralImageData>::error(
+      ErrorInfo(ErrorCode::InvalidData, "No spectral channels found in image",
+                "LoadSpectralFromMemory", 0));
+  }
+
+  // Sort wavelengths
+  std::sort(wavelengths_set.begin(), wavelengths_set.end());
+  spectral.wavelengths = wavelengths_set;
+
+  size_t num_wavelengths = wavelengths_set.size();
+  size_t num_pixels = static_cast<size_t>(img.width) * img.height;
+
+  // Determine spectrum type
+  bool is_polarised = has_stokes[0] && has_stokes[1] && has_stokes[2] && has_stokes[3];
+  if (is_polarised) {
+    spectral.spectrum_type = SPECTRUM_EMISSIVE | SPECTRUM_POLARISED;
+    spectral.stokes_data.resize(4);
+    for (int s = 0; s < 4; s++) {
+      spectral.stokes_data[s].resize(num_wavelengths);
+      for (size_t w = 0; w < num_wavelengths; w++) {
+        spectral.stokes_data[s][w].resize(num_pixels, 0.0f);
+      }
+    }
+  } else if (is_reflective) {
+    spectral.spectrum_type = SPECTRUM_REFLECTIVE;
+    spectral.spectral_data.resize(num_wavelengths);
+    for (size_t w = 0; w < num_wavelengths; w++) {
+      spectral.spectral_data[w].resize(num_pixels, 0.0f);
+    }
+  } else {
+    spectral.spectrum_type = SPECTRUM_EMISSIVE;
+    spectral.spectral_data.resize(num_wavelengths);
+    for (size_t w = 0; w < num_wavelengths; w++) {
+      spectral.spectral_data[w].resize(num_pixels, 0.0f);
+    }
+  }
+
+  // Extract channel data
+  for (size_t c = 0; c < img.header.channels.size(); c++) {
+    const std::string& ch_name = img.header.channels[c].name;
+
+    // Check for RGB preview
+    if (ch_name == "R" || ch_name == "G" || ch_name == "B") {
+      if (spectral.rgb_preview.empty()) {
+        spectral.rgb_preview.resize(num_pixels * 3, 0.0f);
+      }
+      int rgb_idx = (ch_name == "R") ? 0 : (ch_name == "G") ? 1 : 2;
+
+      // Get raw channel data
+      if (c < img.raw_channels.size() && !img.raw_channels[c].empty()) {
+        int ch_size = (img.header.channels[c].pixel_type == PIXEL_TYPE_HALF) ? 2 : 4;
+        const uint8_t* src = img.raw_channels[c].data();
+        for (size_t i = 0; i < num_pixels; i++) {
+          float val;
+          if (ch_size == 2) {
+            uint16_t h;
+            std::memcpy(&h, src + i * 2, 2);
+            val = HalfToFloat(h);
+          } else {
+            std::memcpy(&val, src + i * 4, 4);
+          }
+          spectral.rgb_preview[i * 3 + rgb_idx] = val;
+        }
+      }
+      continue;
+    }
+
+    // Check for spectral channel
+    float wl = ParseSpectralChannelWavelength(ch_name);
+    if (wl <= 0.0f) continue;
+
+    int stokes = GetStokesComponent(ch_name);
+
+    // Find wavelength index
+    int wl_idx = -1;
+    for (size_t w = 0; w < num_wavelengths; w++) {
+      if (std::abs(spectral.wavelengths[w] - wl) < 0.001f) {
+        wl_idx = static_cast<int>(w);
+        break;
+      }
+    }
+    if (wl_idx < 0) continue;
+
+    // Get raw channel data
+    if (c < img.raw_channels.size() && !img.raw_channels[c].empty()) {
+      int ch_size = (img.header.channels[c].pixel_type == PIXEL_TYPE_HALF) ? 2 : 4;
+      const uint8_t* src = img.raw_channels[c].data();
+
+      std::vector<float>* dest = nullptr;
+      if (is_polarised && stokes >= 0 && stokes < 4) {
+        dest = &spectral.stokes_data[stokes][wl_idx];
+      } else if (!is_polarised) {
+        dest = &spectral.spectral_data[wl_idx];
+      }
+
+      if (dest) {
+        for (size_t i = 0; i < num_pixels; i++) {
+          float val;
+          if (ch_size == 2) {
+            uint16_t h;
+            std::memcpy(&h, src + i * 2, 2);
+            val = HalfToFloat(h);
+          } else {
+            std::memcpy(&val, src + i * 4, 4);
+          }
+          (*dest)[i] = val;
+        }
+      }
+    }
+  }
+
+  return Result<SpectralImageData>::ok(std::move(spectral));
+}
+
+Result<SpectralImageData> LoadSpectralFromFile(const char* filename) {
+  if (!filename) {
+    return Result<SpectralImageData>::error(
+      ErrorInfo(ErrorCode::InvalidArgument, "Null filename",
+                "LoadSpectralFromFile", 0));
+  }
+
+  FILE* fp = fopen(filename, "rb");
+  if (!fp) {
+    return Result<SpectralImageData>::error(
+      ErrorInfo(ErrorCode::IOError, "Failed to open file for reading",
+                filename, 0));
+  }
+
+  fseek(fp, 0, SEEK_END);
+  long file_size = ftell(fp);
+  fseek(fp, 0, SEEK_SET);
+
+  if (file_size <= 0) {
+    fclose(fp);
+    return Result<SpectralImageData>::error(
+      ErrorInfo(ErrorCode::IOError, "File is empty or seek failed",
+                filename, 0));
+  }
+
+  std::vector<uint8_t> data(static_cast<size_t>(file_size));
+  size_t read_size = fread(data.data(), 1, data.size(), fp);
+  fclose(fp);
+
+  if (read_size != data.size()) {
+    return Result<SpectralImageData>::error(
+      ErrorInfo(ErrorCode::IOError, "Failed to read complete file",
+                filename, 0));
+  }
+
+  return LoadSpectralFromMemory(data.data(), data.size());
 }
 
 }  // namespace v2
