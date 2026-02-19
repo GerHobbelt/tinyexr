@@ -23,6 +23,12 @@
 #include "streamreader.hh"
 #include "streamwriter.hh"
 
+// SIMD optimizations (optional, define TINYEXR_ENABLE_SIMD=1 to enable)
+#if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD
+#include "tinyexr_simd.hh"
+#include "tinyexr_huffman.hh"
+#endif
+
 namespace tinyexr {
 namespace v2 {
 
@@ -678,6 +684,113 @@ struct Box2i {
   int height() const { return max_y - min_y + 1; }
 };
 
+// Generic EXR attribute for custom/extended attributes
+struct Attribute {
+  std::string name;          // Attribute name
+  std::string type;          // Type string (e.g., "string", "float", "int", "v2f", etc.)
+  std::vector<uint8_t> data; // Raw attribute data
+
+  Attribute() = default;
+
+  Attribute(const std::string& n, const std::string& t, const std::vector<uint8_t>& d)
+    : name(n), type(t), data(d) {}
+
+  // Convenience constructors for common types
+  static Attribute String(const std::string& name, const std::string& value) {
+    Attribute attr;
+    attr.name = name;
+    attr.type = "string";
+    attr.data.assign(value.begin(), value.end());
+    return attr;
+  }
+
+  static Attribute Int(const std::string& name, int32_t value) {
+    Attribute attr;
+    attr.name = name;
+    attr.type = "int";
+    attr.data.resize(4);
+    std::memcpy(attr.data.data(), &value, 4);
+    return attr;
+  }
+
+  static Attribute Float(const std::string& name, float value) {
+    Attribute attr;
+    attr.name = name;
+    attr.type = "float";
+    attr.data.resize(4);
+    std::memcpy(attr.data.data(), &value, 4);
+    return attr;
+  }
+
+  static Attribute Double(const std::string& name, double value) {
+    Attribute attr;
+    attr.name = name;
+    attr.type = "double";
+    attr.data.resize(8);
+    std::memcpy(attr.data.data(), &value, 8);
+    return attr;
+  }
+
+  static Attribute V2f(const std::string& name, float x, float y) {
+    Attribute attr;
+    attr.name = name;
+    attr.type = "v2f";
+    attr.data.resize(8);
+    std::memcpy(attr.data.data(), &x, 4);
+    std::memcpy(attr.data.data() + 4, &y, 4);
+    return attr;
+  }
+
+  static Attribute V3f(const std::string& name, float x, float y, float z) {
+    Attribute attr;
+    attr.name = name;
+    attr.type = "v3f";
+    attr.data.resize(12);
+    std::memcpy(attr.data.data(), &x, 4);
+    std::memcpy(attr.data.data() + 4, &y, 4);
+    std::memcpy(attr.data.data() + 8, &z, 4);
+    return attr;
+  }
+
+  // Get value as string (for "string" type)
+  std::string as_string() const {
+    if (type == "string") {
+      return std::string(data.begin(), data.end());
+    }
+    return "";
+  }
+
+  // Get value as int (for "int" type)
+  int32_t as_int() const {
+    if (type == "int" && data.size() >= 4) {
+      int32_t v;
+      std::memcpy(&v, data.data(), 4);
+      return v;
+    }
+    return 0;
+  }
+
+  // Get value as float (for "float" type)
+  float as_float() const {
+    if (type == "float" && data.size() >= 4) {
+      float v;
+      std::memcpy(&v, data.data(), 4);
+      return v;
+    }
+    return 0.0f;
+  }
+
+  // Get value as double (for "double" type)
+  double as_double() const {
+    if (type == "double" && data.size() >= 8) {
+      double v;
+      std::memcpy(&v, data.data(), 8);
+      return v;
+    }
+    return 0.0;
+  }
+};
+
 struct Header {
   std::vector<Channel> channels;
   Box2i data_window;
@@ -695,18 +808,79 @@ struct Header {
   int tile_level_mode;
   int tile_rounding_mode;
 
-  // Multipart
-  std::string name;
-  std::string type;
+  // Multipart / Deep
+  std::string name;           // Part name (required for multipart)
+  std::string type;           // "scanlineimage", "tiledimage", "deepscanline", "deeptile"
+  std::string view;           // View name for stereo (e.g., "left", "right")
+  int chunk_count;            // Number of chunks (for multipart files)
+  int deep_data_version;      // Version of deep data format (1 = current)
+  bool is_deep;               // True if this is a deep image part
+
+  // Custom/extended attributes (non-standard attributes)
+  std::vector<Attribute> custom_attributes;
 
   size_t header_len;  // Length of header in bytes
 
   Header()
     : compression(0), line_order(0), pixel_aspect_ratio(1.0f),
       screen_window_width(1.0f), tiled(false), tile_size_x(0), tile_size_y(0),
-      tile_level_mode(0), tile_rounding_mode(0), header_len(0) {
+      tile_level_mode(0), tile_rounding_mode(0), chunk_count(0),
+      deep_data_version(0), is_deep(false), header_len(0) {
     screen_window_center[0] = 0.0f;
     screen_window_center[1] = 0.0f;
+  }
+
+  // Find custom attribute by name (returns nullptr if not found)
+  const Attribute* find_attribute(const std::string& name) const {
+    for (const auto& attr : custom_attributes) {
+      if (attr.name == name) return &attr;
+    }
+    return nullptr;
+  }
+
+  // Check if custom attribute exists
+  bool has_attribute(const std::string& name) const {
+    return find_attribute(name) != nullptr;
+  }
+
+  // Set or add custom attribute (replaces if exists)
+  void set_attribute(const Attribute& attr) {
+    for (auto& existing : custom_attributes) {
+      if (existing.name == attr.name) {
+        existing = attr;
+        return;
+      }
+    }
+    custom_attributes.push_back(attr);
+  }
+
+  // Convenience setters for common types
+  void set_string_attribute(const std::string& name, const std::string& value) {
+    set_attribute(Attribute::String(name, value));
+  }
+
+  void set_int_attribute(const std::string& name, int32_t value) {
+    set_attribute(Attribute::Int(name, value));
+  }
+
+  void set_float_attribute(const std::string& name, float value) {
+    set_attribute(Attribute::Float(name, value));
+  }
+
+  // Convenience getters for common types (returns default if not found)
+  std::string get_string_attribute(const std::string& name, const std::string& default_val = "") const {
+    const Attribute* attr = find_attribute(name);
+    return attr ? attr->as_string() : default_val;
+  }
+
+  int32_t get_int_attribute(const std::string& name, int32_t default_val = 0) const {
+    const Attribute* attr = find_attribute(name);
+    return attr ? attr->as_int() : default_val;
+  }
+
+  float get_float_attribute(const std::string& name, float default_val = 0.0f) const {
+    const Attribute* attr = find_attribute(name);
+    return attr ? attr->as_float() : default_val;
   }
 };
 
@@ -720,18 +894,86 @@ Result<Version> ParseVersion(Reader& reader);
 // Parse EXR header (after version)
 Result<Header> ParseHeader(Reader& reader, const Version& version);
 
+// Load options for customizing how EXR files are loaded
+struct LoadOptions {
+  // If true, preserve raw channel data in original format (UINT/HALF/FLOAT bytes)
+  // Default: false (only convert to RGBA float)
+  bool preserve_raw_channels = false;
+
+  // If true, convert pixel data to RGBA float (default behavior)
+  // Default: true
+  bool convert_to_rgba = true;
+
+  LoadOptions() : preserve_raw_channels(false), convert_to_rgba(true) {}
+};
+
 // Load full EXR from memory (simplified API)
 struct ImageData {
   int width;
   int height;
   int num_channels;
-  std::vector<float> rgba;  // Always RGBA float for simplicity in v2
+  std::vector<float> rgba;  // Always RGBA float for simplicity in v2 (when convert_to_rgba=true)
   Header header;
+
+  // Raw channel data (populated when LoadOptions.preserve_raw_channels = true)
+  // raw_channels[channel_index] contains the raw bytes for that channel
+  // The data format depends on the channel's pixel_type in header.channels
+  std::vector<std::vector<uint8_t>> raw_channels;
 
   ImageData() : width(0), height(0), num_channels(0) {}
 };
 
+// Deep image data - variable samples per pixel
+struct DeepImageData {
+  int width;
+  int height;
+  int num_channels;
+  Header header;
+
+  // Sample counts per pixel (width * height elements)
+  std::vector<uint32_t> sample_counts;
+
+  // Total number of samples across all pixels
+  size_t total_samples;
+
+  // Per-channel deep data (flattened, total_samples elements each)
+  // channel_data[channel_index][sample_index] = sample value
+  std::vector<std::vector<float>> channel_data;
+
+  DeepImageData() : width(0), height(0), num_channels(0), total_samples(0) {}
+};
+
+// Multipart image data - multiple parts/layers
+struct MultipartImageData {
+  std::vector<ImageData> parts;          // Regular image parts
+  std::vector<DeepImageData> deep_parts; // Deep image parts
+  std::vector<Header> headers;           // All part headers
+
+  // Get part by name
+  const ImageData* get_part(const std::string& name) const {
+    for (size_t i = 0; i < parts.size(); i++) {
+      if (parts[i].header.name == name) return &parts[i];
+    }
+    return nullptr;
+  }
+
+  // Get part by view name (for stereo)
+  const ImageData* get_view(const std::string& view) const {
+    for (size_t i = 0; i < parts.size(); i++) {
+      if (parts[i].header.view == view) return &parts[i];
+    }
+    return nullptr;
+  }
+};
+
 Result<ImageData> LoadFromMemory(const uint8_t* data, size_t size);
+
+// Load EXR from memory with options
+// Use this when you need to preserve raw channel data or customize loading behavior
+Result<ImageData> LoadFromMemory(const uint8_t* data, size_t size, const LoadOptions& opts);
+
+// Load multipart/deep EXR from memory
+Result<MultipartImageData> LoadMultipartFromMemory(const uint8_t* data, size_t size);
 
 // ============================================================================
 // Writer functions
@@ -744,7 +986,299 @@ Result<void> WriteVersion(Writer& writer, const Version& version);
 Result<void> WriteHeader(Writer& writer, const Header& header);
 
 // Save image data to memory (simplified API)
+// compression_level: 1-9 for ZIP compression (6 = default)
+Result<std::vector<uint8_t>> SaveToMemory(const ImageData& image, int compression_level);
 Result<std::vector<uint8_t>> SaveToMemory(const ImageData& image);
+
+// Save image data to file
+Result<void> SaveToFile(const char* filename, const ImageData& image, int compression_level = 6);
+
+// Save tiled EXR to memory
+// The image.header must have tiled=true, tile_size_x>0, and tile_size_y>0
+// compression_level: 1-9 for ZIP compression (6 = default)
+Result<std::vector<uint8_t>> SaveTiledToMemory(const ImageData& image, int compression_level);
+Result<std::vector<uint8_t>> SaveTiledToMemory(const ImageData& image);
+
+// Save tiled EXR to file
+Result<void> SaveTiledToFile(const char* filename, const ImageData& image, int compression_level = 6);
+
+// Save deep scanline EXR to memory
+// The deep.header must have type="deepscanline"
+// compression_level: 1-9 for ZIP compression (6 = default)
+Result<std::vector<uint8_t>> SaveDeepToMemory(const DeepImageData& deep, int compression_level);
+Result<std::vector<uint8_t>> SaveDeepToMemory(const DeepImageData& deep);
+
+// Save deep scanline EXR to file
+Result<void> SaveDeepToFile(const char* filename, const DeepImageData& deep, int compression_level = 6);
+
+// Save multipart image data to memory
+// compression_level: 1-9 for ZIP compression (6 = default)
+Result<std::vector<uint8_t>> SaveMultipartToMemory(const MultipartImageData& multipart, int compression_level);
+Result<std::vector<uint8_t>> SaveMultipartToMemory(const MultipartImageData& multipart);
+
+// Save multipart image data to file
+Result<void> SaveMultipartToFile(const char* filename, const MultipartImageData& multipart, int compression_level = 6);
+
+// ============================================================================
+// Pixel Processing Utilities (with SIMD optimization when enabled)
+// ============================================================================
+
+// Convert half-precision (FP16) array to single-precision (FP32)
+// Uses SIMD when TINYEXR_ENABLE_SIMD is defined
+inline void ConvertHalfToFloat(const uint16_t* half_data, float* float_data, size_t count) {
+#if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD
+  tinyexr::simd::half_to_float_batch(half_data, float_data, count);
+#else
+  // Scalar fallback (same algorithm as tinyexr.h)
+  for (size_t i = 0; i < count; i++) {
+    uint16_t h = half_data[i];
+    union { uint32_t u; float f; } o;
+    static const union { uint32_t u; float f; } magic = {113U << 23};
+    static const uint32_t shifted_exp = 0x7c00U << 13;
+
+    o.u = (h & 0x7fffU) << 13U;
+    uint32_t exp_ = shifted_exp & o.u;
+    o.u += (127 - 15) << 23;
+
+    if (exp_ == shifted_exp) {
+      o.u += (128 - 16) << 23;
+    } else if (exp_ == 0) {
+      o.u += 1 << 23;
+      o.f -= magic.f;
+    }
+
+    o.u |= (h & 0x8000U) << 16U;
+    float_data[i] = o.f;
+  }
+#endif
+}
+
+// Convert single-precision (FP32) array to half-precision (FP16)
+// Uses SIMD when TINYEXR_ENABLE_SIMD is defined
+inline void ConvertFloatToHalf(const float* float_data, uint16_t* half_data, size_t count) {
+#if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD
+  tinyexr::simd::float_to_half_batch(float_data, half_data, count);
+#else
+  // Scalar fallback
+  for (size_t i = 0; i < count; i++) {
+    float f = float_data[i];
+    union {
+      float f;
+      uint32_t u;
+      struct {
+        uint32_t Mantissa : 23;
+        uint32_t Exponent : 8;
+        uint32_t Sign : 1;
+      } s;
+    } fi;
+    fi.f = f;
+
+    union {
+      uint16_t u;
+      struct {
+        uint16_t Mantissa : 10;
+        uint16_t Exponent : 5;
+        uint16_t Sign : 1;
+      } s;
+    } o;
+    o.u = 0;
+
+    if (fi.s.Exponent == 0) {
+      o.s.Exponent = 0;
+    } else if (fi.s.Exponent == 255) {
+      o.s.Exponent = 31;
+      o.s.Mantissa = fi.s.Mantissa ? 0x200 : 0;
+    } else {
+      int newexp = static_cast<int>(fi.s.Exponent) - 127 + 15;
+      if (newexp >= 31) {
+        o.s.Exponent = 31;
+      } else if (newexp <= 0) {
+        if ((14 - newexp) <= 24) {
+          uint32_t mant = fi.s.Mantissa | 0x800000;
+          o.s.Mantissa = static_cast<uint16_t>(mant >> (14 - newexp));
+          if ((mant >> (13 - newexp)) & 1) {
+            o.u++;
+          }
+        }
+      } else {
+        o.s.Exponent = static_cast<uint16_t>(newexp);
+        o.s.Mantissa = static_cast<uint16_t>(fi.s.Mantissa >> 13);
+        if (fi.s.Mantissa & 0x1000) {
+          o.u++;
+        }
+      }
+    }
+
+    o.s.Sign = static_cast<uint16_t>(fi.s.Sign);
+    half_data[i] = o.u;
+  }
+#endif
+}
+
+// Interleave separate channel arrays into interleaved RGBA format
+// Input: 4 separate float arrays (R, G, B, A), each of length 'pixel_count'
+// Output: Interleaved RGBA array of length 'pixel_count * 4'
+inline void InterleaveRGBA(const float* r, const float* g, const float* b, const float* a,
+                           float* rgba, size_t pixel_count) {
+#if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD
+  tinyexr::simd::interleave_rgba_float(r, g, b, a, rgba, pixel_count);
+#else
+  for (size_t i = 0; i < pixel_count; i++) {
+    rgba[i * 4 + 0] = r[i];
+    rgba[i * 4 + 1] = g[i];
+    rgba[i * 4 + 2] = b[i];
+    rgba[i * 4 + 3] = a[i];
+  }
+#endif
+}
+
+// Deinterleave RGBA format into separate channel arrays
+inline void DeinterleaveRGBA(const float* rgba, float* r, float* g, float* b, float* a,
+                             size_t pixel_count) {
+#if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD
+  tinyexr::simd::deinterleave_rgba_float(rgba, r, g, b, a, pixel_count);
+#else
+  for (size_t i = 0; i < pixel_count; i++) {
+    r[i] = rgba[i * 4 + 0];
+    g[i] = rgba[i * 4 + 1];
+    b[i] = rgba[i * 4 + 2];
+    a[i] = rgba[i * 4 + 3];
+  }
+#endif
+}
+
+// Get SIMD capability information string
+inline const char* GetSIMDInfo() {
+#if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD
+  return tinyexr::simd::get_simd_info();
+#else
+  return "Scalar (SIMD disabled)";
+#endif
+}
+
+// Check if SIMD is enabled at compile time
+inline bool IsSIMDEnabled() {
+#if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD
+  return true;
+#else
+  return false;
+#endif
+}
+
+// ============================================================================
+// Compression/Decompression Utilities (with optimizations when enabled)
+// ============================================================================
+
+// Get Huffman/bit manipulation backend info
+inline const char* GetHuffmanInfo() {
+#if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD
+  return tinyexr::huffman::get_huffman_info();
+#else
+  return "Scalar (SIMD disabled)";
+#endif
+}
+
+// Decompress deflate data (raw deflate, no zlib header)
+// Returns true on success, false on error
+// dst_len should be set to the output buffer size on input,
+// and will be set to the actual decompressed size on output
+inline bool DecompressDeflate(const uint8_t* src, size_t src_len,
+                              uint8_t* dst, size_t* dst_len) {
+#if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD
+  return tinyexr::huffman::inflate(src, src_len, dst, dst_len);
+#else
+  // Fallback: not implemented without SIMD
+  // In production, this would call miniz or zlib
+  (void)src; (void)src_len; (void)dst; (void)dst_len;
+  return false;
+#endif
+}
+
+// Decompress zlib data (with 2-byte header)
+inline bool DecompressZlib(const uint8_t* src, size_t src_len,
+                          uint8_t* dst, size_t* dst_len) {
+#if defined(TINYEXR_ENABLE_SIMD) && TINYEXR_ENABLE_SIMD
+  return tinyexr::huffman::inflate_zlib(src, src_len, dst, dst_len);
+#else
+  // Fallback: not implemented without SIMD
+  (void)src; (void)src_len; (void)dst; (void)dst_len;
+  return false;
+#endif
+}
+
+// ============================================================================
+// Memory Pool for Temporary Buffers
+// ============================================================================
+
+// Thread-local scratch buffer pool to avoid repeated allocations
+// during decompression operations
+class ScratchPool {
+public:
+  static constexpr size_t SMALL_SIZE = 64 * 1024;     // 64KB
+  static constexpr size_t MEDIUM_SIZE = 256 * 1024;   // 256KB
+  static constexpr size_t LARGE_SIZE = 1024 * 1024;   // 1MB
+
+  ScratchPool() {
+    small_.resize(SMALL_SIZE);
+    medium_.resize(MEDIUM_SIZE);
+    large_.resize(LARGE_SIZE);
+  }
+
+  // Get pre-allocated small buffer (64KB)
+  uint8_t* get_small() { return small_.data(); }
+  size_t small_size() const { return SMALL_SIZE; }
+
+  // Get pre-allocated medium buffer (256KB)
+  uint8_t* get_medium() { return medium_.data(); }
+  size_t medium_size() const { return MEDIUM_SIZE; }
+
+  // Get pre-allocated large buffer (1MB)
+  uint8_t* get_large() { return large_.data(); }
+  size_t large_size() const { return LARGE_SIZE; }
+
+  // Get dynamic buffer, resizing if needed
+  uint8_t* get_dynamic(size_t needed) {
+    if (dynamic_.size() < needed) {
+      dynamic_.resize(needed);
+    }
+    return dynamic_.data();
+  }
+  size_t dynamic_size() const { return dynamic_.size(); }
+
+  // Get best-fit buffer for given size
+  // Returns pointer to appropriate pre-allocated buffer if size fits,
+  // otherwise allocates dynamic buffer
+  uint8_t* get_buffer(size_t needed) {
+    if (needed <= SMALL_SIZE) {
+      return get_small();
+    } else if (needed <= MEDIUM_SIZE) {
+      return get_medium();
+    } else if (needed <= LARGE_SIZE) {
+      return get_large();
+    } else {
+      return get_dynamic(needed);
+    }
+  }
+
+  // Clear dynamic buffer to release memory
+  void clear_dynamic() {
+    dynamic_.clear();
+    dynamic_.shrink_to_fit();
+  }
+
+private:
+  std::vector<uint8_t> small_;
+  std::vector<uint8_t> medium_;
+  std::vector<uint8_t> large_;
+  std::vector<uint8_t> dynamic_;
+};
+
+// Thread-local scratch pool instance
+// Each thread gets its own pool to avoid contention
+inline ScratchPool& get_scratch_pool() {
+  static thread_local ScratchPool pool;
+  return pool;
+}
 
 }  // namespace v2
 }  // namespace tinyexr
