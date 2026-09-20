@@ -17,7 +17,6 @@
 
 #include "exr_internal.h"
 
-#include <stdlib.h>
 
 /* Reversed nibble (deflate codes are emitted LSB-first). */
 static const uint8_t kRevNib[16] = {0x0, 0x8, 0x4, 0xC, 0x2, 0xA, 0x6, 0xE,
@@ -311,6 +310,7 @@ exr_result exr_fpnge_deflate(const exr_allocator *a, const uint8_t *src,
     }
 #else
     (void)use_simd;
+    (void)simd; /* non-x86: the scalar path is taken unconditionally below */
 #endif
 
     for (off = 0; off < n; off += CH) {

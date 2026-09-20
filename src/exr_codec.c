@@ -21,7 +21,10 @@ exr_result exr_decompress_block(const exr_codec_ctx *ctx, const uint8_t *src,
         memcpy(dst, src, dst_size);
         return EXR_SUCCESS;
     }
-    if (src_size > dst_size) return EXR_ERROR_CORRUPT;
+    if (src_size > dst_size &&
+        ctx->compression != EXR_COMPRESSION_HTJ2K256 &&
+        ctx->compression != EXR_COMPRESSION_HTJ2K32)
+        return EXR_ERROR_CORRUPT;
 
     switch (ctx->compression) {
     case EXR_COMPRESSION_NONE:
@@ -41,10 +44,18 @@ exr_result exr_decompress_block(const exr_codec_ctx *ctx, const uint8_t *src,
     case EXR_COMPRESSION_B44A:
         return exr_b44_decompress(ctx, src, src_size, dst, dst_size, 1);
     case EXR_COMPRESSION_ZSTD:
+#ifdef EXR_NO_ZSTD
+        return EXR_ERROR_UNSUPPORTED;
+#else
         return exr_zstd_decompress(ctx->alloc, src, src_size, dst, dst_size);
+#endif
     case EXR_COMPRESSION_HTJ2K256:
     case EXR_COMPRESSION_HTJ2K32:
+#ifdef EXR_NO_JPH
+        return EXR_ERROR_UNSUPPORTED;
+#else
         return exr_jph_decompress(ctx, src, src_size, dst, dst_size);
+#endif
     case EXR_COMPRESSION_DWAA:
     case EXR_COMPRESSION_DWAB:
         return EXR_ERROR_UNSUPPORTED;
@@ -78,10 +89,18 @@ exr_result exr_compress_block(const exr_codec_ctx *ctx, const uint8_t *block,
     case EXR_COMPRESSION_B44A:
         return exr_b44_compress(ctx, block, n, out_data, out_size, 1);
     case EXR_COMPRESSION_ZSTD:
+#ifdef EXR_NO_ZSTD
+        return EXR_ERROR_UNSUPPORTED;
+#else
         return exr_zstd_compress(ctx->alloc, block, n, out_data, out_size);
+#endif
     case EXR_COMPRESSION_HTJ2K256:
     case EXR_COMPRESSION_HTJ2K32:
+#ifdef EXR_NO_JPH
+        return EXR_ERROR_UNSUPPORTED;
+#else
         return exr_jph_compress(ctx, block, n, out_data, out_size);
+#endif
     default:
         return EXR_ERROR_UNSUPPORTED;
     }
@@ -94,12 +113,17 @@ exr_result exr_compress_block(const exr_codec_ctx *ctx, const uint8_t *block,
  *   interleave: source is the even-byte half followed by the odd-byte half.
  * ------------------------------------------------------------------------- */
 
-void exr_predictor_decode(uint8_t *p, size_t n) {
+void exr_predictor_decode_scalar(uint8_t *p, size_t n) {
     size_t i;
     for (i = 1; i < n; ++i) {
         int d = (int)p[i - 1] + (int)p[i] - 128;
         p[i] = (uint8_t)d;
     }
+}
+
+void exr_predictor_decode(uint8_t *p, size_t n) {
+    exr_simd_init();
+    exr_simd.predictor_decode(p, n);
 }
 
 void exr_interleave_decode(const uint8_t *src, uint8_t *dst, size_t n) {
@@ -120,7 +144,7 @@ void exr_interleave_encode(const uint8_t *src, uint8_t *dst, size_t n) {
 
 /* Forward delta predictor: store (cur - prev + 128) per byte. Inverse of
  * exr_predictor_decode. */
-void exr_predictor_encode(uint8_t *p, size_t n) {
+void exr_predictor_encode_scalar(uint8_t *p, size_t n) {
     size_t i;
     int prev;
     if (n == 0) return;
@@ -130,4 +154,9 @@ void exr_predictor_encode(uint8_t *p, size_t n) {
         p[i] = (uint8_t)(cur - prev + (128 + 256));
         prev = cur;
     }
+}
+
+void exr_predictor_encode(uint8_t *p, size_t n) {
+    exr_simd_init();
+    exr_simd.predictor_encode(p, n);
 }

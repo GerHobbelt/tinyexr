@@ -55,7 +55,7 @@ exr_result exr_pxr24_decompress(const exr_codec_ctx *ctx, const uint8_t *src,
         memcpy(buf, src, inter);
     } else {
         size_t got = 0;
-        rc = exr_inflate_zlib(src, src_size, buf, inter, &got);
+        rc = EXR_INFLATE_ZLIB(src, src_size, buf, inter, &got);
         if (EXR_OK(rc) && got != inter) rc = EXR_ERROR_CORRUPT;
         if (!EXR_OK(rc)) {
             exr_free(a, buf);
@@ -171,7 +171,13 @@ exr_result exr_pxr24_compress(const exr_codec_ctx *ctx, const uint8_t *block,
             if ((yy % ys) != 0) continue;
             w = exr_num_samples(xmin, xmax, xs);
             if (w < 0) w = 0;
-            inter += (size_t)w * pxr_bpc(ctx->channels[c].pixel_type);
+            {
+                size_t add;
+                if (exr_mul_ovf((size_t)w, pxr_bpc(ctx->channels[c].pixel_type),
+                                &add) ||
+                    exr_add_ovf(inter, add, &inter))
+                    return EXR_ERROR_CORRUPT;
+            }
         }
     }
     buf = (uint8_t *)exr_malloc(a, inter ? inter : 1);
@@ -234,7 +240,7 @@ exr_result exr_pxr24_compress(const exr_codec_ctx *ctx, const uint8_t *block,
         }
     }
 
-    rc = exr_deflate_zlib(a, buf, inter, &comp, &clen);
+    rc = EXR_DEFLATE_ZLIB(a, buf, inter, &comp, &clen);
     exr_free(a, buf);
     if (!EXR_OK(rc) || clen >= n) { /* store the canonical block raw */
         exr_free(a, comp);

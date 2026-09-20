@@ -22,6 +22,10 @@ untouched.
 - `make test-c`     — unit tests under ASan+UBSan (note: runs with `detect_leaks=0`).
 - `make fuzz-corpus`— replay `test/unit/regression/*` under ASan+UBSan+**LSan**
   (this is what catches error-path leaks; keep it green).
+- `make fuzz-corpus-asan` — same corpus replay with `ASAN_OPTIONS=detect_leaks=0`;
+  use only in ptrace/sandboxed local sessions where LSan aborts with
+  "LeakSanitizer does not work under ptrace". It is a crash/ASan/UBSan fallback,
+  not a replacement for the LSan gate.
 - `make fuzz`       — clang/libFuzzer coverage-guided target (`build/fuzz_v3`).
 - `make bench`      — codec + SIMD-kernel throughput.
 
@@ -30,6 +34,33 @@ Validation method: cross-check against the legacy v1 loader
 (`exrheader`, `exrmaketiled`, `exrmultipart`). `oiiotool` is broken here
 (missing libboost). For lossy codecs the bar is "OpenEXR reads my output and my
 own decode matches"; for lossless it is byte-identical.
+
+## Secret-scanning audit (run before/after committing)
+
+Audit new commits for accidentally-committed credentials with **both**
+gitleaks and trufflehog. Tools default to `~/go/bin/` (trufflehog lives there;
+gitleaks may also be on `PATH`). Both must exit 0 (no findings) before pushing.
+
+```sh
+# Scan only the new commits: RANGE = <last-known-clean>..HEAD (e.g. a tag or the
+# upstream commit you branched from). Use --all / drop --log-opts for a full sweep.
+RANGE=origin/release..HEAD
+
+# gitleaks: history scan, redact matches, fail (non-zero) on any leak.
+gitleaks detect --source . --log-opts="$RANGE" --no-banner --redact
+
+# trufflehog: scan the same range; --fail makes it exit non-zero on a finding.
+~/go/bin/trufflehog git "file://$(pwd)" --since-commit "${RANGE%%..*}" \
+    --results=verified,unknown --no-update --fail
+```
+
+Both should report "no leaks found" / `verified_secrets: 0` and exit 0. If either
+flags something, do not push — rewrite history to drop the secret and rotate it.
+
+`.gitleaks.toml` (auto-loaded from the repo root) allowlists the vendored
+`deps/zstd/` amalgamation, whose xxHash key-mixing intrinsics (`key_lo`/`key_hi`)
+trip the generic-api-key heuristic — those are upstream constants, not secrets.
+Keep first-party code out of the allowlist.
 
 ## Conventions
 

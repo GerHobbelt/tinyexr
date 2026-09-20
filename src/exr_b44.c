@@ -12,10 +12,14 @@
 
 #include "exr_internal.h"
 
-#include <math.h>
-#include <stdlib.h>
-
-/* ---- perceptual tables (lazy init) ---------------------------------------- */
+/* ---- perceptual tables (computed once, on first use) -----------------------
+ * The two half-indexed tables (convertFromLinear / convertToLinear) are built
+ * at runtime into .bss so no large precomputed array is baked into the object.
+ * To keep the core freestanding (no <math.h>), exp/log are implemented here in
+ * double precision; they reproduce libm's results bit-for-bit after the f2h
+ * quantization for the entire half domain (verified vs libm over all 65536
+ * entries; see the b44 table test in test_exr_v3.c).
+ * ------------------------------------------------------------------------- */
 
 static uint16_t g_b44_exp_table[65536];
 static uint16_t g_b44_log_table[65536];
@@ -56,6 +60,52 @@ static uint16_t b44_f2h(float f) {
     return (uint16_t)((s << 15) | ((e - 112) << 10) | (m >> 13));
 }
 
+/* 2^k as a double (normal + subnormal range). The B44 table domain keeps k well
+ * inside [-1022,1023]; the clamps just keep the bit math defined at the edges. */
+static double b44_scale2(int k) {
+    union { uint64_t b; double d; } u;
+    if (k > 1023) k = 1023;
+    if (k < -1074) return 0.0;
+    if (k >= -1022) { u.b = (uint64_t)(k + 1023) << 52; return u.d; }
+    u.b = (uint64_t)(k + 54 + 1023) << 52;
+    return u.d * 0x1p-54;
+}
+
+/* exp(x): range-reduce x = k*ln2 + r, Taylor on r in [-ln2/2, ln2/2]. */
+static double b44_exp(double x) {
+    const double INV_LN2 = 1.4426950408889634;
+    const double LN2_HI = 6.93145751953125e-1, LN2_LO = 1.42860682030941723212e-6;
+    int k;
+    double r, r2, p;
+    if (x != x) return x; /* NaN */
+    k = (int)(x * INV_LN2 + (x < 0 ? -0.5 : 0.5));
+    r = (x - (double)k * LN2_HI) - (double)k * LN2_LO;
+    r2 = r * r;
+    p = r + r2 * (0.5 + r * (1.0 / 6 + r * (1.0 / 24 + r * (1.0 / 120 +
+        r * (1.0 / 720 + r * (1.0 / 5040 + r * (1.0 / 40320 + r * (1.0 / 362880))))))));
+    return (1.0 + p) * b44_scale2(k);
+}
+
+/* log(x), x > 0: x = m*2^e with m in [1,2); log via atanh series of (m-1)/(m+1). */
+static double b44_log(double x) {
+    union { uint64_t b; double d; } u;
+    int e;
+    double m, f, f2, s;
+    const double LN2 = 0.6931471805599453;
+    if (x <= 0.0) return -1.0e308; /* unreachable: caller guards x>0 */
+    u.d = x;
+    if (((u.b >> 52) & 0x7ff) == 0) { u.d = x * 0x1p54; e = -54; } else { e = 0; }
+    e += (int)((u.b >> 52) & 0x7ff) - 1023;
+    u.b = (u.b & 0x000fffffffffffffULL) | 0x3ff0000000000000ULL;
+    m = u.d;
+    if (m > 1.4142135623730951) { m *= 0.5; e++; }
+    f = (m - 1.0) / (m + 1.0);
+    f2 = f * f;
+    s = f * (2.0 + f2 * (2.0 / 3 + f2 * (2.0 / 5 + f2 * (2.0 / 7 + f2 * (2.0 / 9 +
+        f2 * (2.0 / 11 + f2 * (2.0 / 13)))))));
+    return (double)e * LN2 + s;
+}
+
 static void b44_init_tables(void) {
     int i;
     if (g_b44_tables_ready) return;
@@ -67,21 +117,28 @@ static void b44_init_tables(void) {
         else if (x >= 0x558c && x < 0x8000)
             g_b44_exp_table[i] = 0x7bff;
         else
-            g_b44_exp_table[i] = b44_f2h((float)exp((double)b44_h2f(x) / 8.0));
+            g_b44_exp_table[i] = b44_f2h((float)b44_exp((double)b44_h2f(x) / 8.0));
         /* logTable: convertToLinear */
         if ((x & 0x7c00) == 0x7c00) {
             g_b44_log_table[i] = 0;
         } else if (x > 0x8000) {
             g_b44_log_table[i] = 0;
         } else {
-            float f = b44_h2f(x);
-            if (f <= 0.0f)
+            float ff = b44_h2f(x);
+            if (ff <= 0.0f)
                 g_b44_log_table[i] = 0;
             else
-                g_b44_log_table[i] = b44_f2h((float)(8.0 * log((double)f)));
+                g_b44_log_table[i] = b44_f2h((float)(8.0 * b44_log((double)ff)));
         }
     }
     g_b44_tables_ready = 1;
+}
+
+/* Internal hook for the table-correctness test (forces init, returns tables). */
+void exr_b44_debug_tables(const uint16_t **exp_tbl, const uint16_t **log_tbl) {
+    b44_init_tables();
+    if (exp_tbl) *exp_tbl = g_b44_exp_table;
+    if (log_tbl) *log_tbl = g_b44_log_table;
 }
 
 /* ---- block unpack (matches OpenEXR unpack14 / unpack3) --------------------- */

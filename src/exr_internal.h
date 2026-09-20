@@ -12,7 +12,23 @@
 
 #include <stddef.h>
 #include <stdint.h>
+
+/*
+ * Freestanding builds (EXR_FREESTANDING) must not pull hosted <string.h>. We
+ * declare the handful of mem/str symbols we use (and that the compiler may
+ * emit) and define them in src/exr_freestanding.c. Hosted builds use the libc
+ * versions as before; no call sites change either way.
+ */
+#ifdef EXR_FREESTANDING
+void *memcpy(void *dst, const void *src, size_t n);
+void *memmove(void *dst, const void *src, size_t n);
+void *memset(void *dst, int c, size_t n);
+int memcmp(const void *a, const void *b, size_t n);
+size_t strlen(const char *s);
+int strcmp(const char *a, const char *b);
+#else
 #include <string.h>
+#endif
 
 /* ============================================================================
  * EXR format constants
@@ -125,6 +141,8 @@ typedef struct {
     void (*half_to_float)(const uint16_t *src, float *dst, size_t count);
     void (*float_to_half)(const float *src, uint16_t *dst, size_t count);
     void (*interleave)(const uint8_t *src, uint8_t *dst, size_t n); /* de-split */
+    void (*predictor_decode)(uint8_t *p, size_t n); /* delta -> prefix sum */
+    void (*predictor_encode)(uint8_t *p, size_t n); /* prefix sum -> delta */
 } exr_simd_vtbl;
 
 extern exr_simd_vtbl exr_simd;
@@ -132,21 +150,103 @@ void exr_simd_init(void);
 /* Force a kernel tier for benchmarking: 0=scalar, 1=sse2/neon, 2=avx2/f16c. */
 void exr_simd_force(int level);
 
+/* Benchmark-only: override the cached CPU caps so codec-internal dispatch that
+ * reads exr_cpu_caps() directly (e.g. the JPH/HTJ2K path) selects a specific
+ * tier. level: -1 restore real detection, 0 scalar, 1 sse4.1, 2 avx2. */
+void exr_cpu_caps_force(int level);
+
+/* Simple parallel-for over [0, njobs): runs fn(ctx, job) for each job, using up
+ * to `nthreads` workers (the calling thread participates). Always defined; when
+ * the library is built without EXR_USE_THREADS it runs serially. Jobs must be
+ * independent and report results through ctx (no aggregated return value).
+ * Defined in exr_thread.c. */
+typedef void (*exr_par_fn)(void *ctx, int job);
+void exr_parallel_for(int nthreads, int njobs, exr_par_fn fn, void *ctx);
+
 /* Scalar kernels (always built). */
 void exr_half_to_float_scalar(const uint16_t *src, float *dst, size_t count);
 void exr_float_to_half_scalar(const float *src, uint16_t *dst, size_t count);
 void exr_interleave_scalar(const uint8_t *src, uint8_t *dst, size_t n);
+void exr_predictor_decode_scalar(uint8_t *p, size_t n);
+void exr_predictor_encode_scalar(uint8_t *p, size_t n);
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #define EXR_X86 1
 void exr_interleave_sse2(const uint8_t *src, uint8_t *dst, size_t n);
 void exr_interleave_avx2(const uint8_t *src, uint8_t *dst, size_t n);
+/* SSE2 predictor: prefix-sum (decode) / delta (encode), bit-identical to the
+ * scalar reference. */
+void exr_predictor_decode_sse2(uint8_t *p, size_t n);
+void exr_predictor_encode_sse2(uint8_t *p, size_t n);
 void exr_half_to_float_f16c(const uint16_t *src, float *dst, size_t count);
 void exr_float_to_half_f16c(const float *src, uint16_t *dst, size_t count);
+
+/* JPH (HTJ2K) SIMD kernels (src/exr_jph_simd.c). Each has a scalar reference of
+ * the same name with a `_scalar` suffix that is the source of truth; the SIMD
+ * variants must be bit-identical. Dispatched at runtime via exr_cpu_caps(). */
+void jph_nlt_type3_i64_sse2(int64_t *data, size_t count, int64_t bias);
+void jph_nlt_type3_i64_avx2(int64_t *data, size_t count, int64_t bias);
+/* int32 NLT type-3 (all-HALF / bit_depth<=31 path): if v<0, v = ~v - biasm1
+ * (== -v-bias, which always fits int32 for bit_depth<=31). 8/4-lane masked. */
+void jph_nlt_type3_i32_sse2(int32_t *data, size_t count, int32_t biasm1);
+void jph_nlt_type3_i32_avx2(int32_t *data, size_t count, int32_t biasm1);
+/* Pack n int32 plane samples (all-HALF fast path) to little-endian uint16 by
+ * truncation (low 16 bits), matching the scalar (uint16_t)v store. */
+void jph_pack_i32_to_half_sse41(uint8_t *dst, const int32_t *src, size_t n);
+void jph_pack_i32_to_half_avx2(uint8_t *dst, const int32_t *src, size_t n);
+/* AVX2 inverse reversible 5/3 1D lifting (int32, int64 intermediates, 4 lanes).
+ * Bit-identical to exr_jph_inverse_53_i32; returns EXR_ERROR_CORRUPT iff a
+ * reconstructed sample exceeds int32 (matching the scalar). ev/od are caller
+ * scratch of >= low_count / >= high_count int64 each. */
+exr_result jph_inverse_53_i32_avx2(const int32_t *low, size_t low_count,
+                                   const int32_t *high, size_t high_count,
+                                   int32_t *out, size_t out_count,
+                                   int64_t *ev, int64_t *od);
+/* Forward reversible 5/3 1D lifting (int64), bit-identical to the scalar
+ * jph_forward_53_i64; ev/od are caller scratch of >= ceil(n/2) int64 each. */
+exr_result jph_forward_53_i64_avx2(const int64_t *src, size_t n, int64_t *low,
+                                   size_t low_count, int64_t *high,
+                                   size_t high_count, int64_t *ev, int64_t *od);
+/* AVX2 vertical (column) inverse reversible 5/3 (int32), row-wise across all
+ * columns; bit-identical to exr_jph_inverse_53_vert_i32. temp: lh low-rows then
+ * hh high-rows (stride rw) -> rh interleaved rows in data (stride width). */
+exr_result jph_inverse_53_vert_i32_avx2(const int32_t *temp, size_t rw,
+                                        size_t lh, size_t hh,
+                                        int32_t *data, size_t width);
+/* AVX2 inverse reversible 5/3 1D (int64, float/32-bit decode path); bit-identical
+ * to jph_inverse_53_i64. ev/od are caller scratch (>= low/high counts). */
+exr_result jph_inverse_53_i64_avx2(const int64_t *low, size_t low_count,
+                                   const int64_t *high, size_t high_count,
+                                   int64_t *out, size_t out_count,
+                                   int64_t *ev, int64_t *od);
+/* AVX2 vertical (column) inverse 5/3 (int64), row-wise; bit-identical to
+ * jph_inverse_53_vert_i64. temp: lh low-rows, hh high-rows -> rh rows in data. */
+exr_result jph_inverse_53_vert_i64_avx2(const int64_t *temp, size_t rw,
+                                        size_t lh, size_t hh,
+                                        int64_t *data, size_t width);
+/* AVX2 sign-magnitude codeblock word -> signed int64 coefficient; bit-identical
+ * to the scalar extraction loop in jph_decode_block. */
+void jph_extract_signmag_i32_to_i64_avx2(int64_t *out, const uint32_t *buf,
+                                         size_t n, unsigned shift);
+/* AVX2 vertical (column) forward reversible 5/3 (int64), row-wise across all
+ * columns; bit-identical to jph_forward_53_vert_i64. data's interleaved rows
+ * (stride width) -> subband layout in temp (stride rw): lh low-rows, hh high. */
+exr_result jph_forward_53_vert_i64_avx2(const int64_t *data, size_t width,
+                                        size_t rw, size_t lh, size_t hh,
+                                        int64_t *temp);
 #endif
+
+/* Scalar references for the JPH NLT type-3 involution (v<0 -> -v-bias). */
+void jph_nlt_type3_i64_scalar(int64_t *data, size_t count, int64_t bias);
+void jph_nlt_type3_i32_scalar(int32_t *data, size_t count, int32_t biasm1);
+void jph_pack_i32_to_half_scalar(uint8_t *dst, const int32_t *src, size_t n);
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #define EXR_NEON 1
 void exr_interleave_neon(const uint8_t *src, uint8_t *dst, size_t n);
+/* NEON predictor: prefix-sum (decode) / delta (encode), bit-identical to the
+ * scalar reference. */
+void exr_predictor_decode_neon(uint8_t *p, size_t n);
+void exr_predictor_encode_neon(uint8_t *p, size_t n);
 #endif
 
 /* ============================================================================
@@ -204,6 +304,10 @@ exr_result exr_parse_chlist(const exr_allocator *a, const uint8_t *data,
 exr_result exr_header_copy(const exr_allocator *a, exr_header *dst,
                            const exr_header *src);
 void exr_header_free(const exr_allocator *a, exr_header *hdr);
+
+/* The allocator a writer was created with (exr_stdio.c frees finalize buffers
+ * with it). exr_writer is opaque outside exr_writer.c. */
+const exr_allocator *exr_writer_allocator(const exr_writer *w);
 
 /* ============================================================================
  * Internal per-part state held by the reader
@@ -317,6 +421,17 @@ exr_result exr_read_deep_scanline_part(exr_reader *r, exr_int_part *p,
 exr_result exr_read_deep_tiled_part(exr_reader *r, exr_int_part *p,
                                     int32_t part_idx, exr_part *out);
 
+/* Deep block streaming decode (exr_deep.c): decode one chunk `idx` block-local.
+ * bw/bh are the block pixel extent (from exr_reader_block_info); is_tiled selects
+ * the chunk-header layout. _counts fills bw*bh per-pixel counts (block row-major);
+ * _samples fills chan_dst[c] with sum(counts) contiguous samples per channel. */
+exr_result exr_deep_decode_counts(exr_reader *r, exr_int_part *p,
+                                  int32_t part_idx, uint32_t idx, int bw, int bh,
+                                  int is_tiled, int32_t *counts);
+exr_result exr_deep_decode_samples(exr_reader *r, exr_int_part *p,
+                                   int32_t part_idx, uint32_t idx, int bw, int bh,
+                                   int is_tiled, void *const *chan_dst);
+
 /* Build a temporary deep part for tile level (lw x lh) by point-subsampling the
  * source: level pixel (x,y) takes the samples of source pixel
  * (x*W/lw, y*H/lh). out shares src's header (channels not owned); free the deep
@@ -396,6 +511,22 @@ exr_result exr_jph_decompress(const exr_codec_ctx *ctx, const uint8_t *src,
 exr_result exr_jph_inverse_53_i32(const int32_t *low, size_t low_count,
                                   const int32_t *high, size_t high_count,
                                   int32_t *out, size_t out_count);
+/* Row-wise vertical inverse 5/3 (int32); source of truth for the AVX2 variant. */
+exr_result exr_jph_inverse_53_vert_i32(const int32_t *temp, size_t rw,
+                                       size_t lh, size_t hh,
+                                       int32_t *data, size_t width);
+/* Row-wise vertical forward 5/3 (int64); source of truth for the AVX2 variant. */
+exr_result jph_forward_53_vert_i64(const int64_t *data, size_t width,
+                                   size_t rw, size_t lh, size_t hh,
+                                   int64_t *temp);
+/* int64 inverse 5/3 1D + row-wise vertical scalar refs (sources of truth for
+ * the AVX2 variants). */
+exr_result jph_inverse_53_i64(const int64_t *low, size_t low_count,
+                              const int64_t *high, size_t high_count,
+                              int64_t *out, size_t out_count);
+exr_result jph_inverse_53_vert_i64(const int64_t *temp, size_t rw,
+                                   size_t lh, size_t hh,
+                                   int64_t *data, size_t width);
 exr_result exr_jph_inverse_53_2d_i32(const exr_allocator *a, int32_t *data,
                                      size_t width, size_t height,
                                      unsigned levels);
@@ -510,6 +641,22 @@ exr_result exr_deflate_zlib(const exr_allocator *a, const uint8_t *src,
 /* Adler-32 (zlib trailer). */
 uint32_t exr_adler32(const uint8_t *data, size_t n, uint32_t adler);
 
+/* Optional libdeflate backend for ZIP/ZIPS/PXR24 (gated by EXR_USE_LIBDEFLATE,
+ * default off). The in-tree encoder/inflate above stay the default and remain
+ * the only path for freestanding builds. ZIP/PXR24 call these via the
+ * EXR_DEFLATE_ZLIB / EXR_INFLATE_ZLIB macros so the choice is a build flag. */
+#ifdef EXR_USE_LIBDEFLATE
+exr_result exr_ld_deflate_zlib(const exr_allocator *a, const uint8_t *src,
+                               size_t n, uint8_t **out_data, size_t *out_size);
+exr_result exr_ld_inflate_zlib(const uint8_t *src, size_t src_size, uint8_t *dst,
+                               size_t dst_cap, size_t *out_size);
+#define EXR_DEFLATE_ZLIB exr_ld_deflate_zlib
+#define EXR_INFLATE_ZLIB exr_ld_inflate_zlib
+#else
+#define EXR_DEFLATE_ZLIB exr_deflate_zlib
+#define EXR_INFLATE_ZLIB exr_inflate_zlib
+#endif
+
 /* fpnge-derived literal DEFLATE encoder with a PSHUFB Huffman-table lookup.
  * The PSHUFB-friendly table: symbols 0-15 and 240-255 are looked up by low
  * nibble, and 16-239 share one code length (so the code is computable from the
@@ -574,8 +721,18 @@ exr_result exr_pxr24_compress(const exr_codec_ctx *ctx, const uint8_t *block,
 exr_result exr_b44_compress(const exr_codec_ctx *ctx, const uint8_t *block,
                             size_t n, uint8_t **out_data, size_t *out_size,
                             int optimize_flat);
+/* Test hook: force B44 perceptual-table init and expose the two tables so a
+ * hosted test can verify them bit-for-bit against a libm reference. */
+void exr_b44_debug_tables(const uint16_t **exp_tbl, const uint16_t **log_tbl);
 exr_result exr_zstd_compress(const exr_allocator *a, const uint8_t *src,
                              size_t n, uint8_t **out_data, size_t *out_size);
+exr_result exr_jph_forward_53_2d_i32(const exr_allocator *a,
+                                      int32_t *data, size_t width,
+                                      size_t height, unsigned levels);
+exr_result exr_jph_forward_rct_i32(int32_t *c0, int32_t *c1, int32_t *c2,
+                                   size_t count);
+exr_result exr_jph_forward_nlt_type3_i32(int32_t *data, size_t count,
+                                         uint32_t bit_depth);
 exr_result exr_jph_compress(const exr_codec_ctx *ctx, const uint8_t *block,
                             size_t n, uint8_t **out_data, size_t *out_size);
 
