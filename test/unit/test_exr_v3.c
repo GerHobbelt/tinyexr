@@ -307,6 +307,73 @@ static void jph_encode_subsampling_roundtrip(void) {
     exr_image_free(&dec);
 }
 
+/* Encode a 3-channel RGB file (HALF + FLOAT) and decode it losslessly. Exactly
+ * 3 same-type channels triggers the multicomponent RCT (mc_trans=1) on encode;
+ * a bit-exact round-trip proves the forward RCT + inverse RCT agree. */
+static void jph_encode_rct_roundtrip(void) {
+    const int W = 5, H = 4, N = 20;
+    int i, ok = 1;
+    float Rf[20], Gf[20], Bf[20];
+    uint16_t Rh[20], Gh[20], Bh[20];
+    for (i = 0; i < N; ++i) {
+        Rf[i] = (float)i * 0.1f - 0.5f;       /* incl. negatives */
+        Gf[i] = (float)((i * 7) % 13) * 0.3f;
+        Bf[i] = (float)(N - i) * 0.07f;
+    }
+    exr_float_to_half(Rf, Rh, N);
+    exr_float_to_half(Gf, Gh, N);
+    exr_float_to_half(Bf, Bh, N);
+    {
+        struct { exr_pixel_type pt; void *r, *g, *b; size_t bytes; const char *nm; }
+        cases[2] = {
+            {EXR_PIXEL_HALF, Rh, Gh, Bh, (size_t)N * 2, "HALF"},
+            {EXR_PIXEL_FLOAT, Rf, Gf, Bf, (size_t)N * 4, "FLOAT"}};
+        int k;
+        for (k = 0; k < 2; ++k) {
+            exr_image img, dec;
+            exr_part part;
+            exr_channel ch[3];
+            void *images[3], *buf = NULL;
+            size_t sz = 0;
+            exr_result rc;
+            memset(&img, 0, sizeof(img));
+            img.num_parts = 1; img.parts = &part;
+            memset(&part, 0, sizeof(part));
+            part.header.num_channels = 3;
+            part.header.channels = ch;
+            memset(ch, 0, sizeof(ch));
+            ch[0] = (exr_channel){"B", cases[k].pt, 1, 1, 0}; /* sorted B,G,R */
+            ch[1] = (exr_channel){"G", cases[k].pt, 1, 1, 0};
+            ch[2] = (exr_channel){"R", cases[k].pt, 1, 1, 0};
+            part.header.data_window.min_x = 0;
+            part.header.data_window.min_y = 0;
+            part.header.data_window.max_x = W - 1;
+            part.header.data_window.max_y = H - 1;
+            part.header.display_window = part.header.data_window;
+            part.width = W; part.height = H;
+            part.images = images;
+            images[0] = cases[k].b; images[1] = cases[k].g; images[2] = cases[k].r;
+            part.header.compression = EXR_COMPRESSION_HTJ2K32;
+            rc = exr_save_to_memory(&buf, &sz, NULL, &img, EXR_COMPRESSION_HTJ2K32);
+            if (!EXR_OK(rc)) { ok = 0; continue; }
+            memset(&dec, 0, sizeof(dec));
+            rc = exr_load_from_memory(buf, sz, NULL, &dec);
+            free(buf);
+            if (!EXR_OK(rc) || dec.parts[0].header.num_channels != 3) {
+                ok = 0;
+            } else {
+                if (memcmp(dec.parts[0].images[0], cases[k].b, cases[k].bytes) ||
+                    memcmp(dec.parts[0].images[1], cases[k].g, cases[k].bytes) ||
+                    memcmp(dec.parts[0].images[2], cases[k].r, cases[k].bytes))
+                    ok = 0;
+                exr_image_free(&dec);
+            }
+        }
+    }
+    CHECK(ok, "3-channel RGB HTJ2K (RCT) round-trips losslessly (HALF+FLOAT)");
+    if (ok) printf("  ok: 3-channel HTJ2K RCT round-trips (mc_trans=1)\n");
+}
+
 /* Encode a UINT-only file and decode it losslessly. */
 static void jph_encode_uint_roundtrip(void) {
     exr_image img, dec;
@@ -1702,13 +1769,18 @@ static void deep_tiled_oob_rejects(void) {
     memset(&back, 0, sizeof(back));
     if (EXR_OK(exr_load_from_memory(buf, sz, NULL, &back))) exr_image_free(&back);
 
-    /* offset table stored verbatim = cumulative int32 LE [1,2,3,4]; corrupt to
-     * decreasing [4,3,2,1] so pixel 1 yields a negative count. */
-    for (i = 0; i < 4; ++i) {
-        pat[i * 4 + 0] = (uint8_t)(i + 1); pat[i * 4 + 1] = 0;
-        pat[i * 4 + 2] = 0; pat[i * 4 + 3] = 0;
-        rep[i * 4 + 0] = (uint8_t)(4 - i); rep[i * 4 + 1] = 0;
-        rep[i * 4 + 2] = 0; rep[i * 4 + 3] = 0;
+    /* offset table stored verbatim = cumulative-per-row int32 LE [1,2,1,2]
+     * (each tile row restarts); corrupt row 0 to decreasing [2,1,2,1] so pixel
+     * (0,1) yields a negative count. */
+    {
+        static const uint8_t patv[4] = {1, 2, 1, 2};
+        static const uint8_t repv[4] = {2, 1, 2, 1};
+        for (i = 0; i < 4; ++i) {
+            pat[i * 4 + 0] = patv[i]; pat[i * 4 + 1] = 0;
+            pat[i * 4 + 2] = 0; pat[i * 4 + 3] = 0;
+            rep[i * 4 + 0] = repv[i]; rep[i * 4 + 1] = 0;
+            rep[i * 4 + 2] = 0; rep[i * 4 + 3] = 0;
+        }
     }
     for (i = 0; sz >= 16 && i + 16 <= sz; ++i) {
         if (memcmp((uint8_t *)buf + i, pat, 16) == 0) {
@@ -1806,6 +1878,32 @@ static void stream_deep_check(const char *path, exr_compression comp,
                 ok = 0;
         }
     }
+#if defined(EXR_USE_THREADS)
+    /* Re-decode the (1-line-per-block) deep image with 4 workers: the parallel
+     * pass-2 scatter must reproduce the single-threaded decode bit-for-bit. */
+    if (ok) {
+        exr_image b4;
+        memset(&b4, 0, sizeof(b4));
+        exr_set_num_threads(4);
+        if (!EXR_OK(exr_load_from_file(tmp, NULL, &b4))) ok = 0;
+        else {
+            ok = b4.parts[0].deep_total_samples ==
+                     back.parts[0].deep_total_samples &&
+                 memcmp(b4.parts[0].deep_sample_counts,
+                        back.parts[0].deep_sample_counts,
+                        npix * sizeof(int32_t)) == 0;
+            for (c = 0; ok && c < h->num_channels; ++c) {
+                size_t ps = (h->channels[c].pixel_type == EXR_PIXEL_HALF) ? 2 : 4;
+                if (memcmp(b4.parts[0].deep_images[c],
+                           back.parts[0].deep_images[c],
+                           (size_t)back.parts[0].deep_total_samples * ps) != 0)
+                    ok = 0;
+            }
+        }
+        exr_set_num_threads(1);
+        exr_image_free(&b4);
+    }
+#endif
     CHECK(ok, name);
     if (ok) printf("  ok: stream deep %s\n", name);
     exr_image_free(&src);
@@ -1818,18 +1916,38 @@ static exr_result blocking_read(void *user, uint64_t off, uint64_t len,
     return EXR_WOULD_BLOCK; /* force the suspend/resume path */
 }
 
-/* Decode block 0 over a streaming source that always blocks; the host feeds the
- * file incrementally. Result must match the memory-path decode. */
+/* Re-issue exr_reader_decode_block while it suspends, feeding the pending range
+ * in 64K steps; *fed counts how many supply cycles happened. */
+static exr_result stream_drive_decode(exr_reader *rs, const uint8_t *file,
+                                      uint32_t blk, void *dst, size_t dst_size,
+                                      int *fed) {
+    int guard = 0;
+    for (;;) {
+        exr_result rc = exr_reader_decode_block(rs, 0, blk, dst, dst_size);
+        exr_pending_read pr;
+        size_t step;
+        if (rc != EXR_WOULD_BLOCK) return rc;
+        if (!EXR_OK(exr_reader_pending(rs, &pr))) return EXR_ERROR_CORRUPT;
+        step = pr.size < 65536u ? (size_t)pr.size : 65536u;
+        if (!EXR_OK(exr_reader_supply(rs, file + pr.offset, step)))
+            return EXR_ERROR_CORRUPT;
+        *fed += 1;
+        if (++guard > 2000000) return EXR_ERROR_CORRUPT;
+    }
+}
+
+/* Decode EVERY block over a streaming source that always blocks, driving the
+ * suspend/resume loop through decode_block itself; each block must match the
+ * memory-path decode, and the suspend path must actually fire (fed > 0). */
 static void stream_would_block_check(const char *path, exr_compression comp,
                                      const char *name) {
     exr_image tmpimg;
     void *buf = NULL;
     size_t sz = 0;
     exr_reader *rm = NULL, *rs = NULL;
-    exr_block_info bi;
     void *ref = NULL, *got = NULL;
-    uint32_t nb = 0;
-    int ok = 1;
+    uint32_t nb = 0, b;
+    int ok = 1, fed = 0;
     exr_data_source dsrc;
 
     memset(&tmpimg, 0, sizeof(tmpimg));
@@ -1846,52 +1964,37 @@ static void stream_would_block_check(const char *path, exr_compression comp,
     exr_image_free(&tmpimg);
 
     if (!EXR_OK(exr_reader_open_memory(buf, sz, NULL, &rm)) ||
-        !EXR_OK(exr_reader_num_blocks(rm, 0, &nb)) ||
-        !EXR_OK(exr_reader_block_info(rm, 0, 0, &bi))) {
+        !EXR_OK(exr_reader_num_blocks(rm, 0, &nb))) {
         g_fail++; printf("  FAIL: mem setup (would-block %s)\n", name);
         if (rm) exr_reader_close(rm);
         free(buf); return;
     }
-    ref = malloc(bi.uncompressed_size ? bi.uncompressed_size : 1);
-    if (!EXR_OK(exr_reader_decode_block(rm, 0, 0, ref, bi.uncompressed_size)))
-        ok = 0;
-    exr_reader_close(rm);
 
     dsrc.user = NULL;
     dsrc.read = blocking_read;
     dsrc.total_size = sz;
-    if (ok && EXR_OK(exr_reader_open_source(&dsrc, NULL, &rs))) {
-        exr_result rc;
-        int guard = 0;
-        for (;;) {
-            rc = exr_reader_parse_header(rs);
-            if (rc == EXR_SUCCESS) break;
-            if (rc != EXR_WOULD_BLOCK) { ok = 0; break; }
-            {
-                exr_pending_read pr;
-                size_t step;
-                if (!EXR_OK(exr_reader_pending(rs, &pr))) { ok = 0; break; }
-                step = 65536;
-                if (step > pr.size) step = (size_t)pr.size;
-                if (!EXR_OK(exr_reader_supply(rs, (uint8_t *)buf + pr.offset,
-                                              step))) { ok = 0; break; }
-            }
-            if (++guard > 1000000) { ok = 0; break; }
-        }
-        if (ok) {
-            got = malloc(bi.uncompressed_size ? bi.uncompressed_size : 1);
-            if (!EXR_OK(exr_reader_decode_block(rs, 0, 0, got,
-                                                bi.uncompressed_size)))
-                ok = 0;
-            else if (memcmp(ref, got, bi.uncompressed_size) != 0)
-                ok = 0;
-        }
-        exr_reader_close(rs);
-    } else if (ok) {
-        ok = 0;
+    if (!EXR_OK(exr_reader_open_source(&dsrc, NULL, &rs))) {
+        g_fail++; exr_reader_close(rm); free(buf); return;
     }
+    for (b = 0; b < nb && ok; ++b) {
+        exr_block_info bi;
+        if (!EXR_OK(exr_reader_block_info(rm, 0, b, &bi))) { ok = 0; break; }
+        ref = realloc(ref, bi.uncompressed_size ? bi.uncompressed_size : 1);
+        got = realloc(got, bi.uncompressed_size ? bi.uncompressed_size : 1);
+        if (!EXR_OK(exr_reader_decode_block(rm, 0, b, ref, bi.uncompressed_size)))
+            ok = 0;
+        else if (!EXR_OK(stream_drive_decode(rs, (uint8_t *)buf, b, got,
+                                             bi.uncompressed_size, &fed)))
+            ok = 0;
+        else if (memcmp(ref, got, bi.uncompressed_size) != 0)
+            ok = 0;
+    }
+    if (fed == 0) ok = 0; /* the suspend/resume path must have actually run */
+    exr_reader_close(rm);
+    exr_reader_close(rs);
     CHECK(ok, name);
-    if (ok) printf("  ok: stream WOULD_BLOCK %s\n", name);
+    if (ok) printf("  ok: stream WOULD_BLOCK %s (%u blocks, %d supplies)\n",
+                   name, nb, fed);
     free(ref);
     free(got);
     free(buf);
@@ -2327,6 +2430,195 @@ static void jph_simd_check(void) {
         free(low); free(high); free(o0); free(o1); free(ev); free(od);
         free(temp); free(ds); free(da); free(ref); free(cl); free(ch); free(co);
     }
+#elif defined(EXR_NEON)
+    /* NEON JPH kernels vs scalar (compile-time selected on aarch64). */
+    {
+        const size_t n = 1003; /* not a multiple of 4 -> exercises SIMD tails */
+        int64_t *orig = (int64_t *)malloc(n * sizeof(int64_t));
+        int64_t *ref = (int64_t *)malloc(n * sizeof(int64_t));
+        int64_t *got = (int64_t *)malloc(n * sizeof(int64_t));
+        uint32_t rng = 0xC0FFEEu;
+        int bds[2] = {16, 32};
+        int ok = 1, k;
+        if (!orig || !ref || !got) { free(orig); free(ref); free(got); return; }
+        for (k = 0; k < 2; ++k) {
+            uint32_t bd = (uint32_t)bds[k];
+            int64_t bias = ((int64_t)1 << (bd - 1)) + 1;
+            size_t i;
+            for (i = 0; i < n; ++i) {
+                int64_t v;
+                rng = rng * 1664525u + 1013904223u;
+                v = (int64_t)(int32_t)rng;
+                if (bd == 32u && (rng & 7u) == 0u) v *= 41;
+                orig[i] = v;
+            }
+            memcpy(ref, orig, n * sizeof(int64_t));
+            jph_nlt_type3_i64_scalar(ref, n, bias);
+            memcpy(got, orig, n * sizeof(int64_t));
+            jph_nlt_type3_i64_neon(got, n, bias);
+            if (memcmp(ref, got, n * sizeof(int64_t)) != 0) ok = 0;
+        }
+        CHECK(ok, "JPH NLT type3 i64 NEON == scalar");
+        if (ok) printf("  ok: JPH NLT type3 i64 NEON == scalar\n");
+        free(orig); free(ref); free(got);
+    }
+    {   /* int32 NLT */
+        const size_t n = 1003;
+        int32_t *orig = (int32_t *)malloc(n * 4), *ref = (int32_t *)malloc(n * 4);
+        int32_t *got = (int32_t *)malloc(n * 4);
+        uint32_t rng = 0x5151u;
+        int ok = 1;
+        if (orig && ref && got) {
+            size_t i;
+            int32_t biasm1 = (int32_t)((((int64_t)1 << 15) + 1) - 1);
+            for (i = 0; i < n; ++i) { rng = rng * 1664525u + 1013904223u;
+                orig[i] = (int32_t)(rng & 0x7fffffffu) - 0x40000000; }
+            memcpy(ref, orig, n * 4); jph_nlt_type3_i32_scalar(ref, n, biasm1);
+            memcpy(got, orig, n * 4); jph_nlt_type3_i32_neon(got, n, biasm1);
+            if (memcmp(ref, got, n * 4) != 0) ok = 0;
+        }
+        CHECK(ok, "JPH NLT type3 i32 NEON == scalar");
+        free(orig); free(ref); free(got);
+    }
+    {   /* int32 -> uint16 pack: truncation, incl. out-of-int16 values. */
+        const size_t pn = 1003;
+        int32_t *ps = (int32_t *)malloc(pn * 4);
+        uint8_t *pr = (uint8_t *)malloc(pn * 2), *px = (uint8_t *)malloc(pn * 2);
+        int pok = 1;
+        if (ps && pr && px) {
+            size_t i; uint32_t r2 = 0x12345u;
+            for (i = 0; i < pn; ++i) { r2 = r2 * 1664525u + 1013904223u;
+                ps[i] = (int32_t)r2; }
+            jph_pack_i32_to_half_scalar(pr, ps, pn);
+            jph_pack_i32_to_half_neon(px, ps, pn);
+            if (memcmp(pr, px, pn * 2) != 0) pok = 0;
+        }
+        CHECK(pok, "JPH pack i32->half NEON == scalar");
+        free(ps); free(pr); free(px);
+    }
+    {   /* sign-magnitude extraction over several shifts. */
+        const size_t en = 1003;
+        uint32_t *src = (uint32_t *)malloc(en * 4);
+        int64_t *r0 = (int64_t *)malloc(en * 8), *r1 = (int64_t *)malloc(en * 8);
+        int ok = 1; unsigned shifts[3] = {0u, 7u, 30u}; int s;
+        if (src && r0 && r1) {
+            size_t i; uint32_t rr = 0x9e37u;
+            for (i = 0; i < en; ++i) { rr = rr * 1664525u + 1013904223u; src[i] = rr; }
+            for (s = 0; s < 3; ++s) {
+                size_t x; unsigned shift = shifts[s];
+                for (x = 0; x < en; ++x) { uint32_t v = src[x];
+                    int32_t mag = (int32_t)((v & 0x7fffffffu) >> shift);
+                    r0[x] = (v & 0x80000000u) ? -mag : mag; }
+                jph_extract_signmag_i32_to_i64_neon(r1, src, en, shift);
+                if (memcmp(r0, r1, en * 8) != 0) ok = 0;
+            }
+        }
+        CHECK(ok, "JPH extract signmag NEON == scalar");
+        free(src); free(r0); free(r1);
+    }
+    {   /* inverse 5/3 1D: i32 (range-checked) and i64, NEON == scalar. */
+        int32_t *low = (int32_t *)malloc(2048 * 4), *high = (int32_t *)malloc(2048 * 4);
+        int32_t *o0 = (int32_t *)malloc(4096 * 4), *o1 = (int32_t *)malloc(4096 * 4);
+        int64_t *L = (int64_t *)malloc(2048 * 8), *H = (int64_t *)malloc(2048 * 8);
+        int64_t *q0 = (int64_t *)malloc(4096 * 8), *q1 = (int64_t *)malloc(4096 * 8);
+        int64_t *ev = (int64_t *)malloc(2048 * 8), *od = (int64_t *)malloc(2048 * 8);
+        uint32_t rng = 0xBEEF01u;
+        int wok = 1, w64 = 1, trial;
+        if (low && high && o0 && o1 && L && H && q0 && q1 && ev && od) {
+            for (trial = 0; trial < 3000 && wok && w64; ++trial) {
+                size_t oc, lc, hc, i; exr_result r0, r1; int sb;
+                rng = rng * 1664525u + 1013904223u;
+                oc = (trial < 100) ? (size_t)trial : (rng % 2000u);
+                lc = (oc + 1u) / 2u; hc = oc / 2u; sb = (int)(trial % 32u);
+                for (i = 0; i < lc; ++i) { rng = rng * 1664525u + 1013904223u;
+                    low[i] = (int32_t)((int32_t)rng >> sb); L[i] = low[i]; }
+                for (i = 0; i < hc; ++i) { rng = rng * 1664525u + 1013904223u;
+                    high[i] = (int32_t)((int32_t)rng >> sb); H[i] = high[i]; }
+                memset(o0, 0x5a, 4096 * 4); memset(o1, 0x5a, 4096 * 4);
+                r0 = exr_jph_inverse_53_i32(low, lc, high, hc, o0, oc);
+                r1 = jph_inverse_53_i32_neon(low, lc, high, hc, o1, oc, ev, od);
+                if (r0 != r1) wok = 0;
+                else if (r0 == EXR_SUCCESS && memcmp(o0, o1, oc * 4) != 0) wok = 0;
+                jph_inverse_53_i64(L, lc, H, hc, q0, oc);
+                jph_inverse_53_i64_neon(L, lc, H, hc, q1, oc, ev, od);
+                if (memcmp(q0, q1, oc * 8) != 0) w64 = 0;
+            }
+        }
+        CHECK(wok, "JPH inverse 5/3 1D i32 NEON == scalar");
+        CHECK(w64, "JPH inverse 5/3 1D i64 NEON == scalar");
+        free(low); free(high); free(o0); free(o1);
+        free(L); free(H); free(q0); free(q1); free(ev); free(od);
+    }
+    {   /* vertical inverse 5/3 (i32 + i64) and forward 5/3 (i64) NEON==scalar. */
+        const size_t RWMAX = 130u, RHMAX = 40u, N = 130u * 40u;
+        int32_t *t32 = (int32_t *)malloc(N * 4), *ds = (int32_t *)malloc(N * 4);
+        int32_t *da = (int32_t *)malloc(N * 4);
+        int64_t *t64 = (int64_t *)malloc(N * 8), *vs = (int64_t *)malloc(N * 8);
+        int64_t *va = (int64_t *)malloc(N * 8);
+        int64_t *fd = (int64_t *)malloc(N * 8), *fs = (int64_t *)malloc(N * 8);
+        int64_t *fa = (int64_t *)malloc(N * 8);
+        int vi32 = 1, vi64 = 1, ff = 1;
+        uint32_t rng = 0x1357abcu;
+        size_t trial;
+        if (t32 && ds && da && t64 && vs && va && fd && fs && fa) {
+            for (trial = 0; trial < 3000 && vi32 && vi64 && ff; ++trial) {
+                size_t rw, rh, lh, hh, i, n; int sb; exr_result rs, ra;
+                rng = rng * 1664525u + 1013904223u; rw = 1u + (rng % RWMAX);
+                rng = rng * 1664525u + 1013904223u; rh = 1u + (rng % RHMAX);
+                lh = (rh + 1u) / 2u; hh = rh / 2u; sb = (int)(trial % 32u);
+                n = (lh + hh) * rw;
+                for (i = 0; i < n; ++i) { rng = rng * 1664525u + 1013904223u;
+                    t32[i] = (int32_t)((int32_t)rng >> sb); t64[i] = t32[i]; }
+                /* inverse vertical i32 */
+                memset(ds, 0x5a, N * 4); memset(da, 0x5a, N * 4);
+                rs = exr_jph_inverse_53_vert_i32(t32, rw, lh, hh, ds, rw);
+                ra = jph_inverse_53_vert_i32_neon(t32, rw, lh, hh, da, rw);
+                if (rs != ra) vi32 = 0;
+                else if (rs == EXR_SUCCESS && memcmp(ds, da, n * 4) != 0) vi32 = 0;
+                /* inverse vertical i64 */
+                memset(vs, 0x5a, N * 8); memset(va, 0x5a, N * 8);
+                jph_inverse_53_vert_i64(t64, rw, lh, hh, vs, rw);
+                jph_inverse_53_vert_i64_neon(t64, rw, lh, hh, va, rw);
+                if (memcmp(vs, va, n * 8) != 0) vi64 = 0;
+                /* forward vertical i64 (data interleaved rh rows -> subbands) */
+                for (i = 0; i < rh * rw; ++i) { rng = rng * 1664525u + 1013904223u;
+                    fd[i] = (int32_t)((int32_t)rng >> sb); }
+                jph_forward_53_vert_i64(fd, rw, rw, lh, hh, fs);
+                jph_forward_53_vert_i64_neon(fd, rw, rw, lh, hh, fa);
+                if (memcmp(fs, fa, n * 8) != 0) ff = 0;
+            }
+        }
+        CHECK(vi32, "JPH inverse 5/3 vertical i32 NEON == scalar");
+        CHECK(vi64, "JPH inverse 5/3 vertical i64 NEON == scalar");
+        CHECK(ff, "JPH forward 5/3 vertical i64 NEON == scalar");
+        free(t32); free(ds); free(da); free(t64); free(vs); free(va);
+        free(fd); free(fs); free(fa);
+    }
+    {   /* forward 5/3 1D i64 NEON: round-trips losslessly through the (already
+         * scalar-verified) inverse 1D i64 NEON kernel -> reconstructs the input.
+         * (The scalar forward 1D is static; the forward arithmetic is also
+         * directly checked scalar-vs-NEON by the vertical test above.) */
+        int64_t *src = (int64_t *)malloc(4096 * 8), *rec = (int64_t *)malloc(4096 * 8);
+        int64_t *lo = (int64_t *)malloc(2048 * 8), *hi = (int64_t *)malloc(2048 * 8);
+        int64_t *ev = (int64_t *)malloc(2048 * 8), *od = (int64_t *)malloc(2048 * 8);
+        uint32_t rng = 0x9a7f3u;
+        int fok = 1, trial;
+        if (src && rec && lo && hi && ev && od) {
+            for (trial = 0; trial < 3000 && fok; ++trial) {
+                size_t n, nl, nh, i; int sb;
+                rng = rng * 1664525u + 1013904223u;
+                n = (trial < 100) ? (size_t)trial : (rng % 4000u);
+                nl = (n + 1u) / 2u; nh = n / 2u; sb = (int)(trial % 16u);
+                for (i = 0; i < n; ++i) { rng = rng * 1664525u + 1013904223u;
+                    src[i] = (int32_t)((int32_t)rng >> sb); }
+                jph_forward_53_i64_neon(src, n, lo, nl, hi, nh, ev, od);
+                jph_inverse_53_i64_neon(lo, nl, hi, nh, rec, n, ev, od);
+                if (n && memcmp(src, rec, n * 8) != 0) fok = 0;
+            }
+        }
+        CHECK(fok, "JPH forward 5/3 1D i64 NEON round-trips (fwd->inv)");
+        free(src); free(rec); free(lo); free(hi); free(ev); free(od);
+    }
 #endif
 }
 
@@ -2410,10 +2702,616 @@ static void thread_tests(const char *path) {
         free(b);
     }
 
+    /* mipmap + ripmap level generation: the parallel downsample must be
+     * bit-deterministic, so a 1-thread and a 4-thread save produce identical
+     * bytes (asakusa's level 1+ rows clear the dh>=64 parallel threshold). */
+    {
+        int modes[2] = {EXR_TILE_MIPMAP_LEVELS, EXR_TILE_RIPMAP_LEVELS};
+        const char *mn[2] = {"mipmap", "ripmap"};
+        int m;
+        for (m = 0; m < 2; ++m) {
+            void *a = NULL, *b = NULL;
+            size_t na = 0, nb = 0;
+            src.parts[0].header.level_mode = modes[m];
+            thread_save(&src, EXR_COMPRESSION_ZIP, 1, &a, &na);
+            thread_save(&src, EXR_COMPRESSION_ZIP, 4, &b, &nb);
+            CHECK(a && b && na == nb && na > 0 && memcmp(a, b, na) == 0, mn[m]);
+            printf("  ok: %s level gen  enc-deterministic (parallel downsample)\n",
+                   mn[m]);
+            free(a);
+            free(b);
+        }
+    }
+
+    exr_set_num_threads(1);
+    exr_image_free(&src);
+}
+
+/* Deep encode: the parallel per-block compress must be byte-deterministic, so a
+ * 1-thread and a 4-thread save produce identical bytes, for both the scanline
+ * (emit_deep_scanlines) and tiled (emit_deep_tile_level) writers. */
+static void deep_encode_thread_check(const char *path) {
+    exr_image src;
+    void *a1 = NULL, *a4 = NULL;
+    size_t n1 = 0, n4 = 0;
+    int pass = 1;
+    memset(&src, 0, sizeof(src));
+    if (!EXR_OK(exr_load_from_file(path, NULL, &src)) || !src.parts[0].is_deep) {
+        printf("  skip: %s (deep encode threads)\n", path);
+        exr_image_free(&src);
+        return;
+    }
+    exr_set_num_threads(1);
+    (void)exr_save_to_memory(&a1, &n1, NULL, &src, EXR_COMPRESSION_ZIPS);
+    exr_set_num_threads(4);
+    (void)exr_save_to_memory(&a4, &n4, NULL, &src, EXR_COMPRESSION_ZIPS);
+    pass = a1 && a4 && n1 == n4 && n1 > 0 && memcmp(a1, a4, n1) == 0;
+    CHECK(pass, "deep scanline encode deterministic (1 vs 4 threads)");
+    free(a1); free(a4); a1 = a4 = NULL; n1 = n4 = 0;
+
+    /* deep tiled (one level, 32x32 tiles) */
+    src.parts[0].header.tiled = 1;
+    src.parts[0].header.part_type = EXR_PART_DEEP_TILED;
+    src.parts[0].header.tile_x_size = 32;
+    src.parts[0].header.tile_y_size = 32;
+    src.parts[0].header.level_mode = EXR_TILE_ONE_LEVEL;
+    src.parts[0].header.rounding_mode = EXR_TILE_ROUND_DOWN;
+    exr_set_num_threads(1);
+    (void)exr_save_to_memory(&a1, &n1, NULL, &src, EXR_COMPRESSION_ZIPS);
+    exr_set_num_threads(4);
+    (void)exr_save_to_memory(&a4, &n4, NULL, &src, EXR_COMPRESSION_ZIPS);
+    pass = a1 && a4 && n1 == n4 && n1 > 0 && memcmp(a1, a4, n1) == 0;
+    CHECK(pass, "deep tiled encode deterministic (1 vs 4 threads)");
+    if (pass)
+        printf("  ok: deep encode 1-vs-4 deterministic (scanline + tiled)\n");
+    free(a1); free(a4);
     exr_set_num_threads(1);
     exr_image_free(&src);
 }
 #endif /* EXR_USE_THREADS */
+
+/* Spectral: channel-name helpers, emissive cube round-trip, custom-attribute
+ * round-trip through the writer. */
+static void spectral_tests(void) {
+    char nm[64];
+    float wl;
+
+    /* name format + parse (comma decimal, 6 fractional digits) */
+    exr_spectral_channel_name(nm, sizeof(nm), EXR_SPECTRUM_EMISSIVE, 0, 550.0f);
+    CHECK(strcmp(nm, "S0.550,000000nm") == 0, "spectral emissive name format");
+    exr_spectral_channel_name(nm, sizeof(nm), EXR_SPECTRUM_REFLECTIVE, 0, 700.0f);
+    CHECK(strcmp(nm, "T.700,000000nm") == 0, "spectral reflective name format");
+    wl = exr_spectral_channel_wavelength("S0.550,000000nm");
+    CHECK(wl > 549.9f && wl < 550.1f, "spectral wavelength parse");
+    CHECK(exr_spectral_channel_stokes("S2.480,000000nm") == 2, "stokes parse");
+    CHECK(exr_spectral_channel_stokes("T.480,000000nm") == -1, "reflective stokes -1");
+    CHECK(exr_is_spectral_channel("S0.480,000000nm") == 1, "is-spectral-channel");
+    CHECK(exr_is_spectral_channel("R") == 0, "non-spectral channel");
+
+    /* build a 3x2 emissive image with 4 wavelengths, save, reload, compare */
+    {
+        const int W = 3, H = 2, NWL = 4;
+        float wls[4] = {480.0f, 550.0f, 620.0f, 700.0f};
+        float *samples = (float *)malloc((size_t)NWL * W * H * sizeof(float));
+        exr_image img;
+        void *blob = NULL;
+        size_t blob_size = 0;
+        exr_spectral_image spec;
+        int k, p, ok = 1;
+
+        for (k = 0; k < NWL; ++k)
+            for (p = 0; p < W * H; ++p)
+                samples[(size_t)k * W * H + p] = (float)(k * 100 + p) * 0.5f;
+
+        memset(&img, 0, sizeof(img));
+        CHECK(EXR_OK(exr_spectral_setup_emissive(NULL, W, H, NWL, wls, samples,
+                                                 "W.m^-2.sr^-1", &img)),
+              "spectral setup emissive");
+        CHECK(EXR_OK(exr_save_to_memory(&blob, &blob_size, NULL, &img,
+                                        EXR_COMPRESSION_ZIP)),
+              "spectral save to memory");
+        exr_image_free(&img);
+
+        memset(&spec, 0, sizeof(spec));
+        CHECK(EXR_OK(exr_spectral_load_from_memory(blob, blob_size, NULL, &spec)),
+              "spectral load from memory");
+        CHECK(spec.type == EXR_SPECTRUM_EMISSIVE, "reloaded spectrum type emissive");
+        CHECK(spec.num_wavelengths == NWL && spec.width == W && spec.height == H,
+              "reloaded spectral dimensions");
+        CHECK(strcmp(spec.units, "W.m^-2.sr^-1") == 0, "reloaded spectral units");
+        for (k = 0; k < spec.num_wavelengths; ++k)
+            if (spec.wavelengths[k] < wls[k] - 0.5f ||
+                spec.wavelengths[k] > wls[k] + 0.5f)
+                ok = 0;
+        CHECK(ok, "reloaded wavelengths sorted + correct");
+        ok = 1;
+        for (k = 0; k < NWL; ++k)
+            for (p = 0; p < W * H; ++p) {
+                float got = exr_spectral_sample(&spec, 0, k, p % W, p / W);
+                float want = (float)(k * 100 + p) * 0.5f;
+                if (got < want - 0.01f || got > want + 0.01f) ok = 0;
+            }
+        CHECK(ok, "reloaded spectral samples match");
+        {
+            float ps[4];
+            int n = exr_spectral_pixel(&spec, 0, 1, 0, ps); /* pixel index p=1 */
+            CHECK(n == NWL && ps[0] == 0.5f && ps[1] == 50.5f,
+                  "per-pixel spectrum extract");
+        }
+        exr_spectral_image_free(&spec);
+        free(samples);
+        free(blob);
+    }
+
+    /* Subsampled spectral channel: make the 550nm plane 2x2-subsampled, save,
+     * reload, and confirm it point-expands to full resolution. */
+    {
+        const int W = 4, H = 4, NWL = 4;
+        float wls[4] = {480.0f, 550.0f, 620.0f, 700.0f};
+        float *samples = (float *)malloc((size_t)NWL * W * H * sizeof(float));
+        exr_image img;
+        void *blob = NULL;
+        size_t blob_size = 0;
+        exr_spectral_image spec;
+        float grid[4]; /* 2x2 subsampled plane for the 550nm channel */
+        int x, y, ok = 1;
+        size_t i;
+
+        for (i = 0; i < (size_t)NWL * W * H; ++i) samples[i] = (float)i;
+        memset(&img, 0, sizeof(img));
+        if (EXR_OK(exr_spectral_setup_emissive(NULL, W, H, NWL, wls, samples,
+                                               "W.m^-2.sr^-1", &img))) {
+            /* channel 1 == 550nm: replace its full plane with a 2x2 grid. */
+            grid[0] = 10.0f; grid[1] = 20.0f; grid[2] = 30.0f; grid[3] = 40.0f;
+            free(img.parts[0].images[1]);
+            img.parts[0].images[1] = malloc(sizeof(grid));
+            memcpy(img.parts[0].images[1], grid, sizeof(grid));
+            img.parts[0].header.channels[1].x_sampling = 2;
+            img.parts[0].header.channels[1].y_sampling = 2;
+
+            CHECK(EXR_OK(exr_save_to_memory(&blob, &blob_size, NULL, &img,
+                                            EXR_COMPRESSION_ZIP)),
+                  "subsampled spectral save");
+            exr_image_free(&img);
+
+            memset(&spec, 0, sizeof(spec));
+            CHECK(EXR_OK(exr_spectral_load_from_memory(blob, blob_size, NULL,
+                                                       &spec)),
+                  "subsampled spectral load (no longer rejected)");
+            for (y = 0; y < H; ++y)
+                for (x = 0; x < W; ++x) {
+                    float got = exr_spectral_sample(&spec, 0, 1, x, y);
+                    float want = grid[(y / 2) * 2 + (x / 2)];
+                    if (got < want - 0.01f || got > want + 0.01f) ok = 0;
+                }
+            CHECK(ok, "subsampled 550nm plane point-expanded to full res");
+            exr_spectral_image_free(&spec);
+            free(blob);
+        } else {
+            CHECK(0, "subsampled spectral setup");
+            exr_image_free(&img);
+        }
+        free(samples);
+    }
+}
+
+/* ============================================================================
+ * Util module: conversions, resize, tonemap, colorspace, transfer, LUT
+ * ========================================================================== */
+
+static int approx(float a, float b, float eps) {
+    float d = a - b;
+    if (d < 0) d = -d;
+    return d <= eps;
+}
+
+static void util_convert_tests(void) {
+    int i;
+    uint16_t u16[256], r16[256];
+    float f[256];
+    /* u16 normalized round-trip (exact: 65535 is representable). */
+    for (i = 0; i < 256; ++i) u16[i] = (uint16_t)(i * 257); /* 0..65535 */
+    exr_u16_to_float(u16, f, 256, 1);
+    exr_float_to_u16(f, r16, 256, 1);
+    {
+        int ok = 1;
+        for (i = 0; i < 256; ++i)
+            if (u16[i] != r16[i]) ok = 0;
+        CHECK(ok, "u16<->float normalized round-trip exact");
+    }
+    CHECK(approx(f[0], 0.0f, 0.0f) && approx(f[255], 1.0f, 1e-6f),
+          "u16 normalized endpoints");
+
+    /* clamp + round: HDR/negative inputs. */
+    {
+        float in[4] = {-1.0f, 0.4f / 65535.0f, 2.0f, 0.50001f / 65535.0f};
+        uint16_t o[4];
+        exr_float_to_u16(in, o, 4, 1);
+        CHECK(o[0] == 0 && o[2] == 65535, "float->u16 clamps out-of-range");
+        CHECK(o[1] == 0 && o[3] == 1, "float->u16 round-to-nearest");
+    }
+    /* convert_pixels: HALF<->FLOAT matches the dedicated kernels. */
+    {
+        uint16_t h[64];
+        float a[64], b[64];
+        for (i = 0; i < 64; ++i) a[i] = (float)i * 0.123f - 3.0f;
+        exr_float_to_half(a, h, 64);
+        exr_convert_pixels(b, EXR_PIXEL_FLOAT, h, EXR_PIXEL_HALF, 64,
+                           EXR_CONVERT_RAW);
+        {
+            float ref[64];
+            int ok = 1;
+            exr_half_to_float(h, ref, 64);
+            for (i = 0; i < 64; ++i)
+                if (b[i] != ref[i]) ok = 0;
+            CHECK(ok, "convert_pixels HALF->FLOAT matches kernel");
+        }
+    }
+    /* uint32 normalized round-trip via convert_pixels. */
+    {
+        uint32_t u[5] = {0u, 1u, 2147483648u, 4294967294u, 4294967295u}, ru[5];
+        float fv[5];
+        exr_convert_pixels(fv, EXR_PIXEL_FLOAT, u, EXR_PIXEL_UINT, 5,
+                           EXR_CONVERT_NORMALIZED);
+        exr_convert_pixels(ru, EXR_PIXEL_UINT, fv, EXR_PIXEL_FLOAT, 5,
+                           EXR_CONVERT_NORMALIZED);
+        CHECK(ru[0] == 0u && ru[4] == 4294967295u, "u32 normalized endpoints");
+        CHECK(approx(fv[4], 1.0f, 1e-6f), "u32 normalized 1.0");
+    }
+}
+
+static void util_simd_parity_tests(void) {
+    int i, n = 1000;
+    static uint16_t u16[1000];
+    static uint8_t u8[1000];
+    static float fin[1000], a_s[1000], a_v[1000], b_s[1000], b_v[1000];
+    static uint16_t q_s[1000], q_v[1000];
+    static uint8_t c_s[1000], c_v[1000];
+    srand(12345);
+    for (i = 0; i < n; ++i) {
+        u16[i] = (uint16_t)(rand() & 0xffff);
+        u8[i] = (uint8_t)(rand() & 0xff);
+        /* mix of normal, HDR, negative, and non-finite-ish values */
+        switch (i % 5) {
+            case 0: fin[i] = (float)(rand() % 200000) / 65535.0f; break;
+            case 1: fin[i] = -(float)(rand() % 100) / 65535.0f; break;
+            case 2: fin[i] = 1.5f; break;
+            default: fin[i] = (float)(rand() % 70000) / 65535.0f; break;
+        }
+    }
+    /* scalar tier */
+    exr_simd_force(0);
+    exr_u16_to_float(u16, a_s, n, 1);
+    exr_u8_to_float(u8, b_s, n, 1);
+    exr_float_to_u16(fin, q_s, n, 1);
+    exr_float_to_u8(fin, c_s, n, 1);
+    /* best tier */
+    exr_simd_force(2);
+    exr_u16_to_float(u16, a_v, n, 1);
+    exr_u8_to_float(u8, b_v, n, 1);
+    exr_float_to_u16(fin, q_v, n, 1);
+    exr_float_to_u8(fin, c_v, n, 1);
+    {
+        int ok = 1;
+        for (i = 0; i < n; ++i) {
+            if (!approx(a_s[i], a_v[i], 1e-6f)) ok = 0;
+            if (!approx(b_s[i], b_v[i], 1e-6f)) ok = 0;
+            if (q_s[i] != q_v[i]) ok = 0;
+            if (c_s[i] != c_v[i]) ok = 0;
+        }
+        CHECK(ok, "SIMD convert kernels match scalar (incl. clamp/round)");
+    }
+    /* axpy + mat3 parity */
+    {
+        static float acc_s[1000], acc_v[1000], x[1000];
+        float m[9] = {0.6f, 0.3f, 0.1f, 0.2f, 0.7f, 0.1f, 0.1f, 0.2f, 0.7f};
+        int ok = 1;
+        for (i = 0; i < n; ++i) { x[i] = fin[i]; acc_s[i] = acc_v[i] = 0.25f; }
+        exr_simd_force(0);
+        exr_simd.axpy(acc_s, x, 0.5f, n);
+        exr_simd_force(2);
+        exr_simd.axpy(acc_v, x, 0.5f, n);
+        for (i = 0; i < n; ++i)
+            if (!approx(acc_s[i], acc_v[i], 1e-5f)) ok = 0;
+        CHECK(ok, "SIMD axpy matches scalar");
+        {
+            static float ms[1000], mv[1000];
+            int px = n / 4;
+            exr_simd_force(0);
+            exr_simd.mat3(ms, x, (size_t)px, 4, m);
+            exr_simd_force(2);
+            exr_simd.mat3(mv, x, (size_t)px, 4, m);
+            ok = 1;
+            for (i = 0; i < px * 4; ++i)
+                if (!approx(ms[i], mv[i], 1e-5f)) ok = 0;
+            CHECK(ok, "SIMD mat3 matches scalar");
+        }
+    }
+    /* half<->float SIMD parity vs scalar. The hardware-convert tiers (x86 F16C,
+     * ARM NEON FCVTL/FCVTN) are bit-exact with the integer scalar for every
+     * finite / zero / inf / subnormal value; like F16C they quiet signalling
+     * NaNs, so NaN inputs need only stay NaN (not bit-identical). float->half is
+     * fully bit-exact, NaN payloads included. */
+    {
+        static uint16_t hin[65536];
+        static float hf_s[65536], hf_v[65536];
+        int q, hok = 1;
+        for (q = 0; q < 65536; ++q) hin[q] = (uint16_t)q;
+        exr_simd_force(0);
+        exr_half_to_float(hin, hf_s, 65536);
+        exr_simd_force(2);
+        exr_half_to_float(hin, hf_v, 65536);
+        for (q = 0; q < 65536; ++q) {
+            if (((q & 0x7c00) == 0x7c00) && (q & 0x3ff)) {
+                if (!(hf_v[q] != hf_v[q])) hok = 0; /* NaN must stay NaN */
+            } else {
+                uint32_t a, b;
+                memcpy(&a, &hf_s[q], 4);
+                memcpy(&b, &hf_v[q], 4);
+                if (a != b) hok = 0;
+            }
+        }
+        CHECK(hok, "SIMD half->float matches scalar (NaN stays NaN)");
+        {
+            static uint16_t qs[65536], qv[65536];
+            static float fv[65536];
+            uint32_t rng = 0x1234567u;
+            int j;
+            hok = 1;
+            for (q = 0; q < 65536; ++q) fv[q] = hf_s[q]; /* every half's float */
+            exr_simd_force(0); exr_float_to_half(fv, qs, 65536);
+            exr_simd_force(2); exr_float_to_half(fv, qv, 65536);
+            for (q = 0; q < 65536; ++q) if (qs[q] != qv[q]) hok = 0;
+            for (j = 0; j < 4 && hok; ++j) { /* + raw float bit patterns */
+                for (q = 0; q < 65536; ++q) {
+                    rng = rng * 1664525u + 1013904223u;
+                    memcpy(&fv[q], &rng, 4);
+                }
+                exr_simd_force(0); exr_float_to_half(fv, qs, 65536);
+                exr_simd_force(2); exr_float_to_half(fv, qv, 65536);
+                for (q = 0; q < 65536; ++q) if (qs[q] != qv[q]) hok = 0;
+            }
+            CHECK(hok, "SIMD float->half bit-exact with scalar");
+        }
+    }
+    exr_simd_force(2);
+}
+
+static void util_resize_tests(void) {
+    const exr_allocator *a = NULL;
+    int w = 8, h = 6, i;
+    float src[8 * 6]; /* 1 channel */
+    /* identity resize reproduces input (triangle). */
+    for (i = 0; i < w * h; ++i) src[i] = (float)i;
+    {
+        float dst[8 * 6];
+        exr_result rc = exr_resize_float(a, src, w, h, 0, dst, w, h, 0, 1,
+                                         EXR_RESIZE_TRIANGLE, EXR_EDGE_CLAMP, -1);
+        int ok = EXR_OK(rc);
+        for (i = 0; i < w * h; ++i)
+            if (!approx(dst[i], src[i], 1e-4f)) ok = 0;
+        CHECK(ok, "resize identity (triangle) reproduces input");
+    }
+    /* 2x box downscale == exact 2x2 block average. */
+    {
+        float dst[4 * 3];
+        int x, y, ok;
+        exr_result rc = exr_resize_float(a, src, w, h, 0, dst, 4, 3, 0, 1,
+                                         EXR_RESIZE_BOX, EXR_EDGE_CLAMP, -1);
+        ok = EXR_OK(rc);
+        for (y = 0; y < 3; ++y)
+            for (x = 0; x < 4; ++x) {
+                float avg = (src[(2 * y) * w + 2 * x] +
+                             src[(2 * y) * w + 2 * x + 1] +
+                             src[(2 * y + 1) * w + 2 * x] +
+                             src[(2 * y + 1) * w + 2 * x + 1]) /
+                            4.0f;
+                if (!approx(dst[y * 4 + x], avg, 1e-4f)) ok = 0;
+            }
+        CHECK(ok, "2x box downscale == 2x2 average");
+    }
+    /* streaming resizer == whole-image (parity). */
+    {
+        int sw = 17, sh = 13, dw = 9, dh = 7, c = 3, n = sw * sh * 3;
+        float *si = (float *)malloc((size_t)n * sizeof(float));
+        float *whole = (float *)malloc((size_t)dw * dh * c * sizeof(float));
+        float *strm = (float *)malloc((size_t)dw * dh * c * sizeof(float));
+        exr_resizer *rz = NULL;
+        int sy = 0, ok = 1, k;
+        for (k = 0; k < n; ++k) si[k] = (float)((k * 7) % 101) * 0.03f;
+        exr_resize_float(a, si, sw, sh, 0, whole, dw, dh, 0, c,
+                         EXR_RESIZE_MITCHELL, EXR_EDGE_CLAMP, -1);
+        exr_resizer_create(a, sw, sh, dw, dh, c, EXR_PIXEL_FLOAT,
+                           EXR_RESIZE_MITCHELL, EXR_EDGE_CLAMP, &rz);
+        for (;;) {
+            int dy;
+            float rowbuf[9 * 3];
+            exr_result rc = exr_resizer_pull_row(rz, &dy, rowbuf);
+            if (rc == EXR_WOULD_BLOCK) {
+                exr_resizer_push_row(rz, sy, si + (size_t)sy * sw * c);
+                sy++;
+                continue;
+            }
+            if (dy >= dh) break;
+            memcpy(strm + (size_t)dy * dw * c, rowbuf,
+                   (size_t)dw * c * sizeof(float));
+        }
+        for (k = 0; k < dw * dh * c; ++k)
+            if (!approx(whole[k], strm[k], 1e-5f)) ok = 0;
+        CHECK(ok, "streaming resizer == whole-image resize");
+        exr_resizer_destroy(rz);
+        free(si); free(whole); free(strm);
+    }
+}
+
+static void util_tonemap_tests(void) {
+    float in[12], out[12];
+    int i;
+    for (i = 0; i < 4; ++i) {
+        in[i * 3 + 0] = (float)i;       /* increasing */
+        in[i * 3 + 1] = (float)i * 2.0f;
+        in[i * 3 + 2] = (float)i * 0.5f;
+    }
+    exr_tonemap_float(out, in, 4, 3, EXR_TONEMAP_ACES, NULL);
+    CHECK(approx(out[0], 0.0f, 1e-6f), "ACES maps 0 to 0");
+    CHECK(out[3] <= out[6] + 1e-6f && out[6] <= out[9] + 1e-6f,
+          "ACES monotonic in input");
+    CHECK(out[9] <= 1.0f + 1e-6f, "ACES saturates <= 1");
+    /* in-place == out-of-place (Reinhard). */
+    {
+        float a[12], b[12];
+        memcpy(a, in, sizeof(in));
+        memcpy(b, in, sizeof(in));
+        exr_tonemap_float(a, a, 4, 3, EXR_TONEMAP_REINHARD, NULL);
+        exr_tonemap_float(out, b, 4, 3, EXR_TONEMAP_REINHARD, NULL);
+        {
+            int ok = 1;
+            for (i = 0; i < 12; ++i)
+                if (a[i] != out[i]) ok = 0;
+            CHECK(ok, "tonemap in-place == out-of-place");
+        }
+    }
+}
+
+static void util_color_tests(void) {
+    float m1[9], m2[9], comp[9];
+    int i, j;
+    /* round-trip: M(to,from) * M(from,to) ~ I */
+    exr_color_matrix(EXR_CS_SRGB, EXR_CS_REC2020, m1);
+    exr_color_matrix(EXR_CS_REC2020, EXR_CS_SRGB, m2);
+    for (i = 0; i < 3; ++i)
+        for (j = 0; j < 3; ++j) {
+            float s = 0.0f;
+            int k;
+            for (k = 0; k < 3; ++k) s += m2[i * 3 + k] * m1[k * 3 + j];
+            comp[i * 3 + j] = s;
+        }
+    {
+        int ok = 1;
+        for (i = 0; i < 3; ++i)
+            for (j = 0; j < 3; ++j)
+                if (!approx(comp[i * 3 + j], i == j ? 1.0f : 0.0f, 1e-4f))
+                    ok = 0;
+        CHECK(ok, "colorspace matrix round-trip ~ identity");
+    }
+    /* sRGB white -> XYZ ~ D65 white (apply matrix). */
+    {
+        float white[3] = {1.0f, 1.0f, 1.0f}, xyz[3];
+        exr_color_matrix(EXR_CS_SRGB, EXR_CS_XYZ, m1);
+        exr_color_apply_matrix(xyz, white, 1, 3, m1);
+        CHECK(approx(xyz[0], 0.95047f, 1e-3f) && approx(xyz[1], 1.0f, 1e-3f) &&
+                  approx(xyz[2], 1.08883f, 1e-3f),
+              "sRGB(1,1,1) -> XYZ D65");
+    }
+}
+
+static void util_transfer_tests(void) {
+    int i;
+    float v[64], lin[64], back[64];
+    exr_transfer tfs[5] = {EXR_TF_SRGB, EXR_TF_GAMMA_22, EXR_TF_REC709,
+                           EXR_TF_PQ, EXR_TF_HLG};
+    int t;
+    for (i = 0; i < 64; ++i) v[i] = (float)i / 63.0f;
+    for (t = 0; t < 5; ++t) {
+        int ok = 1;
+        exr_encode_transfer(lin, v, 64, tfs[t]); /* code from "linear" v */
+        exr_decode_transfer(back, lin, 64, tfs[t]);
+        for (i = 0; i < 64; ++i)
+            if (!approx(back[i], v[i], 2e-3f)) ok = 0;
+        CHECK(ok, "transfer EOTF(OETF(x)) ~ x");
+    }
+    /* hand-rolled transcendentals vs libm. */
+    {
+        int ok = 1;
+        for (i = 1; i < 200; ++i) {
+            float x = (float)i * 0.05f;
+            if (!approx(exr_util_log2f(x), log2f(x), 3e-5f * (1.0f + x))) ok = 0;
+            if (!approx(exr_util_exp2f((float)i * 0.03f - 3.0f),
+                        exp2f((float)i * 0.03f - 3.0f),
+                        1e-5f * exp2f((float)i * 0.03f - 3.0f)))
+                ok = 0;
+            if (!approx(exr_util_powf(x, 1.0f / 2.4f), powf(x, 1.0f / 2.4f),
+                        2e-5f * (1.0f + x)))
+                ok = 0;
+        }
+        CHECK(ok, "hand-rolled log2/exp2/pow match libm (~1e-5)");
+    }
+}
+
+static void util_lut_tests(void) {
+    int N = 2, ir, ig, ib, ok;
+    float data[2 * 2 * 2 * 3];
+    exr_lut3d lut;
+    float in[12], out[12];
+    int i;
+    /* identity LUT on [0,1]: sample(ir,ig,ib) = (ir,ig,ib)/(N-1). */
+    for (ib = 0; ib < N; ++ib)
+        for (ig = 0; ig < N; ++ig)
+            for (ir = 0; ir < N; ++ir) {
+                size_t idx = (((size_t)ib * N + ig) * N + ir) * 3;
+                data[idx + 0] = (float)ir / (N - 1);
+                data[idx + 1] = (float)ig / (N - 1);
+                data[idx + 2] = (float)ib / (N - 1);
+            }
+    lut.size = N;
+    lut.data = data;
+    lut.domain_min[0] = lut.domain_min[1] = lut.domain_min[2] = 0.0f;
+    lut.domain_max[0] = lut.domain_max[1] = lut.domain_max[2] = 1.0f;
+    for (i = 0; i < 4; ++i) {
+        in[i * 3 + 0] = 0.1f + 0.2f * i;
+        in[i * 3 + 1] = 0.3f;
+        in[i * 3 + 2] = 0.8f - 0.1f * i;
+    }
+    exr_lut3d_apply(out, in, 4, 3, &lut, EXR_LUT_TRILINEAR);
+    ok = 1;
+    for (i = 0; i < 12; ++i)
+        if (!approx(out[i], in[i], 1e-5f)) ok = 0;
+    CHECK(ok, "identity LUT (trilinear) reproduces input");
+    exr_lut3d_apply(out, in, 4, 3, &lut, EXR_LUT_TETRAHEDRAL);
+    ok = 1;
+    for (i = 0; i < 12; ++i)
+        if (!approx(out[i], in[i], 1e-5f)) ok = 0;
+    CHECK(ok, "identity LUT (tetrahedral) reproduces input");
+    /* parse a tiny .cube and apply identity. */
+    {
+        const char *cube =
+            "# comment\nTITLE \"id\"\nLUT_3D_SIZE 2\n"
+            "DOMAIN_MIN 0 0 0\nDOMAIN_MAX 1 1 1\n"
+            "0 0 0\n1 0 0\n0 1 0\n1 1 0\n"
+            "0 0 1\n1 0 1\n0 1 1\n1 1 1\n";
+        exr_lut3d pl;
+        float *owned = NULL;
+        exr_result rc =
+            exr_lut3d_parse_cube(NULL, cube, strlen(cube), &pl, &owned);
+        CHECK(EXR_OK(rc) && pl.size == 2 && owned != NULL, ".cube parse ok");
+        if (EXR_OK(rc)) {
+            exr_lut3d_apply(out, in, 4, 3, &pl, EXR_LUT_TRILINEAR);
+            ok = 1;
+            for (i = 0; i < 12; ++i)
+                if (!approx(out[i], in[i], 1e-5f)) ok = 0;
+            CHECK(ok, "parsed .cube identity reproduces input");
+            free(owned);
+        }
+    }
+}
+
+static void util_tests(void) {
+    exr_simd_init(); /* ensure dispatch is initialized so force() sticks */
+    printf("== util: conversions ==\n");
+    util_convert_tests();
+    printf("== util: SIMD parity ==\n");
+    util_simd_parity_tests();
+    printf("== util: resize ==\n");
+    util_resize_tests();
+    printf("== util: tonemap ==\n");
+    util_tonemap_tests();
+    printf("== util: colorspace ==\n");
+    util_color_tests();
+    printf("== util: transfer functions ==\n");
+    util_transfer_tests();
+    printf("== util: 3D LUT ==\n");
+    util_lut_tests();
+}
 
 int main(void) {
     static const char *poc[] = {
@@ -2541,6 +3439,7 @@ int main(void) {
               EXR_COMPRESSION_HTJ2K256, "HTJ2K256 WideFloatRange");
     jph_encode_subsampling_roundtrip();
     jph_encode_uint_roundtrip();
+    jph_encode_rct_roundtrip();
     jph_encode_mixed_precision_roundtrip();
 
     printf("== JPH SIMD kernels ==\n");
@@ -2588,10 +3487,67 @@ int main(void) {
 
     printf("== streaming deep + suspend/resume + memory bound ==\n");
     deep_tiled_oob_rejects();
-    stream_deep_check("deepscanline.exr", EXR_COMPRESSION_ZIPS,
+    stream_deep_check("data/deepscanline.exr", EXR_COMPRESSION_ZIPS,
                       "deep scanline ZIPS");
+#ifndef EXR_NO_ZSTD
+    stream_deep_check("data/deepscanline.exr", EXR_COMPRESSION_ZSTD,
+                      "deep scanline ZSTD");
+#endif
+#if defined(EXR_USE_THREADS)
+    deep_encode_thread_check("data/deepscanline.exr");
+#endif
+    /* Regression: an OpenEXR-authored deep-tiled file (per-row cumulative
+     * offset tables) decodes via the high-level loader. */
+    {
+        exr_image di;
+        memset(&di, 0, sizeof(di));
+        if (EXR_OK(exr_load_from_file("data/deep_tiled_sample.exr", NULL, &di))) {
+            int ok = di.num_parts == 1 && di.parts[0].is_deep &&
+                     di.parts[0].deep_total_samples > 0;
+            CHECK(ok, "deep-tiled sample loads (data/deep_tiled_sample.exr)");
+#if defined(EXR_USE_THREADS)
+            /* Re-decode the deep tiles with 4 workers: the parallel per-tile
+             * scatter must match the single-threaded decode bit-for-bit. */
+            if (ok) {
+                exr_image d4;
+                int c;
+                size_t npix = (size_t)di.parts[0].width * di.parts[0].height;
+                memset(&d4, 0, sizeof(d4));
+                exr_set_num_threads(4);
+                if (!EXR_OK(exr_load_from_file("data/deep_tiled_sample.exr",
+                                               NULL, &d4)))
+                    ok = 0;
+                else {
+                    ok = d4.parts[0].deep_total_samples ==
+                             di.parts[0].deep_total_samples &&
+                         memcmp(d4.parts[0].deep_sample_counts,
+                                di.parts[0].deep_sample_counts,
+                                npix * sizeof(int32_t)) == 0;
+                    for (c = 0; ok && c < di.parts[0].header.num_channels; ++c) {
+                        size_t ps = (di.parts[0].header.channels[c].pixel_type ==
+                                     EXR_PIXEL_HALF) ? 2 : 4;
+                        if (memcmp(d4.parts[0].deep_images[c],
+                                   di.parts[0].deep_images[c],
+                                   (size_t)di.parts[0].deep_total_samples * ps) != 0)
+                            ok = 0;
+                    }
+                }
+                exr_set_num_threads(1);
+                exr_image_free(&d4);
+                CHECK(ok, "deep-tiled decode parity (1 vs 4 threads)");
+            }
+#endif
+            exr_image_free(&di);
+        } else {
+            CHECK(0, "deep-tiled sample loads (data/deep_tiled_sample.exr)");
+        }
+    }
+    stream_would_block_check("asakusa.exr", EXR_COMPRESSION_NONE,
+                             "asakusa NONE");
     stream_would_block_check("asakusa.exr", EXR_COMPRESSION_ZIP,
                              "asakusa ZIP");
+    stream_would_block_check("asakusa.exr", EXR_COMPRESSION_PIZ,
+                             "asakusa PIZ");
     stream_memory_bound_check("asakusa.exr", EXR_COMPRESSION_ZIP,
                               "asakusa ZIP");
 
@@ -2599,6 +3555,12 @@ int main(void) {
     printf("== multithreading (serial vs parallel) ==\n");
     thread_tests("asakusa.exr");
 #endif
+
+    printf("== spectral (JCGT layout) ==\n");
+    spectral_tests();
+
+    printf("== util module ==\n");
+    util_tests();
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

@@ -720,6 +720,9 @@ exr_result exr_jph_apply_nlt_type3_i32(int32_t *data, size_t count,
             jph_nlt_type3_i32_sse2(data, count, biasm1);
             return EXR_SUCCESS;
         }
+#elif defined(EXR_NEON)
+        jph_nlt_type3_i32_neon(data, count, biasm1);
+        return EXR_SUCCESS;
 #endif
         jph_nlt_type3_i32_scalar(data, count, biasm1);
         return EXR_SUCCESS;
@@ -831,13 +834,15 @@ exr_result exr_jph_inverse_53_2d_i32(const exr_allocator *a, int32_t *data,
                                      size_t width, size_t height,
                                      unsigned levels) {
     unsigned level;
-    int use_avx2 = 0;
+    int use_simd = 0;
     if (!a) a = exr_default_allocator();
     if (!data && width && height) return EXR_ERROR_INVALID_ARGUMENT;
     if (levels > 32) return EXR_ERROR_INVALID_ARGUMENT;
     if (width == 0 || height == 0 || levels == 0) return EXR_SUCCESS;
 #if defined(EXR_X86)
-    use_avx2 = (exr_cpu_caps() & EXR_SIMD_AVX2) != 0;
+    use_simd = (exr_cpu_caps() & EXR_SIMD_AVX2) != 0;
+#elif defined(EXR_NEON)
+    use_simd = 1;
 #endif
 
     for (level = levels; level > 0; --level) {
@@ -847,7 +852,7 @@ exr_result exr_jph_inverse_53_2d_i32(const exr_allocator *a, int32_t *data,
         size_t lh = (rh + 1u) / 2u, hh = rh / 2u;
         size_t temp_count, temp_bytes, scratch_len, sb64;
         int32_t *temp = NULL;
-        int64_t *ev = NULL, *od = NULL; /* AVX2 1D row-pass scratch */
+        int64_t *ev = NULL, *od = NULL; /* SIMD 1D row-pass scratch */
         size_t y;
         exr_result rc = EXR_SUCCESS;
 
@@ -860,11 +865,11 @@ exr_result exr_jph_inverse_53_2d_i32(const exr_allocator *a, int32_t *data,
             return EXR_ERROR_CORRUPT;
 
         temp = (int32_t *)exr_malloc(a, temp_bytes);
-        if (use_avx2) {
+        if (use_simd) {
             ev = (int64_t *)exr_malloc(a, sb64);
             od = (int64_t *)exr_malloc(a, sb64);
         }
-        if (!temp || (use_avx2 && (!ev || !od))) {
+        if (!temp || (use_simd && (!ev || !od))) {
             exr_free(a, temp); exr_free(a, ev); exr_free(a, od);
             return EXR_ERROR_OUT_OF_MEMORY;
         }
@@ -873,8 +878,13 @@ exr_result exr_jph_inverse_53_2d_i32(const exr_allocator *a, int32_t *data,
         for (y = 0; y < rh; ++y) {
             const int32_t *row = data + y * width;
 #if defined(EXR_X86)
-            if (use_avx2)
+            if (use_simd)
                 rc = jph_inverse_53_i32_avx2(row, lw, row + lw, hw,
+                                             temp + y * rw, rw, ev, od);
+            else
+#elif defined(EXR_NEON)
+            if (use_simd)
+                rc = jph_inverse_53_i32_neon(row, lw, row + lw, hw,
                                              temp + y * rw, rw, ev, od);
             else
 #endif
@@ -885,8 +895,12 @@ exr_result exr_jph_inverse_53_2d_i32(const exr_allocator *a, int32_t *data,
         /* Vertical (column) pass, row-wise across all columns -- no gather/
          * scatter. temp's lh low-rows / hh high-rows -> interleaved data rows. */
 #if defined(EXR_X86)
-        if (use_avx2)
+        if (use_simd)
             rc = jph_inverse_53_vert_i32_avx2(temp, rw, lh, hh, data, width);
+        else
+#elif defined(EXR_NEON)
+        if (use_simd)
+            rc = jph_inverse_53_vert_i32_neon(temp, rw, lh, hh, data, width);
         else
 #endif
             rc = exr_jph_inverse_53_vert_i32(temp, rw, lh, hh, data, width);
@@ -973,13 +987,15 @@ static exr_result jph_inverse_53_2d_i64(const exr_allocator *a, int64_t *data,
                                         size_t width, size_t height,
                                         unsigned levels) {
     unsigned level;
-    int use_avx2 = 0;
+    int use_simd = 0;
     if (!a) a = exr_default_allocator();
     if (!data && width && height) return EXR_ERROR_INVALID_ARGUMENT;
     if (levels > 32) return EXR_ERROR_INVALID_ARGUMENT;
     if (width == 0 || height == 0 || levels == 0) return EXR_SUCCESS;
 #if defined(EXR_X86)
-    use_avx2 = (exr_cpu_caps() & EXR_SIMD_AVX2) != 0;
+    use_simd = (exr_cpu_caps() & EXR_SIMD_AVX2) != 0;
+#elif defined(EXR_NEON)
+    use_simd = 1;
 #endif
 
     for (level = levels; level > 0; --level) {
@@ -1001,11 +1017,11 @@ static exr_result jph_inverse_53_2d_i64(const exr_allocator *a, int64_t *data,
             return EXR_ERROR_CORRUPT;
 
         temp = (int64_t *)exr_malloc(a, temp_bytes);
-        if (use_avx2) {
+        if (use_simd) {
             ev = (int64_t *)exr_malloc(a, scratch_bytes);
             od = (int64_t *)exr_malloc(a, scratch_bytes);
         }
-        if (!temp || (use_avx2 && (!ev || !od))) {
+        if (!temp || (use_simd && (!ev || !od))) {
             exr_free(a, temp); exr_free(a, ev); exr_free(a, od);
             return EXR_ERROR_OUT_OF_MEMORY;
         }
@@ -1014,8 +1030,13 @@ static exr_result jph_inverse_53_2d_i64(const exr_allocator *a, int64_t *data,
         for (y = 0; y < rh; ++y) {
             const int64_t *row = data + y * width;
 #if defined(EXR_X86)
-            if (use_avx2)
+            if (use_simd)
                 rc = jph_inverse_53_i64_avx2(row, lw, row + lw, hw,
+                                             temp + y * rw, rw, ev, od);
+            else
+#elif defined(EXR_NEON)
+            if (use_simd)
+                rc = jph_inverse_53_i64_neon(row, lw, row + lw, hw,
                                              temp + y * rw, rw, ev, od);
             else
 #endif
@@ -1024,8 +1045,12 @@ static exr_result jph_inverse_53_2d_i64(const exr_allocator *a, int64_t *data,
         }
         /* Vertical (column) pass, row-wise across all columns -- no gather. */
 #if defined(EXR_X86)
-        if (use_avx2)
+        if (use_simd)
             rc = jph_inverse_53_vert_i64_avx2(temp, rw, lh, hh, data, width);
+        else
+#elif defined(EXR_NEON)
+        if (use_simd)
+            rc = jph_inverse_53_vert_i64_neon(temp, rw, lh, hh, data, width);
         else
 #endif
             rc = jph_inverse_53_vert_i64(temp, rw, lh, hh, data, width);
@@ -1081,6 +1106,9 @@ static exr_result jph_apply_nlt_type3_i64(int64_t *data, size_t count,
             return EXR_SUCCESS;
         }
     }
+#elif defined(EXR_NEON)
+    jph_nlt_type3_i64_neon(data, count, bias);
+    return EXR_SUCCESS;
 #endif
     jph_nlt_type3_i64_scalar(data, count, bias);
     return EXR_SUCCESS;
@@ -1941,6 +1969,9 @@ static void jph_pack_i32_to_half(uint8_t *dst, const int32_t *src, size_t n) {
     uint32_t caps = exr_cpu_caps();
     if (caps & EXR_SIMD_AVX2) { jph_pack_i32_to_half_avx2(dst, src, n); return; }
     if (caps & EXR_SIMD_SSE41) { jph_pack_i32_to_half_sse41(dst, src, n); return; }
+#elif defined(EXR_NEON)
+    jph_pack_i32_to_half_neon(dst, src, n);
+    return;
 #endif
     jph_pack_i32_to_half_scalar(dst, src, n);
 }
@@ -2551,19 +2582,23 @@ static exr_result jph_magsgn_init(JphMagSgn *m, const uint8_t *data,
     return jph_forward_bits_init(m, data, size, 0xffu, bitbuf);
 }
 
-static uint64_t jph_magsgn_fetch64(JphMagSgn *m) {
-    uint64_t c, v, avail;
+/* Read 64 unstuffed bits at an arbitrary absolute bit position (no cursor move),
+ * with the same fill semantics as jph_magsgn_fetch64. */
+static uint64_t jph_magsgn_fetch64_at(const JphMagSgn *m, uint64_t c) {
+    uint64_t v, avail;
     uint32_t off;
-    if (!m) return 0u;
-    c = m->cursor;
     if (c >= m->real_bits) return m->fill_word;
     off = (uint32_t)(c & 63u);
     v = m->buf[c >> 6u] >> off;
     if (off) v |= m->buf[(c >> 6u) + 1u] << (64u - off);
     avail = m->real_bits - c;
-    /* bits beyond real_bits are already 0 in `buf`; for a 1-fill stream set them */
     if (avail < 64u && m->fill_word) v |= ~UINT64_C(0) << avail;
     return v;
+}
+
+static uint64_t jph_magsgn_fetch64(JphMagSgn *m) {
+    if (!m) return 0u;
+    return jph_magsgn_fetch64_at(m, m->cursor);
 }
 
 static uint32_t jph_magsgn_fetch(JphMagSgn *m) {
@@ -2572,6 +2607,64 @@ static uint32_t jph_magsgn_fetch(JphMagSgn *m) {
 
 static void jph_magsgn_advance(JphMagSgn *m, uint32_t n) {
     if (m) m->cursor += n;
+}
+
+/* Per-quad MagSgn reader for the int32 path. A whole HT quad of this path
+ * consumes <= 4*31 = 124 bits, so one 128-bit window at the quad's start cursor
+ * covers it and the 4 samples are extracted at running bit offsets -- replacing
+ * the 4 per-sample fetch+advance with (usually) a single 64-bit read. The upper
+ * 64 bits are fetched lazily, only when a sample actually crosses bit 64 (rare
+ * for HALF data, whose quad magnitudes are small). Bit-identical to the
+ * per-sample core of jph_decode_block. */
+typedef struct {
+    uint64_t lo, hi, base;
+    uint32_t off;
+    int hi_loaded;
+} JphQuadMs;
+
+static inline void jph_quad_ms_begin(JphQuadMs *q, const JphMagSgn *m) {
+    q->base = m->cursor;
+    q->lo = jph_magsgn_fetch64_at(m, q->base);
+    q->hi = 0u;
+    q->off = 0u;
+    q->hi_loaded = 0;
+}
+
+static inline uint32_t jph_quad_ms_sample(JphQuadMs *q, const JphMagSgn *m,
+                                          uint32_t inf, uint32_t bit,
+                                          uint32_t U_q, uint32_t p,
+                                          uint32_t *v_n_out) {
+    uint32_t val = 0u, v_n = 0u;
+    if (inf & (1u << (4u + bit))) {
+        uint32_t o = q->off;
+        uint32_t m_n = U_q - ((inf >> (12u + bit)) & 1u);
+        uint32_t ms;
+        /* Caller must ensure U_q <= 31 so total consumed bits across all four
+         * samples stays <= 4*31 = 124 < 128 (the two-word window).  Guard here
+         * to prevent UB from a shift >= 64 if that invariant is ever violated. */
+        if (o + m_n > 127u) {
+            *v_n_out = 0u;
+            return 0u;
+        }
+        if (o + m_n > 64u && !q->hi_loaded) {
+            q->hi = jph_magsgn_fetch64_at(m, q->base + 64u);
+            q->hi_loaded = 1;
+        }
+        ms = (o < 64u) ? (uint32_t)((q->lo >> o) | (o ? (q->hi << (64u - o)) : 0u))
+                       : (uint32_t)(q->hi >> (o - 64u));
+        val = ms << 31;
+        v_n = ms & jph_mask32(m_n);
+        v_n |= ((inf >> (8u + bit)) & 1u) << m_n;
+        v_n |= 1u;
+        val |= (v_n + 2u) << (p - 1u);
+        q->off = o + m_n;
+    }
+    *v_n_out = v_n;
+    return val;
+}
+
+static inline void jph_quad_ms_end(JphQuadMs *q, JphMagSgn *m) {
+    m->cursor = q->base + q->off;
 }
 
 /* uint64 words needed for jph_unstuff_bits over `size` bytes (+ fetch slack). */
@@ -3244,11 +3337,14 @@ static exr_result jph_decode_block(const JphCodeblockSeg *seg,
     (void)i;
 
     if (!seg || !htab || !out) return EXR_ERROR_INVALID_ARGUMENT;
+    /* Defense-in-depth: HT codeblocks are at most 128x32 (callers/validation
+     * enforce this).  Re-check locally so the fixed-size scratch math below
+     * cannot be driven OOB if a future caller skips the guard. */
     if (width == 0u || height == 0u) return EXR_ERROR_INVALID_ARGUMENT;
     if (width > 128u || height > 32u) return EXR_ERROR_CORRUPT;
 
     if (num_passes > 1u && lengths2 == 0u) num_passes = 1u;
-    if (num_passes > 3u) return EXR_ERROR_UNSUPPORTED;
+    if (num_passes < 1u || num_passes > 3u) return EXR_ERROR_UNSUPPORTED;
 
     if (missing_msbs >= 30u || kmax > 30u) {
         return jph_decode_block64_cleanup(seg, htab, out, out_stride, kmax);
@@ -3476,79 +3572,36 @@ static exr_result jph_decode_block(const JphCodeblockSeg *seg,
         while (x < width) {
             uint32_t inf = sp[0];
             uint32_t U_q = sp[1];
-            uint32_t bit, m_n;
-            uint32_t v_n = 0, val = 0;
+            uint32_t v_n = 0u, ignore;
+            JphQuadMs q;
 
             if (U_q > mmsbp2) {
                 rc = EXR_ERROR_CORRUPT;
                 goto done;
             }
-            bit = 0u;
-            if (inf & (1u << (4u + bit))) {
-                uint32_t ms_val = jph_magsgn_fetch(&magsgn);
-                m_n = U_q - ((inf >> (12u + bit)) & 1u);
-                jph_magsgn_advance(&magsgn, m_n);
-                val = ms_val << 31;
-                v_n = ms_val & jph_mask32(m_n);
-                v_n |= ((inf >> (8u + bit)) & 1u) << m_n;
-                v_n |= 1u;
-                val |= (v_n + 2u) << (p - 1u);
-            }
-            dp[0] = val;
-            v_n = 0u;
-            val = 0u;
-            bit = 1u;
-            if (inf & (1u << (4u + bit))) {
-                uint32_t ms_val = jph_magsgn_fetch(&magsgn);
-                m_n = U_q - ((inf >> (12u + bit)) & 1u);
-                jph_magsgn_advance(&magsgn, m_n);
-                val = ms_val << 31;
-                v_n = ms_val & jph_mask32(m_n);
-                v_n |= ((inf >> (8u + bit)) & 1u) << m_n;
-                v_n |= 1u;
-                val |= (v_n + 2u) << (p - 1u);
-            }
-            if (1u < height) {
-                dp[sstr] = val;
+            jph_quad_ms_begin(&q, &magsgn);
+            dp[0] = jph_quad_ms_sample(&q, &magsgn, inf, 0u, U_q, p, &ignore);
+            {
+                uint32_t val =
+                    jph_quad_ms_sample(&q, &magsgn, inf, 1u, U_q, p, &v_n);
+                if (1u < height) dp[sstr] = val;
             }
             vp[0] = (uint32_t)(prev_v_n | v_n);
             prev_v_n = 0;
             ++dp;
             ++x;
             if (x >= width) {
+                jph_quad_ms_end(&q, &magsgn);
                 ++vp;
                 break;
             }
-            v_n = 0u;
-            val = 0u;
-            bit = 2u;
-            if (inf & (1u << (4u + bit))) {
-                uint32_t ms_val = jph_magsgn_fetch(&magsgn);
-                m_n = U_q - ((inf >> (12u + bit)) & 1u);
-                jph_magsgn_advance(&magsgn, m_n);
-                val = ms_val << 31;
-                v_n = ms_val & jph_mask32(m_n);
-                v_n |= ((inf >> (8u + bit)) & 1u) << m_n;
-                v_n |= 1u;
-                val |= (v_n + 2u) << (p - 1u);
+            dp[0] = jph_quad_ms_sample(&q, &magsgn, inf, 2u, U_q, p, &ignore);
+            {
+                uint32_t val =
+                    jph_quad_ms_sample(&q, &magsgn, inf, 3u, U_q, p, &v_n);
+                if (1u < height) dp[sstr] = val;
             }
-            dp[0] = val;
-            v_n = 0u;
-            val = 0u;
-            bit = 3u;
-            if (inf & (1u << (4u + bit))) {
-                uint32_t ms_val = jph_magsgn_fetch(&magsgn);
-                m_n = U_q - ((inf >> (12u + bit)) & 1u);
-                jph_magsgn_advance(&magsgn, m_n);
-                val = ms_val << 31;
-                v_n = ms_val & jph_mask32(m_n);
-                v_n |= ((inf >> (8u + bit)) & 1u) << m_n;
-                v_n |= 1u;
-                val |= (v_n + 2u) << (p - 1u);
-            }
-            if (1u < height) {
-                dp[sstr] = val;
-            }
+            jph_quad_ms_end(&q, &magsgn);
             prev_v_n = v_n;
             ++dp;
             ++x;
@@ -3604,72 +3657,33 @@ static exr_result jph_decode_block(const JphCodeblockSeg *seg,
                 }
 
                 {
-                    uint32_t bit = 0u, m_n, v_n, val = 0u;
-                    if (inf & (1u << (4u + bit))) {
-                        uint32_t ms_val = jph_magsgn_fetch(&magsgn);
-                        m_n = U_q - ((inf >> (12u + bit)) & 1u);
-                        jph_magsgn_advance(&magsgn, m_n);
-                        val = ms_val << 31;
-                        v_n = ms_val & jph_mask32(m_n);
-                        v_n |= ((inf >> (8u + bit)) & 1u) << m_n;
-                        v_n |= 1u;
-                        val |= (v_n + 2u) << (p - 1u);
-                    }
-                    dp[0] = val;
-                    v_n = 0u;
-                    val = 0u;
-                    bit = 1u;
-                    if (inf & (1u << (4u + bit))) {
-                        uint32_t ms_val = jph_magsgn_fetch(&magsgn);
-                        m_n = U_q - ((inf >> (12u + bit)) & 1u);
-                        jph_magsgn_advance(&magsgn, m_n);
-                        val = ms_val << 31;
-                        v_n = ms_val & jph_mask32(m_n);
-                        v_n |= ((inf >> (8u + bit)) & 1u) << m_n;
-                        v_n |= 1u;
-                        val |= (v_n + 2u) << (p - 1u);
-                    }
-                    if (y + 1u < height) {
-                        dp[sstr] = val;
+                    uint32_t v_n = 0u, ignore;
+                    JphQuadMs q;
+                    jph_quad_ms_begin(&q, &magsgn);
+                    dp[0] = jph_quad_ms_sample(&q, &magsgn, inf, 0u, U_q, p,
+                                               &ignore);
+                    {
+                        uint32_t val = jph_quad_ms_sample(&q, &magsgn, inf, 1u,
+                                                          U_q, p, &v_n);
+                        if (y + 1u < height) dp[sstr] = val;
                     }
                     vp[0] = (uint32_t)(prev_v_n | v_n);
                     prev_v_n = 0;
                     ++dp;
                     ++x;
                     if (x >= width) {
+                        jph_quad_ms_end(&q, &magsgn);
                         ++vp;
                         break;
                     }
-                    v_n = 0u;
-                    val = 0u;
-                    bit = 2u;
-                    if (inf & (1u << (4u + bit))) {
-                        uint32_t ms_val = jph_magsgn_fetch(&magsgn);
-                        m_n = U_q - ((inf >> (12u + bit)) & 1u);
-                        jph_magsgn_advance(&magsgn, m_n);
-                        val = ms_val << 31;
-                        v_n = ms_val & jph_mask32(m_n);
-                        v_n |= ((inf >> (8u + bit)) & 1u) << m_n;
-                        v_n |= 1u;
-                        val |= (v_n + 2u) << (p - 1u);
+                    dp[0] = jph_quad_ms_sample(&q, &magsgn, inf, 2u, U_q, p,
+                                               &ignore);
+                    {
+                        uint32_t val = jph_quad_ms_sample(&q, &magsgn, inf, 3u,
+                                                          U_q, p, &v_n);
+                        if (y + 1u < height) dp[sstr] = val;
                     }
-                    dp[0] = val;
-                    v_n = 0u;
-                    val = 0u;
-                    bit = 3u;
-                    if (inf & (1u << (4u + bit))) {
-                        uint32_t ms_val = jph_magsgn_fetch(&magsgn);
-                        m_n = U_q - ((inf >> (12u + bit)) & 1u);
-                        jph_magsgn_advance(&magsgn, m_n);
-                        val = ms_val << 31;
-                        v_n = ms_val & jph_mask32(m_n);
-                        v_n |= ((inf >> (8u + bit)) & 1u) << m_n;
-                        v_n |= 1u;
-                        val |= (v_n + 2u) << (p - 1u);
-                    }
-                    if (y + 1u < height) {
-                        dp[sstr] = val;
-                    }
+                    jph_quad_ms_end(&q, &magsgn);
                     prev_v_n = v_n;
                     ++dp;
                     ++x;
@@ -3906,6 +3920,9 @@ static exr_result jph_decode_block(const JphCodeblockSeg *seg,
                 jph_extract_signmag_i32_to_i64_avx2(orow, brow, width, shift);
                 continue;
             }
+#elif defined(EXR_NEON)
+            jph_extract_signmag_i32_to_i64_neon(orow, brow, width, shift);
+            continue;
 #endif
             for (x = 0u; x < width; ++x) {
                 uint32_t v = brow[x];
@@ -4553,13 +4570,16 @@ static exr_result jph_forward_53_i64(const int64_t *src, size_t n,
  * which may alias the `low` output — pass a distinct source for that case. */
 static exr_result jph_forward_53_1d_i64(const int64_t *src, size_t n,
                                         int64_t *low, size_t lc, int64_t *high,
-                                        size_t hc, int use_avx2, int64_t *ev,
+                                        size_t hc, int use_simd, int64_t *ev,
                                         int64_t *od) {
 #if defined(EXR_X86)
-    if (use_avx2)
+    if (use_simd)
         return jph_forward_53_i64_avx2(src, n, low, lc, high, hc, ev, od);
+#elif defined(EXR_NEON)
+    if (use_simd)
+        return jph_forward_53_i64_neon(src, n, low, lc, high, hc, ev, od);
 #else
-    (void)use_avx2; (void)ev; (void)od;
+    (void)use_simd; (void)ev; (void)od;
 #endif
     return jph_forward_53_i64(src, n, low, lc, high, hc);
 }
@@ -4606,13 +4626,15 @@ static exr_result jph_forward_53_2d_i64(const exr_allocator *a, int64_t *data,
                                         size_t width, size_t height,
                                         unsigned levels) {
     unsigned level;
-    int use_avx2 = 0;
+    int use_simd = 0;
     if (!a) a = exr_default_allocator();
     if (!data && width && height) return EXR_ERROR_INVALID_ARGUMENT;
     if (levels > 32) return EXR_ERROR_INVALID_ARGUMENT;
     if (width == 0 || height == 0 || levels == 0) return EXR_SUCCESS;
 #if defined(EXR_X86)
-    use_avx2 = (exr_cpu_caps() & EXR_SIMD_AVX2) != 0;
+    use_simd = (exr_cpu_caps() & EXR_SIMD_AVX2) != 0;
+#elif defined(EXR_NEON)
+    use_simd = 1;
 #endif
 
     for (level = 1; level <= levels; ++level) {
@@ -4637,12 +4659,12 @@ static exr_result jph_forward_53_2d_i64(const exr_allocator *a, int64_t *data,
         temp = (int64_t *)exr_malloc(a, temp_bytes);
         col_low = (int64_t *)exr_malloc(a, scratch_bytes);
         col_high = (int64_t *)exr_malloc(a, scratch_bytes);
-        if (use_avx2) {
+        if (use_simd) {
             ev = (int64_t *)exr_malloc(a, scratch_bytes);
             od = (int64_t *)exr_malloc(a, scratch_bytes);
         }
         if (!temp || !col_low || !col_high ||
-            (use_avx2 && (!ev || !od))) {
+            (use_simd && (!ev || !od))) {
             exr_free(a, temp); exr_free(a, col_low);
             exr_free(a, col_high); exr_free(a, ev); exr_free(a, od);
             return EXR_ERROR_OUT_OF_MEMORY;
@@ -4651,8 +4673,12 @@ static exr_result jph_forward_53_2d_i64(const exr_allocator *a, int64_t *data,
         /* Vertical (column) analysis, row-wise across all columns -- no gather/
          * scatter. data's interleaved rows -> temp's lh low-rows / hh high-rows. */
 #if defined(EXR_X86)
-        if (use_avx2)
+        if (use_simd)
             rc = jph_forward_53_vert_i64_avx2(data, width, rw, lh, hh, temp);
+        else
+#elif defined(EXR_NEON)
+        if (use_simd)
+            rc = jph_forward_53_vert_i64_neon(data, width, rw, lh, hh, temp);
         else
 #endif
             rc = jph_forward_53_vert_i64(data, width, rw, lh, hh, temp);
@@ -4660,7 +4686,7 @@ static exr_result jph_forward_53_2d_i64(const exr_allocator *a, int64_t *data,
         /* Horizontal (row) analysis: each temp row is contiguous. */
         for (y = 0; y < rh; ++y) {
             rc = jph_forward_53_1d_i64(temp + y * rw, rw, col_low, lw, col_high,
-                                       hw, use_avx2, ev, od);
+                                       hw, use_simd, ev, od);
             if (rc != EXR_SUCCESS) goto done_fwd64;
             for (x = 0; x < lw; ++x) data[y * width + x] = col_low[x];
             for (x = 0; x < hw; ++x) data[y * width + lw + x] = col_high[x];

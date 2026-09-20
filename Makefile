@@ -41,9 +41,9 @@ V3_WARN  = -Wall -Wextra -Werror
 V3_DEFS  =
 V3_SRC   = $(wildcard src/*.c)
 V3_OBJ   = $(patsubst src/%.c,build/%.o,$(V3_SRC))
-# Freestanding core: everything except the optional stdio layer and the
-# (freestanding-only) mem/str implementations.
-V3_CORE_SRC = $(filter-out src/exr_stdio.c src/exr_freestanding.c,$(V3_SRC))
+# Freestanding core: everything except the optional stdio layer, the spectral
+# helpers (hosted-only convenience), and the (freestanding-only) mem/str impls.
+V3_CORE_SRC = $(filter-out src/exr_stdio.c src/exr_freestanding.c src/exr_spectral.c,$(V3_SRC))
 ZSTD_SRC = deps/zstd/tinyexr_zstd.c
 ZSTD_OBJ = build/tinyexr_zstd.o
 V3_TEST_OBJ = $(patsubst src/%.c,build/test-%.o,$(V3_SRC))
@@ -178,6 +178,18 @@ fuzz: test/fuzzer/fuzz_v3.c | build
 	  test/fuzzer/fuzz_v3.c $(V3_SRC) $(ZSTD_SRC) -lm -o build/fuzz_v3
 	@echo "built build/fuzz_v3 - e.g. ./build/fuzz_v3 -max_total_time=60 test/unit/regression"
 
+# HTJ2K (JPH) encode+decode+round-trip fuzzer.
+#   ./build/fuzz_jph -max_total_time=600 test/fuzzer/corpus_jph
+fuzz-jph: test/fuzzer/fuzz_jph.c | build
+	clang $(V3_CSTD) $(V3_INC) -O1 -g -w -fsanitize=fuzzer,address,undefined \
+	  test/fuzzer/fuzz_jph.c $(V3_SRC) $(ZSTD_SRC) -lm -o build/fuzz_jph
+	@echo "built build/fuzz_jph"
+
+# Deterministic corpus replay for fuzz_jph (no libFuzzer needed).
+fuzz-jph-corpus: test/fuzzer/fuzz_jph.c | build
+	clang $(V3_CSTD) -Wall $(V3_INC) -O1 -g $(SAN) -DEXR_JPH_FUZZ_STANDALONE \
+	  test/fuzzer/fuzz_jph.c $(V3_SRC) $(ZSTD_SRC) -lm -o build/fuzz_jph_replay
+
 # Deterministic corpus replay under ASan+UBSan (no libFuzzer needed; CI gate).
 fuzz-corpus: $(V3_TEST_OBJ) build/test-tinyexr_zstd.o $(LD_TEST_OBJ) test/fuzzer/fuzz_v3.c | build
 	$(CC) $(V3_CSTD) -Wall -Wextra $(V3_INC) -O1 -g $(SAN) -DEXR_FUZZ_STANDALONE \
@@ -275,6 +287,94 @@ freestanding-gate: $(FS_OBJ) test/v3/freestanding_smoke.c | build
 	  test/v3/freestanding_smoke.c $(FS_OBJ) -o build/fs_smoke
 	./build/fs_smoke
 	@echo "freestanding gate: OK"
+
+# ---- tocio (sandbox: tiny OpenColorIO config engine + codegen) ------------
+# Pure-C11, freestanding, no external deps. Lives outside src/ so it has its own
+# build/gate targets. Mirrors the v3 freestanding discipline.
+TOC_INC      = -Isandbox/tocio/include -Isandbox/tocio/src
+TOC_SRC      = $(wildcard sandbox/tocio/src/*.c)
+TOC_OBJ      = $(patsubst sandbox/tocio/src/%.c,build/toc-%.o,$(TOC_SRC))
+TOC_HDRS     = sandbox/tocio/include/tocio.h sandbox/tocio/src/toc_internal.h
+# Freestanding core: everything except the optional hosted stdio loader and the
+# hosted JIT (needs OS executable memory).
+TOC_CORE_SRC = $(filter-out sandbox/tocio/src/toc_stdio.c sandbox/tocio/src/toc_jit.c,$(TOC_SRC))
+TOC_FS_OBJ   = $(patsubst sandbox/tocio/src/%.c,build/toc-fs-%.o,$(TOC_CORE_SRC))
+TOC_FS_FORBIDDEN = $(FS_FORBIDDEN)
+
+.PHONY: tocio-lib tocio-c11-gate tocio-freestanding-gate tocio-test
+
+build/toc-%.o: sandbox/tocio/src/%.c $(TOC_HDRS) | build
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TOC_INC) -O2 -g $(SAN) -c $< -o $@
+
+tocio-lib: $(TOC_OBJ)
+	$(AR) rcs build/libtocio.a $(TOC_OBJ)
+	@echo "built build/libtocio.a"
+
+tocio-c11-gate: | build
+	@for f in $(TOC_SRC); do \
+	  echo "  C11  $$f"; \
+	  $(CC) $(V3_CSTD) $(V3_WARN) $(TOC_INC) -O1 -fsyntax-only $$f || exit 1; \
+	done
+	@echo "tocio pure-C11 gate: OK"
+
+build/toc-fs-%.o: sandbox/tocio/src/%.c $(TOC_HDRS) | build
+	$(CC) -DTOC_FREESTANDING -ffreestanding -fno-builtin -fno-stack-protector \
+	  $(V3_CSTD) $(V3_WARN) $(TOC_INC) -O2 -g -c $< -o $@
+
+tocio-freestanding-gate: $(TOC_FS_OBJ) sandbox/tocio/tests/toc_fs_smoke.c | build
+	@echo "  scan: only toc_stdio.c may include <stdio.h>"
+	@bad=`grep -rl '<stdio.h>' sandbox/tocio/src/ | grep -v 'toc_stdio.c' || true`; \
+	  if [ -n "$$bad" ]; then echo "  FAIL: stdio leaked into: $$bad"; exit 1; fi
+	@echo "  scan: no forbidden libc symbols in the freestanding core"
+	@for o in $(TOC_FS_OBJ); do \
+	  hit=`nm -u $$o 2>/dev/null | awk '{print $$NF}' | grep -wE '$(TOC_FS_FORBIDDEN)' || true`; \
+	  if [ -n "$$hit" ]; then echo "  FAIL: $$o references:" $$hit; exit 1; fi; \
+	done
+	@echo "  run: freestanding-compiled core + custom-allocator round-trip"
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TOC_INC) -O2 \
+	  sandbox/tocio/tests/toc_fs_smoke.c $(TOC_FS_OBJ) -o build/toc_fs_smoke
+	./build/toc_fs_smoke
+	@echo "tocio freestanding gate: OK"
+
+tocio-test: | build
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TOC_INC) -O1 -g $(SAN) \
+	  sandbox/tocio/tests/toc_test.c $(TOC_SRC) -lm -ldl -o build/toc_test
+	ASAN_OPTIONS=detect_leaks=0 ./build/toc_test
+
+# Interpreter throughput benchmark (scalar vs SIMD per op). -O2, no sanitizers.
+.PHONY: tocio-bench
+tocio-bench: | build
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TOC_INC) -O2 \
+	  sandbox/tocio/tests/toc_bench.c $(TOC_SRC) -lm -ldl -o build/toc_bench
+	./build/toc_bench
+
+# ---- tocio ARM64 (aarch64 NEON) cross build + qemu test ---------------------
+# Cross-compile the full tocio test suite and run under qemu-aarch64.
+# toc_jit.c has a native AArch64/NEON backend (emits A64 code to executable
+# memory); under qemu-user the JIT may report TOC_ERROR_UNSUPPORTED and skip.
+.PHONY: tocio-arm-test
+tocio-arm-test: | build
+	$(ARM_CC) -static -march=armv8-a $(V3_CSTD) -Wall -Wextra $(TOC_INC) -O2 \
+	  sandbox/tocio/tests/toc_test.c $(TOC_SRC) -lm -o build/toc_test_arm
+	@file build/toc_test_arm | sed 's/^/  /'
+	$(ARM_QEMU) ./build/toc_test_arm
+
+# ---- tocio WASM (Emscripten ES6 module for the web viewer) -----------------
+TOCW_EXPORTS = ['_tocw_parse','_tocw_free_config','_tocw_processor','_tocw_processor_view','_tocw_free_ops','_tocw_apply','_tocw_emit_glsl','_tocw_emit_metal','_tocw_emit_c','_tocw_free_str','_tocw_num_colorspaces','_tocw_colorspace_name','_malloc','_free']
+TOCW_RUNTIME = ['HEAPU8','HEAPF32','HEAP32','UTF8ToString','stringToUTF8','lengthBytesUTF8']
+.PHONY: wasm-tocio wasm-tocio-test
+wasm-tocio: | build
+	$(EMCC) -O3 $(TOC_INC) -w \
+	  $(TOC_CORE_SRC) sandbox/tocio/wasm/toc_wasm.c \
+	  -s FILESYSTEM=0 -s ALLOW_MEMORY_GROWTH=1 -s MODULARIZE=1 \
+	  -s EXPORT_ES6=1 -s ENVIRONMENT=web,node \
+	  -s "EXPORTED_FUNCTIONS=$(TOCW_EXPORTS)" \
+	  -s "EXPORTED_RUNTIME_METHODS=$(TOCW_RUNTIME)" \
+	  -o build/tocio.mjs
+	@echo "built build/tocio.mjs + build/tocio.wasm"
+
+wasm-tocio-test: wasm-tocio
+	node sandbox/tocio/wasm/test.mjs
 
 clean:
 	rm -rf $(TARGET) miniz.o build $(PARSE_HARNESS)

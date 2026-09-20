@@ -4,30 +4,67 @@ Status: **scoping / not yet implemented.** Target: `src/exr_jph.c`,
 `src/exr_jph_simd.c`. Reference: OpenJPH `ojph_block_decoder_avx2.cpp` /
 `_ssse3.cpp` in `~/work/openexr/external/OpenJPH/src/core/coding/`.
 
-## ⚠ Empirical finding (2026-06-09): Stage 0 regressed — premise needs revisiting
+## Empirical findings (2026-06-09)
 
-Stage 0 (the scalar per-quad 128-bit-window refactor) was implemented and
-**measured ~4% SLOWER** on all-HALF htj2k256 decode (clean interleaved A/B,
-min-of-6: 5.09s → 5.30s), and was reverted. Root cause: the assumption that
-windowing "removes 3 of 4 fetches" is wrong for real data. HALF detail bands are
-**sparse** — most quads have 0–1 significant samples — and the current
-per-sample path does *zero* MagSgn work for insignificant samples. A per-quad
-window pays a fixed read + offset-bookkeeping cost on every quad (even fully
-insignificant ones; guarding the read by significance did not recover it).
+**Density measurement (decisive):** instrumenting the int32 step-2 loop showed HT
+quads are overwhelmingly **dense**, not sparse — asakusa averages **3.97
+significant samples/quad** with **99.4%** of quads having ≥3 (213,812 of 218,498
+fully significant); other corpus images 84–99% dense. So per-quad processing has
+ample work to amortize fixed cost, and **no density gating is needed** in
+practice.
 
-Implication for the SIMD stages: per-quad/2-quad vectorization pays the same
-fixed per-quad cost, so a net win requires enough significant samples per quad to
-amortize it. That holds for **dense, low-frequency (LL / coarse-resolution)**
-subbands but not the sparse high-frequency detail that dominates a typical HALF
-image. OpenJPH's measured step-2 speedups likely come from dense/high-bit-depth
-blocks plus its fully-SIMD surrounding pipeline, not this step on sparse data.
+**First attempt (Stage 0) regressed ~4%, then a corrected version won ~4%.**
+The initial per-quad refactor read a *full* 128-bit window (both 64-bit halves)
+per quad through non-inlined helpers, and measured 4% slower. The regression was
+an **implementation artifact**, not the "sparse data" hypothesis first recorded
+here: HALF quad magnitudes are small, so the upper 64 bits are essentially never
+needed, and always fetching them (plus call overhead) cost more than the 4
+per-sample reads it replaced. **Fix — `JphQuadMs` lazy per-quad reader**
+(`exr_jph.c`): read only the lower 64 bits eagerly, fetch the upper half **only
+when a sample crosses bit 64** (rare), and force-inline the begin/sample/end
+helpers. Result: **~4% faster** all-HALF htj2k256 decode (clean interleaved A/B,
+min-of-6: 5.13s → 4.91s), byte-identical across the corpus. **Landed — scalar,
+no SIMD.**
 
-**Revised recommendation:** treat decode entropy SIMD as **low priority / uncertain
-ROI** for the common all-HALF case. If pursued, gate it to dense quads (e.g.
-significant-sample count ≥ threshold, or only the coarse resolutions) and
-benchmark per-subband before committing. The wavelet/extraction SIMD already
-landed are the higher-confidence wins. The analysis below stands as the design
-if/when a dense-block path is wanted.
+**Stage 1 (AVX2 4-sample MagSgn kernel) implemented, verified, measured
+break-even — not shipped.** `jph_decode_quad_magsgn_i32_avx2` decodes a quad's 4
+samples in parallel from the pre-filled 128-bit window: per-lane `m_n`, inclusive
+prefix-sum for bit offsets, `pshufb` byte-gather (`d0`/`d1`) + AVX2 `srlv`/`sllv`
+variable shift to extract each sample, then the `v_n`/sign/`val` assembly, with
+insignificant lanes masked to 0. It was wired into both step-2 loops as a
+full-quad fast path (half-quads/non-AVX2 keep scalar `JphQuadMs`) and is
+**bit-exact** — 200k random parity trials vs a scalar reference, 202 unit tests,
+59 single-part corpus files byte-identical. But a careful interleaved A/B (800
+iters, min-of-8) measured **+0.0%** vs the committed scalar `JphQuadMs`. Reasons:
+(1) the scalar path already cut fetches to ~1/quad (lazy upper half) and the
+compiler does the per-sample assembly cheaply; (2) the 128-bit (4-sample) kernel
+amortizes its gather/shift setup over only 4 lanes *and* reads both 64-bit window
+halves unconditionally, giving back the lazy-hi saving. So it was **reverted**.
+
+**2-quad / 8-sample (256-bit) batching (OpenJPH `decode_two_quad32` style) —
+implemented, verified bit-exact, measured ~4% SLOWER, reverted.**
+`jph_decode_2quad_magsgn_i32_avx2` decoded two quads' 8 samples in a 256-bit
+register (per-128-lane prefix sum + `pshufb` gather from each quad's own window).
+It was wired into both step-2 loops for full quad pairs (`x+4<=width`), with the
+non-initial `kappa` for quad B correctly reading `vp[1]|vp[2]` (the scalar loop
+advances `vp` by one between quads). **Bit-exact** — 200k random parity trials,
+202 unit tests, 59 corpus files byte-identical — but a careful interleaved A/B
+(600 iters, min-of-7) measured **+4.1%** (slower) vs the scalar `JphQuadMs`.
+Reasons: (1) it computes the per-quad bit totals twice (scalar, to position the
+second window) duplicating the kernel's own `m_n`; (2) it fetches **two full
+128-bit windows** (4 reads) vs the scalar lazy path's ~2; (3) on Zen2, AVX2-256
+ops issue as 2×128-bit µops, so the nominal 2× width does not materialize while
+the extra setup does. Reverted.
+
+**Conclusion (entropy decode SIMD): not worth it on this workload/hardware.**
+Three data points — Stage 0 per-quad scalar (regressed, fixed into the shipped
+`JphQuadMs`), 1-quad AVX2 (break-even), 2-quad AVX2 (~4% slower) — all show the
+scalar `JphQuadMs` (commit a4cb990) is the sweet spot: it already minimizes
+fetches (lazy upper half) and the per-sample assembly is cheap, so per-quad SIMD
+setup + extra window reads cancel the parallelism. The MagSgn step would only
+favour SIMD on much denser / higher-bit-depth blocks or hardware with full-width
+256-bit execution. **The entropy-decode SIMD line is closed.** The design below
+remains as reference for any future revisit.
 
 ## Why
 

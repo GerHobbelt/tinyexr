@@ -147,10 +147,10 @@ static exr_result cur_string(cursor *c, const char **out, size_t *out_len) {
     return EXR_SUCCESS;
 }
 
-static exr_result attr_append(const exr_allocator *a, exr_attr_list *list,
-                              const char *name, size_t name_len,
-                              const char *type, size_t type_len,
-                              const uint8_t *data, uint32_t size) {
+exr_result exr_attr_list_append(const exr_allocator *a, exr_attr_list *list,
+                                const char *name, size_t name_len,
+                                const char *type, size_t type_len,
+                                const uint8_t *data, uint32_t size) {
     exr_attr *slot;
     if (list->count >= EXR_MAX_ATTRIBUTES) return EXR_ERROR_CORRUPT;
     if (list->count == list->capacity) {
@@ -218,8 +218,8 @@ static exr_result parse_one_header(exr_reader *r, cursor *c,
         c->pos += 4;
         if (sz < 0 || (uint32_t)sz > EXR_MAX_ATTR_SIZE) return EXR_ERROR_CORRUPT;
         if (!cur_need(c, (size_t)sz)) return EXR_ERROR_CORRUPT;
-        rc = attr_append(a, list, name, name_len, type, type_len,
-                         c->p + c->pos, (uint32_t)sz);
+        rc = exr_attr_list_append(a, list, name, name_len, type, type_len,
+                                  c->p + c->pos, (uint32_t)sz);
         if (!EXR_OK(rc)) return rc;
         c->pos += (size_t)sz;
     }
@@ -1674,7 +1674,11 @@ exr_result exr_reader_decode_deep_samples(exr_reader *r, int32_t part,
 }
 
 /* ============================================================================
- * Streaming suspend/resume (Phase 9 stubs)
+ * Streaming suspend/resume. With an EXR_SRC_CALLBACK source, any reader call
+ * (parse_header / decode_block / decode_deep_*) runs exr_reader_ensure_buffered
+ * first; when the source has no bytes ready it returns EXR_WOULD_BLOCK and
+ * records the pending byte range. The host fetches that range, feeds it via
+ * exr_reader_supply(), and re-issues the same call to resume.
  * ========================================================================== */
 
 exr_result exr_reader_pending(const exr_reader *r, exr_pending_read *out) {
