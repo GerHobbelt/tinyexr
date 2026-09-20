@@ -12,6 +12,7 @@ CC  ?= gcc
 CXX ?= g++
 EMCC ?= emcc
 EMAR ?= emar
+NODE ?= node
 
 CFLAGS   ?= -O2
 CXXFLAGS ?= -O2 -std=c++11
@@ -22,7 +23,7 @@ MINIZ_SRC = ./deps/miniz/miniz.c
 # ---- legacy v1 single-header test (unchanged) -----------------------------
 TARGET = test_tinyexr
 
-.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate freestanding-zstd-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph texcomp texcomp-arm texcomp-c11-gate texcomp-test texcomp-bench texcomp-astc-psnr texcomp-astc-arm-smoke texcomp-astc-arm-gate texcomp-astc-hdr-gate texcomp-xbc7-gate texcomp-uni-gate texcomp-bc6h-gate texcomp-wasm texcomp-wasm-simd wasm-texcomp wasm-texcomp-simd
+.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate texcomp-web fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate freestanding-zstd-gate examples-c bench bench-compare bench-htj2k arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph texcomp texcomp-arm texcomp-c11-gate texcomp-test texcomp-bench texcomp-astc-psnr texcomp-astc-arm-smoke texcomp-astc-arm-gate texcomp-astc-hdr-gate texcomp-uni-gate texcomp-bc6h-gate texcomp-wasm texcomp-wasm-simd wasm-texcomp wasm-texcomp-simd ptexatlas-c11-gate
 
 all: $(TARGET)
 
@@ -45,17 +46,26 @@ tools-test: texcomp-c11-gate texcomp-test texcomp-uni-gate texcomp-xbc7-gate \
             texcomp-bc6h-gate \
             resize-c11-gate resize-test \
             texpipe-c11-gate texpipe-test \
-            envmap-c11-gate envmap-test envmap-pbr-test
+            envmap-c11-gate envmap-test envmap-pbr-test ptexatlas-c11-gate
 	@echo "tools-test: all self-contained tool gates passed"
 
 tools-test-all: tools-test texcomp-astc-hdr-gate texcomp-astc-arm-gate
 	@echo "tools-test-all: all tool gates (incl. astcenc cross-checks) passed"
+
+# TinyEXR/TinyUSDZ shared Ptex reader + coarse atlas packer.  Keep this gate
+# independent of the C++ legacy library so it remains usable in freestanding
+# and WASM-oriented builds.
+ptexatlas-c11-gate:
+	$(CC) -std=c11 -Wall -Wextra -Werror -Itools/ptexatlas -Ideps/miniz \
+	  -fsyntax-only tools/ptexatlas/ptex.c tools/ptexatlas/texatlas.c
 
 # ---- pure-C11 v3 library + tests ------------------------------------------
 V3_INC   = -Iinclude -Isrc -Ideps/zstd
 V3_CSTD  = -std=c11
 V3_WARN  = -Wall -Wextra -Werror
 V3_DEFS  =
+V3_OPT   ?= -O2
+V3_ARCH  ?=
 V3_SRC   = $(wildcard src/*.c)
 V3_OBJ   = $(patsubst src/%.c,build/%.o,$(V3_SRC))
 # Freestanding core: everything except the optional stdio layer, the spectral
@@ -161,7 +171,7 @@ build/vkew.o: third_party/vkew/vkew.c third_party/vkew/vkew.h | build
 build/exr_gpu_cuda.o: src/exr_gpu_cuda.c include/exr_gpu.h include/exr.h \
                       src/exr_internal.h src/exr_gpu_kernels.cuh.inc \
                       src/exr_gpu_jph_kernels.cuh.inc | build
-	$(CC) $(V3_CSTD) $(V3_WARN) $(V3_DEFS) $(V3_INC) -O2 -g -c $< -o $@
+	$(CC) $(V3_CSTD) $(V3_WARN) $(V3_DEFS) $(V3_INC) $(V3_OPT) $(V3_ARCH) -g -c $< -o $@
 
 # Vulkan backend TU: extra prereqs (public header, embedded SPIR-V, vkew).
 build/exr_vk_vulkan.o: src/exr_vk_vulkan.c include/exr_vk.h include/exr.h \
@@ -169,7 +179,7 @@ build/exr_vk_vulkan.o: src/exr_vk_vulkan.c include/exr_vk.h include/exr.h \
 	$(CC) $(V3_CSTD) $(V3_WARN) $(V3_DEFS) $(V3_INC) -O2 -g -c $< -o $@
 
 build/%.o: src/%.c include/exr.h src/exr_internal.h deps/zstd/tinyexr_zstd.h | build
-	$(CC) $(V3_CSTD) $(V3_WARN) $(V3_DEFS) $(V3_INC) -O2 -g -c $< -o $@
+	$(CC) $(V3_CSTD) $(V3_WARN) $(V3_DEFS) $(V3_INC) $(V3_OPT) $(V3_ARCH) -g -c $< -o $@
 
 build/tinyexr_zstd.o: $(ZSTD_SRC) deps/zstd/tinyexr_zstd.h | build
 	$(CC) $(V3_CSTD) $(V3_INC) -O2 -g -w -c $< -o $@
@@ -249,7 +259,9 @@ TEXCOMP_SRC = tools/texcomp/src/texcomp.c \
   tools/texcomp/src/texcomp_bc7.c tools/texcomp/src/texcomp_etc2.c \
   tools/texcomp/src/texcomp_eac.c tools/texcomp/src/texcomp_astc.c \
   tools/texcomp/src/texcomp_astc_hdr.c tools/texcomp/src/texcomp_uni.c \
-  tools/texcomp/src/texcomp_astc_decode.c
+  tools/texcomp/src/texcomp_astc_decode.c \
+  tools/texcomp/src/texcomp_etc2_decode.c \
+  tools/texcomp/src/texcomp_bc6h_decode.c
 TEXCOMP_HDRS = tools/texcomp/include/texcomp.h tools/texcomp/src/texcomp_internal.h
 TEXCOMP_OBJ = $(patsubst tools/texcomp/src/%.c,build/texcomp/%.o,$(TEXCOMP_SRC))
 TEXCOMP_TEST_OBJ = $(patsubst tools/texcomp/src/%.c,build/texcomp/test-%.o,$(TEXCOMP_SRC))
@@ -333,6 +345,13 @@ texcomp-wasm: build/texcomp/wasm/libtexcomp.a build/texcomp/wasm/texcomp.mjs bui
 texcomp-wasm-simd: build/texcomp/wasm-simd/libtexcomp.a build/texcomp/wasm-simd/texcomp.mjs build/texcomp/wasm-simd/texcomp_cli.js
 	@echo "built build/texcomp/wasm-simd/libtexcomp.a, texcomp.mjs/.wasm, texcomp_cli.js/.wasm"
 
+# Browser demo: web/texcomp (tir + texcomp + texpipe + envmap + EXR decode).
+# Needs emcc on PATH. Artifacts land next to index.html so the page can be
+# served straight from a checkout.
+.PHONY: texcomp-web
+texcomp-web:
+	cd web/texcomp && EMCC=$(EMCC) ./build.sh
+
 wasm-texcomp: texcomp-wasm
 
 wasm-texcomp-simd: texcomp-wasm-simd
@@ -387,7 +406,8 @@ texcomp-astc-psnr: $(TEXCOMP_OBJ) tools/texcomp/bench/texcomp_psnr.c tools/texco
 # aarch64; the default `make texcomp` stays pure C11 with no C++ parts.
 ASTCENC_LIB_SRC = $(wildcard deps/astcenc/*.cpp)
 ASTCENC_LIB_OBJ = $(patsubst deps/astcenc/%.cpp,build/astcenc/%.o,$(ASTCENC_LIB_SRC))
-ifeq ($(shell uname -m),aarch64)
+ASTCENC_HOST_ARCH ?= $(shell uname -m)
+ifneq ($(filter aarch64 arm64,$(ASTCENC_HOST_ARCH)),)
   ASTCENC_DEFS = -DASTCENC_SSE=0 -DASTCENC_AVX=0 -DASTCENC_NEON=1 -DASTCENC_SVE=0 -DASTCENC_POPCNT=0 -DASTCENC_F16C=0
 else
   ASTCENC_DEFS = -DASTCENC_SSE=20 -DASTCENC_AVX=0 -DASTCENC_NEON=0 -DASTCENC_SVE=0 -DASTCENC_POPCNT=0 -DASTCENC_F16C=0
@@ -471,7 +491,7 @@ texcomp-xbc7-gate: lib $(TEXCOMP_OBJ) texcomp tools/texcomp/test/xbc7_gate.c too
 	  --format xbc7 --rdo 16 --raw build/texcomp/rt_enc.bc7
 	./build/texcomp/texcomp -i build/texcomp/rt.xbc7 -o build/texcomp/rt.dds \
 	  --raw build/texcomp/rt_dec.bc7
-	@cmp -s build/texcomp/rt_enc.bc7 build/texcomp/rt_dec.bc7 \
+	@git diff --no-index --quiet build/texcomp/rt_enc.bc7 build/texcomp/rt_dec.bc7 \
 	  && echo "xbc7 CLI round-trip: OK (transcode is bit-exact BC7)" \
 	  || { echo "FAIL: xbc7 round-trip differs"; exit 1; }
 
@@ -488,7 +508,7 @@ TEXPIPE_LIB_SRC = tools/texpipe/src/texpipe.c tools/texpipe/src/texpipe_mip.c \
 TEXPIPE_HDRS = tools/texpipe/include/texpipe.h tools/texpipe/src/texpipe_internal.h
 TEXPIPE_OBJ = $(patsubst tools/texpipe/src/%.c,build/texpipe/%.o,$(TEXPIPE_LIB_SRC))
 
-.PHONY: texpipe texpipe-c11-gate texpipe-test
+.PHONY: texpipe texpipe-c11-gate texpipe-test texpipe-three-ktx2-test
 
 build/texpipe:
 	@mkdir -p build/texpipe
@@ -524,6 +544,24 @@ texpipe-test: resize-lib texcomp tools/texpipe/test/test_texpipe.c $(TEXPIPE_HDR
 	  tools/texpipe/test/test_texpipe.c $(TEXPIPE_LIB_SRC) build/libtir.a \
 	  build/libtexcomp.a -lm -o build/test_texpipe
 	./build/test_texpipe
+
+# Optional browser interoperability gate. This stays outside tools-test because
+# it needs Node, Puppeteer, Three.js and Chrome. Install dependencies in the test
+# directory, or point THREE_KTX2_NODE_ROOT at an existing web project.
+THREE_KTX2_NODE_ROOT ?= tools/texpipe/test/three_ktx2_loader
+
+build/texpipe/three_ktx2_fixture: texpipe \
+  tools/texpipe/test/three_ktx2_loader/generate_fixture.c
+	$(CC) $(V3_CSTD) $(V3_WARN) $(TEXPIPE_INC) -Ideps/zstd -O2 -g \
+	  tools/texpipe/test/three_ktx2_loader/generate_fixture.c \
+	  build/libtexpipe.a build/libtir.a build/libtexcomp.a $(ZSTD_OBJ) \
+	  -pthread -lm -o $@
+
+texpipe-three-ktx2-test: build/texpipe/three_ktx2_fixture
+	./build/texpipe/three_ktx2_fixture build/texpipe/three-ktx2.ktx2
+	THREE_KTX2_NODE_ROOT="$(THREE_KTX2_NODE_ROOT)" \
+	  $(NODE) tools/texpipe/test/three_ktx2_loader/test.mjs \
+	  build/texpipe/three-ktx2.ktx2
 
 # ---- tools/envmap: environment-map projections, SH, spherical gaussians ----
 # Pure C11. Links tir + texcomp + texpipe + libtinyexr3 (CLI does HDR EXR I/O).
@@ -627,14 +665,21 @@ OPENEXR_LDPATH = $(OPENEXR_LIBDIR)/OpenEXR:$(OPENEXR_LIBDIR)/OpenEXRCore:$(OPENE
 build/bench_tx.o: benchmark/bench_tx.c benchmark/bench_tx.h include/exr.h | build
 	$(CC) $(V3_CSTD) -Wall -Wextra $(V3_INC) -O3 -c benchmark/bench_tx.c -o $@
 
-bench-compare: $(V3_OBJ) $(ZSTD_OBJ) $(LD_OBJ) build/bench_tx.o benchmark/bench_compare.cpp | build
+build/bench_compare: $(V3_OBJ) $(ZSTD_OBJ) $(LD_OBJ) build/bench_tx.o benchmark/bench_compare.cpp | build
 	@test -d $(OPENEXR_LIBDIR)/OpenEXR || { \
 	  echo "OpenEXR build not found at $(OPENEXR_BUILD)"; \
 	  echo "build OpenEXR first, or set OPENEXR_ROOT=/path/to/openexr"; exit 1; }
 	$(CXX) -std=c++14 -Wall -Ibenchmark $(OPENEXR_INC) -O3 \
 	  benchmark/bench_compare.cpp build/bench_tx.o $(V3_OBJ) $(ZSTD_OBJ) $(LD_OBJ) \
 	  $(OPENEXR_LIBS) $(THREAD_LIBS) -lm -o build/bench_compare
+
+bench-compare: build/bench_compare
 	LD_LIBRARY_PATH=$(OPENEXR_LDPATH) ./build/bench_compare $(ARGS)
+
+# HTJ2K-only comparison; set ARGS and optionally pin the process externally.
+
+bench-htj2k: build/bench_compare
+	EXR_BENCH_HTJ2K_ONLY=1 LD_LIBRARY_PATH=$(OPENEXR_LDPATH) ./build/bench_compare $(ARGS)
 
 # Coverage-guided fuzzer (clang+libFuzzer over the whole library).
 #   ./build/fuzz_v3 -max_total_time=60 test/unit/regression
@@ -832,13 +877,13 @@ tocio-lib: $(TOC_OBJ)
 tocio-c11-gate: | build
 	@for f in $(TOC_SRC); do \
 	  echo "  C11  $$f"; \
-	  $(CC) $(V3_CSTD) $(V3_WARN) $(TOC_INC) -O1 -fsyntax-only $$f || exit 1; \
+	  $(CC) $(V3_CSTD) $(V3_WARN) $(TOC_INC) -ffp-contract=off -O1 -fsyntax-only $$f || exit 1; \
 	done
 	@echo "tocio pure-C11 gate: OK"
 
 build/toc-fs-%.o: sandbox/tocio/src/%.c $(TOC_HDRS) | build
 	$(CC) -DTOC_FREESTANDING -ffreestanding -fno-builtin -fno-stack-protector \
-	  $(V3_CSTD) $(V3_WARN) $(TOC_INC) -O2 -g -c $< -o $@
+	  $(V3_CSTD) $(V3_WARN) $(TOC_INC) -ffp-contract=off -O2 -g -c $< -o $@
 
 tocio-freestanding-gate: $(TOC_FS_OBJ) sandbox/tocio/tests/toc_fs_smoke.c | build
 	@echo "  scan: only toc_stdio.c may include <stdio.h>"
@@ -1129,6 +1174,7 @@ help:
 	@echo "make texcomp-astc-arm-smoke - decode our ASTC output with Arm astcenc-native"
 	@echo "make texcomp-astc-arm-gate - self-contained astcenc build + PSNR cross-check (CI gate)"
 	@echo "make texcomp-basis-gate  - Basis Universal transcoder validation (cp basisu_transcoder to deps/basisu/)"
+	@echo "make texpipe-three-ktx2-test - Three.js KTX2Loader browser interop (optional Node/Chrome deps)"
 	@echo "make texcomp-wasm - Emscripten texcomp C API + Node CLI (scalar wasm)"
 	@echo "make texcomp-wasm-simd - Emscripten texcomp C API + Node CLI (-msimd128)"
 	@echo "make bench-compare - tinyexr-vs-OpenEXR codec comparison (needs OpenEXR build)"
