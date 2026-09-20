@@ -63,9 +63,28 @@ ptexatlas-c11-gate:
 V3_INC   = -Iinclude -Isrc -Ideps/zstd
 V3_CSTD  = -std=c11
 V3_WARN  = -Wall -Wextra -Werror
-V3_DEFS  =
+# Enable the validated AVX2 four-quad HALF cleanup kernel on x86. The source
+# keeps the scalar path and runtime capability check for baseline portability.
+V3_DEFS  = -DEXR_JPH_ENABLE_AVX2_FOUR_QUAD16=1
 V3_OPT   ?= -O2
 V3_ARCH  ?=
+# Opt-in Ryzen/AVX2 tuning for the HTJ2K translation unit.  The portable
+# default remains baseline code with runtime CPU dispatch; this mode produces
+# a host-specific object and therefore requires an AVX2-capable x86 CPU.
+EXR_JPH_HOST_AVX2 ?= 0
+JPH_HOST_OPT =
+ifeq ($(EXR_JPH_HOST_AVX2),1)
+  V3_DEFS += -DEXR_JPH_HOST_AVX2=1
+  JPH_HOST_OPT = -O3 -mavx2 -mfma -mbmi2 -mtune=znver1
+endif
+# Opt-in Apple Silicon tuning for the NEON HTJ2K translation unit.  Clang's
+# generic arm64 scheduler leaves a measurable amount of throughput on the
+# table in the entropy cleanup loop; this mode is intended for binaries built
+# specifically for an Apple M-series host, not portable distribution builds.
+EXR_JPH_HOST_NEON ?= 0
+ifeq ($(EXR_JPH_HOST_NEON),1)
+  JPH_HOST_OPT += -O3 -mcpu=apple-m1
+endif
 V3_SRC   = $(wildcard src/*.c)
 V3_OBJ   = $(patsubst src/%.c,build/%.o,$(V3_SRC))
 # Freestanding core: everything except the optional stdio layer, the spectral
@@ -74,7 +93,7 @@ V3_CORE_SRC = $(filter-out src/exr_stdio.c src/exr_freestanding.c src/exr_spectr
 ZSTD_SRC = deps/zstd/tinyexr_zstd.c
 ZSTD_OBJ = build/tinyexr_zstd.o
 V3_TEST_OBJ = $(patsubst src/%.c,build/test-%.o,$(V3_SRC))
-SAN      = -fsanitize=address,undefined
+SAN      = -fsanitize=address,undefined -fno-sanitize-recover=all
 
 # ---- zlib (DEFLATE) backend for ZIP/ZIPS/PXR24 ----------------------------
 # DEFLATE = auto | libdeflate | intree    (default: auto)
@@ -178,6 +197,13 @@ build/exr_vk_vulkan.o: src/exr_vk_vulkan.c include/exr_vk.h include/exr.h \
                        src/exr_internal.h src/exr_vk_shaders.spv.inc | build
 	$(CC) $(V3_CSTD) $(V3_WARN) $(V3_DEFS) $(V3_INC) -O2 -g -c $< -o $@
 
+# Keep the host-tuned JPH build isolated to this TU.  Runtime capability
+# checks remain in exr_jph.c; EXR_JPH_HOST_AVX2=1 is intentionally a host-only
+# build mode and must not be used for baseline-distributed binaries.
+build/exr_jph.o: src/exr_jph.c src/exr_jph_avx2_inline.h include/exr.h \
+                 src/exr_internal.h deps/zstd/tinyexr_zstd.h | build
+	$(CC) $(V3_CSTD) $(V3_WARN) $(V3_DEFS) $(V3_INC) $(V3_OPT) $(V3_ARCH) $(JPH_HOST_OPT) -g -c $< -o $@
+
 build/%.o: src/%.c include/exr.h src/exr_internal.h deps/zstd/tinyexr_zstd.h | build
 	$(CC) $(V3_CSTD) $(V3_WARN) $(V3_DEFS) $(V3_INC) $(V3_OPT) $(V3_ARCH) -g -c $< -o $@
 
@@ -189,7 +215,7 @@ build/libdeflate/%.o: deps/libdeflate/%.c | build
 	@mkdir -p $(dir $@)
 	$(CC) -Ideps/libdeflate -O3 -g -w -c $< -o $@
 
-build/test-libdeflate/%.o: deps/libdeflate/%.c | build
+build/test-libdeflate/%.o: deps/libdeflate/%.c build/.v3-test-flags | build
 	@mkdir -p $(dir $@)
 	$(CC) -Ideps/libdeflate -O1 -g $(SAN) -w -c $< -o $@
 
@@ -238,16 +264,29 @@ c11-gate: | build
 	done
 	@echo "pure-C11 gate: OK"
 
-build/test-%.o: src/%.c include/exr.h src/exr_internal.h deps/zstd/tinyexr_zstd.h | build
+.PHONY: FORCE
+FORCE:
+
+# Sanitized objects are shared by test-c and fuzz-corpus. Track the complete
+# compile configuration so changing SAN/THREADS/DEFLATE cannot silently reuse
+# objects built with stale recovery or backend flags.
+build/.v3-test-flags: FORCE | build
+	@{ printf '%s\n' 'CC=$(CC)' 'SAN=$(SAN)' 'DEFS=$(V3_DEFS)' \
+	    'INC=$(V3_INC)' 'ARCH=$(V3_ARCH)' 'THREADS=$(THREADS)'; } > $@.tmp
+	@cmp -s $@.tmp $@ || mv $@.tmp $@
+	@rm -f $@.tmp
+
+build/test-%.o: src/%.c include/exr.h src/exr_internal.h deps/zstd/tinyexr_zstd.h build/.v3-test-flags | build
 	$(CC) $(V3_CSTD) -Wall -Wextra $(V3_DEFS) $(V3_INC) -O1 -g $(SAN) -c $< -o $@
 
-build/test-tinyexr_zstd.o: $(ZSTD_SRC) deps/zstd/tinyexr_zstd.h | build
+build/test-tinyexr_zstd.o: $(ZSTD_SRC) deps/zstd/tinyexr_zstd.h build/.v3-test-flags | build
 	$(CC) $(V3_CSTD) $(V3_INC) -O1 -g $(SAN) -w -c $< -o $@
 
 test-c: $(V3_TEST_OBJ) build/test-tinyexr_zstd.o $(LD_TEST_OBJ) test/unit/test_exr_v3.c | build
+	python3 test/fuzzer/gen_bad_corpus.py build/fuzz-corpus-v3
 	$(CC) $(V3_CSTD) -Wall -Wextra $(V3_DEFS) $(V3_INC) -O1 -g $(SAN) \
 	  test/unit/test_exr_v3.c $(V3_TEST_OBJ) build/test-tinyexr_zstd.o $(LD_TEST_OBJ) $(THREAD_LIBS) -lm -o build/test_exr_v3
-	ASAN_OPTIONS=detect_leaks=0 ./build/test_exr_v3
+	ASAN_OPTIONS="$${ASAN_OPTIONS:-detect_leaks=1}" ./build/test_exr_v3
 
 # ---- tools/texcomp: pure-C11 BC/ETC/ASTC texture compression --------------
 # One translation unit per codec, plus texcomp.c for the shared core
@@ -622,9 +661,9 @@ test-c-threads:
 # glibc/TSan combos only intercept pthread_* and crash on thrd_create/mtx_*.
 # The threaded build also runs cleanly under ASan+UBSan via `make test-c-threads`.
 test-c-tsan: | build
-	$(CC) $(V3_CSTD) -Wall -Wextra -DEXR_USE_THREADS $(V3_INC) -O1 -g \
-	  -fsanitize=thread test/unit/test_exr_v3.c $(V3_SRC) $(ZSTD_SRC) \
-	  -pthread -lm -o build/test_exr_v3_tsan
+	$(CC) $(V3_CSTD) -Wall -Wextra $(V3_DEFS) -DEXR_USE_THREADS $(V3_INC) -O1 -g \
+	  -DEXR_THREADS_PTHREAD -fsanitize=thread test/unit/test_exr_v3.c $(V3_SRC) $(ZSTD_SRC) \
+	  $(LD_SRC) -pthread -lm -o build/test_exr_v3_tsan
 	./build/test_exr_v3_tsan
 
 bench: $(V3_OBJ) $(ZSTD_OBJ) $(LD_OBJ) benchmark/bench.c | build
@@ -653,12 +692,25 @@ OPENEXR_ROOT  ?= $(HOME)/work/openexr
 OPENEXR_BUILD ?= $(OPENEXR_ROOT)/_build
 OPENEXR_INC    = -I$(OPENEXR_ROOT)/src/lib/OpenEXR -I$(OPENEXR_ROOT)/src/lib/OpenEXRCore \
                  -I$(OPENEXR_ROOT)/src/lib/Iex -I$(OPENEXR_ROOT)/src/lib/IlmThread \
-                 -I$(OPENEXR_BUILD)/cmake $(shell pkg-config --cflags Imath 2>/dev/null)
+                 -I$(OPENEXR_BUILD)/cmake \
+                 -I$(OPENEXR_BUILD)/OpenEXR_ImathIncludeCompat \
+                 -I$(OPENEXR_BUILD)/_deps/imath-src/src \
+                 -I$(OPENEXR_BUILD)/_deps/imath-src/src/Imath \
+                 -I$(OPENEXR_BUILD)/_deps/imath-build/config \
+                 $(shell pkg-config --cflags Imath 2>/dev/null)
 OPENEXR_LIBDIR = $(OPENEXR_BUILD)/src/lib
+OPENEXR_IMATH_LIBDIR = $(OPENEXR_BUILD)/_deps/imath-build/src/Imath
 OPENEXR_LIBS   = -L$(OPENEXR_LIBDIR)/OpenEXR -L$(OPENEXR_LIBDIR)/OpenEXRCore \
                  -L$(OPENEXR_LIBDIR)/Iex -L$(OPENEXR_LIBDIR)/IlmThread \
-                 -lOpenEXR-4_0 -lOpenEXRCore-4_0 -lIex-4_0 -lIlmThread-4_0 -pthread
+                 -L$(OPENEXR_IMATH_LIBDIR) \
+                 -lOpenEXR-4_0 -lOpenEXRCore-4_0 -lIex-4_0 -lIlmThread-4_0 \
+                 -lImath-3_2 -pthread
 OPENEXR_LDPATH = $(OPENEXR_LIBDIR)/OpenEXR:$(OPENEXR_LIBDIR)/OpenEXRCore:$(OPENEXR_LIBDIR)/Iex:$(OPENEXR_LIBDIR)/IlmThread
+OPENEXR_LDPATH := $(OPENEXR_LDPATH):$(OPENEXR_IMATH_LIBDIR)
+OPENEXR_RUNPATH = LD_LIBRARY_PATH=$(OPENEXR_LDPATH)
+ifeq ($(shell uname -s),Darwin)
+  OPENEXR_RUNPATH = DYLD_LIBRARY_PATH=$(OPENEXR_LDPATH)
+endif
 
 # The tinyexr side (bench_tx.c) is compiled as C because exr.h and OpenEXR's
 # C core declare the same global enum names and cannot share a translation unit.
@@ -674,19 +726,19 @@ build/bench_compare: $(V3_OBJ) $(ZSTD_OBJ) $(LD_OBJ) build/bench_tx.o benchmark/
 	  $(OPENEXR_LIBS) $(THREAD_LIBS) -lm -o build/bench_compare
 
 bench-compare: build/bench_compare
-	LD_LIBRARY_PATH=$(OPENEXR_LDPATH) ./build/bench_compare $(ARGS)
+	$(OPENEXR_RUNPATH) ./build/bench_compare $(ARGS)
 
 # HTJ2K-only comparison; set ARGS and optionally pin the process externally.
 
 bench-htj2k: build/bench_compare
-	EXR_BENCH_HTJ2K_ONLY=1 LD_LIBRARY_PATH=$(OPENEXR_LDPATH) ./build/bench_compare $(ARGS)
+	EXR_BENCH_HTJ2K_ONLY=1 $(OPENEXR_RUNPATH) ./build/bench_compare $(ARGS)
 
 # Coverage-guided fuzzer (clang+libFuzzer over the whole library).
 #   ./build/fuzz_v3 -max_total_time=60 test/unit/regression
 fuzz: test/fuzzer/fuzz_v3.c | build
 	clang $(V3_CSTD) $(V3_INC) -O1 -g -w -fsanitize=fuzzer,address,undefined \
 	  test/fuzzer/fuzz_v3.c $(V3_SRC) $(ZSTD_SRC) -lm -o build/fuzz_v3
-	@echo "built build/fuzz_v3 - e.g. ./build/fuzz_v3 -max_total_time=60 test/unit/regression"
+	@echo "built build/fuzz_v3 - e.g. ./build/fuzz_v3 -dict=test/fuzzer/exr.dict -max_total_time=60 test/unit/regression"
 
 # Same fuzzer but with libdeflate as the default zlib backend, so the shipped
 # DEFLATE=auto decode path (ZIP/ZIPS/PXR24 -> libdeflate) is fuzzed too.
@@ -715,19 +767,21 @@ fuzz-jph-corpus: test/fuzzer/fuzz_jph.c | build
 
 # Deterministic corpus replay under ASan+UBSan (no libFuzzer needed; CI gate).
 fuzz-corpus: $(V3_TEST_OBJ) build/test-tinyexr_zstd.o $(LD_TEST_OBJ) test/fuzzer/fuzz_v3.c | build
+	python3 test/fuzzer/gen_bad_corpus.py build/fuzz-corpus-v3
 	$(CC) $(V3_CSTD) -Wall -Wextra $(V3_INC) -O1 -g $(SAN) -DEXR_FUZZ_STANDALONE \
 	  test/fuzzer/fuzz_v3.c $(V3_TEST_OBJ) build/test-tinyexr_zstd.o $(LD_TEST_OBJ) -lm \
 	  -o build/fuzz_replay
-	./build/fuzz_replay test/unit/regression/* asakusa.exr deepscanline.exr
+	./build/fuzz_replay test/unit/regression/* build/fuzz-corpus-v3/* asakusa.exr data/deepscanline.exr
 
 # Some local sandboxes/debug wrappers use ptrace. LeakSanitizer cannot run
 # under ptrace, so this target preserves ASan+UBSan corpus coverage there while
 # keeping fuzz-corpus as the strict LSan gate for CI/native hosts.
 fuzz-corpus-asan: $(V3_TEST_OBJ) build/test-tinyexr_zstd.o $(LD_TEST_OBJ) test/fuzzer/fuzz_v3.c | build
+	python3 test/fuzzer/gen_bad_corpus.py build/fuzz-corpus-v3
 	$(CC) $(V3_CSTD) -Wall -Wextra $(V3_INC) -O1 -g $(SAN) -DEXR_FUZZ_STANDALONE \
 	  test/fuzzer/fuzz_v3.c $(V3_TEST_OBJ) build/test-tinyexr_zstd.o $(LD_TEST_OBJ) -lm \
 	  -o build/fuzz_replay
-	ASAN_OPTIONS=detect_leaks=0 ./build/fuzz_replay test/unit/regression/* asakusa.exr deepscanline.exr
+	ASAN_OPTIONS=detect_leaks=0 ./build/fuzz_replay test/unit/regression/* build/fuzz-corpus-v3/* asakusa.exr data/deepscanline.exr
 
 # Parse/load every *.exr under $(EXR_IMAGES) and classify PASS/XFAIL/FAIL.
 # Override the corpus dir with: make parse-test EXR_IMAGES=/path/to/images

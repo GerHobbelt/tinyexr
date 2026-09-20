@@ -27,8 +27,8 @@ on the deflate family:
 
 ![Encode throughput: tinyexr libdeflate on/off vs OpenEXR](doc/perf-libdeflate-htj2k-encode.png)
 
-On **ARM64 (Apple M1 / NEON)**, single-thread in-tree throughput — same shape:
-TinyEXR leads the cheap codecs (none / rle / b44) and is near parity on HTJ2K:
+On **ARM64 (Apple M1 / NEON)**, single-thread throughput is now on-par with
+OpenEXR/OpenJPH for HTJ2K when using the opt-in M1 scheduler tuning:
 
 ![Decode throughput, single thread (Apple M1 / NEON)](doc/perf-arm-decode.png)
 
@@ -112,9 +112,10 @@ same thread count. Throughput in megapixels/s. Full writeup + charts:
   data (~+8% on 4K texture packs) but slower on high-entropy natural images, so
   libdeflate is the safer hosted default; both link and switch at runtime via
   `exr_zlib_set_backend()`.
-- **In-tree codec tuning:** **PIZ decode ~+14%** (inline Huffman literal store +
-  tighter canonical-table scan); ZSTD (vendored upstream) decodes ~410–420 Mpix/s
-  here, ahead of the libdeflate ZIP path.
+- **In-tree codec tuning:** PIZ now has an OpenEXR-style two-window Huffman
+  reader and is effectively on-par on the Ryzen 9 3950X snapshot (**33.8 vs
+  35.6 MP/s** decode). ZSTD (vendored upstream) decodes ~410–420 Mpix/s here,
+  ahead of the libdeflate ZIP path.
 - **Multi-threaded** (opt-in C11 threads, `make … THREADS=1` +
   `exr_set_num_threads(n)`): per-block parallel encode/decode scales **~5×
   (ZIP) to ~8.8× (ZIPS)** to 16 threads. At 16 threads TinyEXR **out-decodes
@@ -148,15 +149,17 @@ for (uint32_t i = 0; i < n; ++i) {
     exr_reader_decode_block(r, 0, i, blk, bi.uncompressed_size);
     for (int c = 0; c < header->num_channels; ++c) {
         /* per-channel planar samples for this block */
-        exr_block_extract_channel(header, &bi, blk, bi.uncompressed_size, c, dst);
+        exr_block_extract_channel(header, &bi, blk, bi.uncompressed_size,
+                                  c, dst[c].data, dst[c].size);
     }
     free(blk);
 }
 exr_reader_close(r);
 ```
 
-Deep parts use the two-step `exr_reader_decode_deep_counts` (to size buffers)
-then `exr_reader_decode_deep_samples`.
+Deep parts use the two-step `exr_reader_decode_deep_counts` (which validates the
+count capacity and returns the total sample count) followed by
+`exr_reader_decode_deep_samples` with an `exr_buffer` per channel.
 
 **Encode** — describe parts with `exr_writer_add_part`, then stream blocks to a
 file (or a custom seekable `exr_data_sink`); the offset table is backpatched at
@@ -168,7 +171,8 @@ exr_writer_create(NULL, &w);
 exr_writer_add_part(w, &header, NULL);            /* geometry/channels/tiling */
 exr_writer_begin_stream_file(w, "out.exr", EXR_COMPRESSION_ZIP);
 for (int y = ymin; y <= ymax; y += lines_per_block)
-    exr_writer_write_scanline_block(w, 0, y, channel_rows);  /* block-local */
+    exr_writer_write_scanline_block(w, 0, y, channel_rows,
+                                    header.num_channels); /* sized buffers */
 exr_writer_end_stream(w);                          /* backpatch + close */
 exr_writer_destroy(w);
 ```
@@ -247,8 +251,6 @@ Contribution is welcome!
   (`exr_part_yc_to_rgba_float`, used by the `examples/wasm` binding), but the
   streaming `web/viewer/` still renders such images as grayscale `Y` pending a
   whole-part hook through the reconstruction helper.
-- [ ] ARM/NEON throughput benchmarks (NEON kernels are correctness-verified under
-  qemu but not yet benchmarked).
 - [ ] Larger-image / higher-channel-count performance sweeps.
 - [ ] Multipart in the high-level spectral cube API (part 0 only today).
 - DWAA/DWAB — intentionally unsupported (not planned).
@@ -385,6 +387,21 @@ It comes with **tir** (resize, above), **texpipe** (`tools/texpipe/`: mip chains
 alpha coverage, seam-free cube LOD, normal/roughness coherence, **KTX2 + DDS**
 read *and* write) and **envmap** (`tools/envmap/`: equirect ⇄ cubemap ⇄
 octahedral, SH, spherical gaussians).
+
+### texcomp BC benchmark
+
+On the benchmark host, texcomp's real-time BC7 mode-6 profiles reach **55.34
+MPix/s (`speed`)** and **66.29 MPix/s (`fastest`)**, versus **45.33 MPix/s** for
+Basis Universal's analytical `bc7f` reference. The broader BC-family snapshot
+is **BC1 46.46**, **BC3 37.49**, **BC5 118.70**, and **BC6H AVX2 16.15 MPix/s**.
+The QuickBC7-derived texcomp profile measures **4.37 MPix/s at 53.62 dB**;
+`speed` measures **51.43 dB** and `fastest` **48.94 dB** on the benchmark's
+gradient quality check.
+
+[![BC-family encode throughput](doc/texcomp-bench.png)](doc/texcomp-bench.md)
+
+See the [full texcomp benchmark notes](doc/texcomp-bench.md) for methodology,
+quality caveats, and the exact command to reproduce the snapshot.
 
 ```c
 #include "texpipe.h"          /* resize -> mips -> compress -> container */
