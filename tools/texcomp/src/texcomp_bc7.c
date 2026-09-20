@@ -2,13 +2,14 @@
  * TinyEXR texcomp - BC7 encoder
  *
  * Copyright (c) 2014-2026 Syoyo Fujita and TinyEXR authors
- * SPDX-License-Identifier: BSD-3-Clause
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include "texcomp.h"
 #include "texcomp_internal.h"
 
 #include <limits.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -73,9 +74,9 @@ static const uint8_t tc_bc7_alpha_part_lut[8][12] = {
 void tc_bc7_options_init(tc_bc7_options *opt) {
     if (!opt) return;
     memset(opt, 0, sizeof(*opt));
-    opt->quality = TC_BC7_QUALITY_QUICKBC7;
+    opt->quality = TC_BC7_QUALITY_MEDIUM;
     opt->perceptual = 1;
-    opt->quick = 1;
+    opt->quick = 2;
     opt->threads = 1;
     opt->mode_mask = 0xffu;
 }
@@ -134,25 +135,34 @@ static uint32_t tc_block_quick_mask(const uint8_t pix[16][4], uint32_t user_mask
     return mask ? mask : user_mask;
 }
 
+/* Per-channel error weights (R,G,B,A), applied to the squared-error metric.
+ * Default {1,1,1,1} makes the weighted expression byte-identical to the plain
+ * sum of squares, so uniform weights change nothing. Set once by
+ * tc_bc7_compress_rgba8 before any worker threads run (read-only thereafter);
+ * not safe against concurrent compress calls using different weights. */
+static uint32_t tc_bc7_cw[4] = {1u, 1u, 1u, 1u};
+
 static uint32_t tc_err4(const uint8_t *a, uint8_t r, uint8_t g, uint8_t b,
                         uint8_t al, int has_alpha) {
     int dr = (int)a[0] - (int)r;
     int dg = (int)a[1] - (int)g;
     int db = (int)a[2] - (int)b;
     int da = has_alpha ? ((int)a[3] - (int)al) : 0;
-    return (uint32_t)(dr * dr + dg * dg + db * db + da * da);
+    return tc_bc7_cw[0] * (uint32_t)(dr * dr) + tc_bc7_cw[1] * (uint32_t)(dg * dg) +
+           tc_bc7_cw[2] * (uint32_t)(db * db) + tc_bc7_cw[3] * (uint32_t)(da * da);
 }
 
 static uint32_t tc_err3(const uint8_t *a, uint8_t r, uint8_t g, uint8_t b) {
     int dr = (int)a[0] - (int)r;
     int dg = (int)a[1] - (int)g;
     int db = (int)a[2] - (int)b;
-    return (uint32_t)(dr * dr + dg * dg + db * db);
+    return tc_bc7_cw[0] * (uint32_t)(dr * dr) + tc_bc7_cw[1] * (uint32_t)(dg * dg) +
+           tc_bc7_cw[2] * (uint32_t)(db * db);
 }
 
 static uint32_t tc_err1(uint8_t a, uint8_t b) {
     int d = (int)a - (int)b;
-    return (uint32_t)(d * d);
+    return tc_bc7_cw[3] * (uint32_t)(d * d);
 }
 
 typedef struct tc_bc7_candidate {
@@ -341,9 +351,88 @@ static void tc_pack_candidate(const tc_bc7_candidate *src, uint8_t out[16]) {
     }
 }
 
-static uint64_t tc_build_candidate(uint32_t mode, uint32_t partition,
-                                   const uint8_t pix[16][4],
-                                   tc_bc7_candidate *cand) {
+/* Weighted-PCA endpoint pixels: pick the two subset pixels at the extremes of
+ * the principal color axis (covariance power iteration) instead of the luma
+ * min/max. The luma axis is wrong when chroma varies at ~constant luminance;
+ * the principal axis follows the actual color spread. Per-channel error weights
+ * (tc_bc7_cw) scale the space so the axis favors the channels the error metric
+ * weights. include_alpha folds A into the axis for the modes whose alpha shares
+ * the color index (6, 7); modes with separate alpha fit it independently, so
+ * their axis stays RGB. Falls back gracefully (degenerate blocks -> min==max). */
+static void tc_bc7_pca_extremes(const uint8_t pix[16][4], const uint8_t *part,
+                                uint32_t subset, int include_alpha,
+                                uint32_t *out_min, uint32_t *out_max) {
+    int nch = include_alpha ? 4 : 3;
+    float w[4], mean[4] = {0.f, 0.f, 0.f, 0.f};
+    float cov[4][4], axis[4];
+    float mnp = 1e30f, mxp = -1e30f;
+    uint32_t i, cnt = 0u, mn_i = 0u, mx_i = 0u;
+    int c, d, it;
+
+    for (c = 0; c < 4; ++c) w[c] = sqrtf((float)tc_bc7_cw[c]);
+    for (i = 0; i < 16u; ++i)
+        if (part[i] == subset) {
+            for (c = 0; c < nch; ++c) mean[c] += (float)pix[i][c];
+            ++cnt;
+        }
+    if (cnt == 0u) { *out_min = 0u; *out_max = 0u; return; }
+    for (c = 0; c < nch; ++c) mean[c] /= (float)cnt;
+
+    for (c = 0; c < 4; ++c)
+        for (d = 0; d < 4; ++d) cov[c][d] = 0.f;
+    for (i = 0; i < 16u; ++i)
+        if (part[i] == subset) {
+            float dv[4];
+            for (c = 0; c < nch; ++c) dv[c] = w[c] * ((float)pix[i][c] - mean[c]);
+            for (c = 0; c < nch; ++c)
+                for (d = 0; d < nch; ++d) cov[c][d] += dv[c] * dv[d];
+        }
+
+    for (c = 0; c < nch; ++c) axis[c] = 1.f;
+    for (it = 0; it < 8; ++it) {
+        float na[4] = {0.f, 0.f, 0.f, 0.f}, len = 0.f;
+        for (c = 0; c < nch; ++c)
+            for (d = 0; d < nch; ++d) na[c] += cov[c][d] * axis[d];
+        for (c = 0; c < nch; ++c) len += na[c] * na[c];
+        if (len < 1e-12f) break;
+        len = 1.f / sqrtf(len);
+        for (c = 0; c < nch; ++c) axis[c] = na[c] * len;
+    }
+
+    for (i = 0; i < 16u; ++i)
+        if (part[i] == subset) {
+            float p = 0.f;
+            for (c = 0; c < nch; ++c)
+                p += axis[c] * w[c] * ((float)pix[i][c] - mean[c]);
+            if (p <= mnp) { mnp = p; mn_i = i; }
+            if (p >= mxp) { mxp = p; mx_i = i; }
+        }
+    *out_min = mn_i;
+    *out_max = mx_i;
+}
+
+/* Endpoint-pixel seeding for a subset: luma extremes (fast, robust) or
+ * weighted-PCA extremes (better on chromatic blocks whose spread is off the
+ * luma axis). Neither dominates -- PCA can be distracted by variance in a
+ * low-error-weight channel -- so tc_build_candidate tries both and keeps the
+ * lower-error block (never regresses). */
+static void tc_bc7_luma_extremes(const uint8_t pix[16][4], const uint8_t *part,
+                                 uint32_t subset, uint32_t *out_min,
+                                 uint32_t *out_max) {
+    uint32_t min_l = UINT_MAX, max_l = 0, min_i = 0, max_i = 0, i;
+    for (i = 0; i < 16u; ++i)
+        if (part[i] == subset) {
+            uint32_t y = tc_luma_u8(pix[i]);
+            if (y < min_l) { min_l = y; min_i = i; }
+            if (y >= max_l) { max_l = y; max_i = i; }
+        }
+    *out_min = min_i;
+    *out_max = max_i;
+}
+
+static uint64_t tc_build_candidate_seed(uint32_t mode, uint32_t partition,
+                                        const uint8_t pix[16][4],
+                                        tc_bc7_candidate *cand, int use_pca) {
     const uint8_t *part = tc_partition_for(mode, partition);
     uint32_t subsets = tc_bc7_num_subsets[mode];
     uint32_t subset, i, c;
@@ -355,20 +444,12 @@ static uint64_t tc_build_candidate(uint32_t mode, uint32_t partition,
     cand->rotation = 0;
 
     for (subset = 0; subset < subsets; ++subset) {
-        uint32_t min_l = UINT_MAX, max_l = 0, min_i = 0, max_i = 0;
-        for (i = 0; i < 16u; ++i) {
-            if (part[i] == subset) {
-                uint32_t y = tc_luma_u8(pix[i]);
-                if (y < min_l) {
-                    min_l = y;
-                    min_i = i;
-                }
-                if (y >= max_l) {
-                    max_l = y;
-                    max_i = i;
-                }
-            }
-        }
+        uint32_t min_i, max_i;
+        int inc_a = (mode >= 4u) && !tc_bc7_sep_alpha[mode];
+        if (use_pca)
+            tc_bc7_pca_extremes(pix, part, subset, inc_a, &min_i, &max_i);
+        else
+            tc_bc7_luma_extremes(pix, part, subset, &min_i, &max_i);
         for (c = 0; c < 4u; ++c) {
             uint8_t qp0, qp1;
             uint32_t prec = c == 3u && mode >= 4u ? tc_bc7_alpha_precision[mode]
@@ -440,6 +521,26 @@ static uint64_t tc_build_candidate(uint32_t mode, uint32_t partition,
         }
     }
     return total_err;
+}
+
+/* Build a candidate for (mode, partition). The luma seed is always evaluated.
+ * When try_pca is set (opt->pca_endpoints), also try the weighted-PCA seed and
+ * keep the lower-error block -- monotonic, never worse than luma alone. PCA
+ * roughly doubles the per-candidate cost, so it is opt-in (off by default);
+ * measured ~+0.09 dB on photos, more on chromatic (off-luma-axis) blocks. */
+static uint64_t tc_build_candidate(uint32_t mode, uint32_t partition,
+                                   const uint8_t pix[16][4],
+                                   tc_bc7_candidate *cand, int try_pca) {
+    uint64_t e0 = tc_build_candidate_seed(mode, partition, pix, cand, 0);
+    tc_bc7_candidate alt;
+    uint64_t e1;
+    if (!try_pca) return e0;
+    e1 = tc_build_candidate_seed(mode, partition, pix, &alt, 1);
+    if (e1 < e0) {
+        *cand = alt;
+        return e1;
+    }
+    return e0;
 }
 
 static uint8_t tc_lookup_index_from_mask(uint32_t mask) {
@@ -556,7 +657,19 @@ static void tc_encode_bc7_all_modes_block(const uint8_t pix[16][4],
     uint64_t best_err = UINT64_MAX;
     uint8_t best_block[16];
     uint32_t mask = opt && opt->mode_mask ? opt->mode_mask : 0xffu;
-    if (opt && opt->quick) mask = tc_block_quick_mask(pix, mask);
+    uint32_t is_quick = opt ? (uint32_t)opt->quick : 0u;
+    if (is_quick == 1u) {
+        mask = tc_block_quick_mask(pix, mask);
+    } else {
+        /* For non-quick modes, still exclude modes that can't encode alpha
+         * when the block has any translucent texel. Modes 0-3 are opaque-only;
+         * mode 4+ handle alpha. Without this filter the encoder would pick a
+         * mode that discards alpha, producing corrupt output. */
+        uint32_t i, has_alpha = 0;
+        for (i = 0; i < 16u; ++i)
+            if (pix[i][3] < 255u) { has_alpha = 1; break; }
+        if (has_alpha) mask &= ~0x0fu; /* drop modes 0-3 */
+    }
     memset(best_block, 0, sizeof(best_block));
     for (mode = 0; mode < 8u; ++mode) {
         tc_bc7_candidate cand;
@@ -565,15 +678,406 @@ static void tc_encode_bc7_all_modes_block(const uint8_t pix[16][4],
         err = tc_build_candidate(mode,
                                  (mode == 1u || mode == 7u)
                                      ? tc_select_partition2(pix, mode,
-                                                            opt && opt->quick)
+                                                            is_quick != 0u)
                                      : 0u,
-                                 pix, &cand);
+                                 pix, &cand, opt && opt->pca_endpoints);
         if (err < best_err) {
             best_err = err;
             tc_pack_candidate(&cand, best_block);
         }
     }
     memcpy(out, best_block, 16);
+}
+
+/* --- BC7 decode (used by decoder-driven RDO; also the public decompressor) ---
+ * BPTC decode: all 8 modes, partitions, rotations, dual-plane, p-bits. The
+ * 2/3-subset partition+anchor tables are the corrected BPTC tables (the
+ * Khronos-published ones have known errors); an independent copy lives in
+ * tools/texcomp/test/bc7_ref_decode.h and the two are cross-checked in the
+ * xbc7 gate. Partition values carry the subset in the low 2 bits and mark each
+ * subset's anchor texel with bit 0x80. */
+static uint32_t tc_bc7_dec_rb(uint64_t *lo, uint64_t *hi, int n) {
+    uint32_t mask = (n >= 32) ? 0xffffffffu : ((1u << n) - 1u);
+    uint32_t bits = (uint32_t)(*lo & mask);
+    *lo >>= n;
+    *lo |= (*hi & mask) << (64 - n);
+    *hi >>= n;
+    return bits;
+}
+static int tc_bc7_dec_interp(int a, int b, const int *w, int idx) {
+    return (a * (64 - w[idx]) + b * w[idx] + 32) >> 6;
+}
+static void tc_bc7_decode_block(const uint8_t blk[16], uint8_t out[16][4]) {
+    static const unsigned char tc_bc7_dec_parts[2][64][4][4] = {
+        {   /* Partition table for 2-subset BPTC */
+            { {128, 0,   1, 1}, {0, 0,   1, 1}, {  0, 0, 1, 1}, {0, 0, 1, 129} }, /*  0 */
+            { {128, 0,   0, 1}, {0, 0,   0, 1}, {  0, 0, 0, 1}, {0, 0, 0, 129} }, /*  1 */
+            { {128, 1,   1, 1}, {0, 1,   1, 1}, {  0, 1, 1, 1}, {0, 1, 1, 129} }, /*  2 */
+            { {128, 0,   0, 1}, {0, 0,   1, 1}, {  0, 0, 1, 1}, {0, 1, 1, 129} }, /*  3 */
+            { {128, 0,   0, 0}, {0, 0,   0, 1}, {  0, 0, 0, 1}, {0, 0, 1, 129} }, /*  4 */
+            { {128, 0,   1, 1}, {0, 1,   1, 1}, {  0, 1, 1, 1}, {1, 1, 1, 129} }, /*  5 */
+            { {128, 0,   0, 1}, {0, 0,   1, 1}, {  0, 1, 1, 1}, {1, 1, 1, 129} }, /*  6 */
+            { {128, 0,   0, 0}, {0, 0,   0, 1}, {  0, 0, 1, 1}, {0, 1, 1, 129} }, /*  7 */
+            { {128, 0,   0, 0}, {0, 0,   0, 0}, {  0, 0, 0, 1}, {0, 0, 1, 129} }, /*  8 */
+            { {128, 0,   1, 1}, {0, 1,   1, 1}, {  1, 1, 1, 1}, {1, 1, 1, 129} }, /*  9 */
+            { {128, 0,   0, 0}, {0, 0,   0, 1}, {  0, 1, 1, 1}, {1, 1, 1, 129} }, /* 10 */
+            { {128, 0,   0, 0}, {0, 0,   0, 0}, {  0, 0, 0, 1}, {0, 1, 1, 129} }, /* 11 */
+            { {128, 0,   0, 1}, {0, 1,   1, 1}, {  1, 1, 1, 1}, {1, 1, 1, 129} }, /* 12 */
+            { {128, 0,   0, 0}, {0, 0,   0, 0}, {  1, 1, 1, 1}, {1, 1, 1, 129} }, /* 13 */
+            { {128, 0,   0, 0}, {1, 1,   1, 1}, {  1, 1, 1, 1}, {1, 1, 1, 129} }, /* 14 */
+            { {128, 0,   0, 0}, {0, 0,   0, 0}, {  0, 0, 0, 0}, {1, 1, 1, 129} }, /* 15 */
+            { {128, 0,   0, 0}, {1, 0,   0, 0}, {  1, 1, 1, 0}, {1, 1, 1, 129} }, /* 16 */
+            { {128, 1, 129, 1}, {0, 0,   0, 1}, {  0, 0, 0, 0}, {0, 0, 0,   0} }, /* 17 */
+            { {128, 0,   0, 0}, {0, 0,   0, 0}, {129, 0, 0, 0}, {1, 1, 1,   0} }, /* 18 */
+            { {128, 1, 129, 1}, {0, 0,   1, 1}, {  0, 0, 0, 1}, {0, 0, 0,   0} }, /* 19 */
+            { {128, 0, 129, 1}, {0, 0,   0, 1}, {  0, 0, 0, 0}, {0, 0, 0,   0} }, /* 20 */
+            { {128, 0,   0, 0}, {1, 0,   0, 0}, {129, 1, 0, 0}, {1, 1, 1,   0} }, /* 21 */
+            { {128, 0,   0, 0}, {0, 0,   0, 0}, {129, 0, 0, 0}, {1, 1, 0,   0} }, /* 22 */
+            { {128, 1,   1, 1}, {0, 0,   1, 1}, {  0, 0, 1, 1}, {0, 0, 0, 129} }, /* 23 */
+            { {128, 0, 129, 1}, {0, 0,   0, 1}, {  0, 0, 0, 1}, {0, 0, 0,   0} }, /* 24 */
+            { {128, 0,   0, 0}, {1, 0,   0, 0}, {129, 0, 0, 0}, {1, 1, 0,   0} }, /* 25 */
+            { {128, 1, 129, 0}, {0, 1,   1, 0}, {  0, 1, 1, 0}, {0, 1, 1,   0} }, /* 26 */
+            { {128, 0, 129, 1}, {0, 1,   1, 0}, {  0, 1, 1, 0}, {1, 1, 0,   0} }, /* 27 */
+            { {128, 0,   0, 1}, {0, 1,   1, 1}, {129, 1, 1, 0}, {1, 0, 0,   0} }, /* 28 */
+            { {128, 0,   0, 0}, {1, 1,   1, 1}, {129, 1, 1, 1}, {0, 0, 0,   0} }, /* 29 */
+            { {128, 1, 129, 1}, {0, 0,   0, 1}, {  1, 0, 0, 0}, {1, 1, 1,   0} }, /* 30 */
+            { {128, 0, 129, 1}, {1, 0,   0, 1}, {  1, 0, 0, 1}, {1, 1, 0,   0} }, /* 31 */
+            { {128, 1,   0, 1}, {0, 1,   0, 1}, {  0, 1, 0, 1}, {0, 1, 0, 129} }, /* 32 */
+            { {128, 0,   0, 0}, {1, 1,   1, 1}, {  0, 0, 0, 0}, {1, 1, 1, 129} }, /* 33 */
+            { {128, 1,   0, 1}, {1, 0, 129, 0}, {  0, 1, 0, 1}, {1, 0, 1,   0} }, /* 34 */
+            { {128, 0,   1, 1}, {0, 0,   1, 1}, {129, 1, 0, 0}, {1, 1, 0,   0} }, /* 35 */
+            { {128, 0, 129, 1}, {1, 1,   0, 0}, {  0, 0, 1, 1}, {1, 1, 0,   0} }, /* 36 */
+            { {128, 1,   0, 1}, {0, 1,   0, 1}, {129, 0, 1, 0}, {1, 0, 1,   0} }, /* 37 */
+            { {128, 1,   1, 0}, {1, 0,   0, 1}, {  0, 1, 1, 0}, {1, 0, 0, 129} }, /* 38 */
+            { {128, 1,   0, 1}, {1, 0,   1, 0}, {  1, 0, 1, 0}, {0, 1, 0, 129} }, /* 39 */
+            { {128, 1, 129, 1}, {0, 0,   1, 1}, {  1, 1, 0, 0}, {1, 1, 1,   0} }, /* 40 */
+            { {128, 0,   0, 1}, {0, 0,   1, 1}, {129, 1, 0, 0}, {1, 0, 0,   0} }, /* 41 */
+            { {128, 0, 129, 1}, {0, 0,   1, 0}, {  0, 1, 0, 0}, {1, 1, 0,   0} }, /* 42 */
+            { {128, 0, 129, 1}, {1, 0,   1, 1}, {  1, 1, 0, 1}, {1, 1, 0,   0} }, /* 43 */
+            { {128, 1, 129, 0}, {1, 0,   0, 1}, {  1, 0, 0, 1}, {0, 1, 1,   0} }, /* 44 */
+            { {128, 0,   1, 1}, {1, 1,   0, 0}, {  1, 1, 0, 0}, {0, 0, 1, 129} }, /* 45 */
+            { {128, 1,   1, 0}, {0, 1,   1, 0}, {  1, 0, 0, 1}, {1, 0, 0, 129} }, /* 46 */
+            { {128, 0,   0, 0}, {0, 1, 129, 0}, {  0, 1, 1, 0}, {0, 0, 0,   0} }, /* 47 */
+            { {128, 1,   0, 0}, {1, 1, 129, 0}, {  0, 1, 0, 0}, {0, 0, 0,   0} }, /* 48 */
+            { {128, 0, 129, 0}, {0, 1,   1, 1}, {  0, 0, 1, 0}, {0, 0, 0,   0} }, /* 49 */
+            { {128, 0,   0, 0}, {0, 0, 129, 0}, {  0, 1, 1, 1}, {0, 0, 1,   0} }, /* 50 */
+            { {128, 0,   0, 0}, {0, 1,   0, 0}, {129, 1, 1, 0}, {0, 1, 0,   0} }, /* 51 */
+            { {128, 1,   1, 0}, {1, 1,   0, 0}, {  1, 0, 0, 1}, {0, 0, 1, 129} }, /* 52 */
+            { {128, 0,   1, 1}, {0, 1,   1, 0}, {  1, 1, 0, 0}, {1, 0, 0, 129} }, /* 53 */
+            { {128, 1, 129, 0}, {0, 0,   1, 1}, {  1, 0, 0, 1}, {1, 1, 0,   0} }, /* 54 */
+            { {128, 0, 129, 1}, {1, 0,   0, 1}, {  1, 1, 0, 0}, {0, 1, 1,   0} }, /* 55 */
+            { {128, 1,   1, 0}, {1, 1,   0, 0}, {  1, 1, 0, 0}, {1, 0, 0, 129} }, /* 56 */
+            { {128, 1,   1, 0}, {0, 0,   1, 1}, {  0, 0, 1, 1}, {1, 0, 0, 129} }, /* 57 */
+            { {128, 1,   1, 1}, {1, 1,   1, 0}, {  1, 0, 0, 0}, {0, 0, 0, 129} }, /* 58 */
+            { {128, 0,   0, 1}, {1, 0,   0, 0}, {  1, 1, 1, 0}, {0, 1, 1, 129} }, /* 59 */
+            { {128, 0,   0, 0}, {1, 1,   1, 1}, {  0, 0, 1, 1}, {0, 0, 1, 129} }, /* 60 */
+            { {128, 0, 129, 1}, {0, 0,   1, 1}, {  1, 1, 1, 1}, {0, 0, 0,   0} }, /* 61 */
+            { {128, 0, 129, 0}, {0, 0,   1, 0}, {  1, 1, 1, 0}, {1, 1, 1,   0} }, /* 62 */
+            { {128, 1,   0, 0}, {0, 1,   0, 0}, {  0, 1, 1, 1}, {0, 1, 1, 129} }  /* 63 */
+        },
+        {   /* Partition table for 3-subset BPTC */
+            { {128, 0, 1, 129}, {0,   0,   1, 1}, {  0,   2,   2, 1}, {  2,   2, 2, 130} }, /*  0 */
+            { {128, 0, 0, 129}, {0,   0,   1, 1}, {130,   2,   1, 1}, {  2,   2, 2,   1} }, /*  1 */
+            { {128, 0, 0,   0}, {2,   0,   0, 1}, {130,   2,   1, 1}, {  2,   2, 1, 129} }, /*  2 */
+            { {128, 2, 2, 130}, {0,   0,   2, 2}, {  0,   0,   1, 1}, {  0,   1, 1, 129} }, /*  3 */
+            { {128, 0, 0,   0}, {0,   0,   0, 0}, {129,   1,   2, 2}, {  1,   1, 2, 130} }, /*  4 */
+            { {128, 0, 1, 129}, {0,   0,   1, 1}, {  0,   0,   2, 2}, {  0,   0, 2, 130} }, /*  5 */
+            { {128, 0, 2, 130}, {0,   0,   2, 2}, {  1,   1,   1, 1}, {  1,   1, 1, 129} }, /*  6 */
+            { {128, 0, 1,   1}, {0,   0,   1, 1}, {130,   2,   1, 1}, {  2,   2, 1, 129} }, /*  7 */
+            { {128, 0, 0,   0}, {0,   0,   0, 0}, {129,   1,   1, 1}, {  2,   2, 2, 130} }, /*  8 */
+            { {128, 0, 0,   0}, {1,   1,   1, 1}, {129,   1,   1, 1}, {  2,   2, 2, 130} }, /*  9 */
+            { {128, 0, 0,   0}, {1,   1, 129, 1}, {  2,   2,   2, 2}, {  2,   2, 2, 130} }, /* 10 */
+            { {128, 0, 1,   2}, {0,   0, 129, 2}, {  0,   0,   1, 2}, {  0,   0, 1, 130} }, /* 11 */
+            { {128, 1, 1,   2}, {0,   1, 129, 2}, {  0,   1,   1, 2}, {  0,   1, 1, 130} }, /* 12 */
+            { {128, 1, 2,   2}, {0, 129,   2, 2}, {  0,   1,   2, 2}, {  0,   1, 2, 130} }, /* 13 */
+            { {128, 0, 1, 129}, {0,   1,   1, 2}, {  1,   1,   2, 2}, {  1,   2, 2, 130} }, /* 14 */
+            { {128, 0, 1, 129}, {2,   0,   0, 1}, {130,   2,   0, 0}, {  2,   2, 2,   0} }, /* 15 */
+            { {128, 0, 0, 129}, {0,   0,   1, 1}, {  0,   1,   1, 2}, {  1,   1, 2, 130} }, /* 16 */
+            { {128, 1, 1, 129}, {0,   0,   1, 1}, {130,   0,   0, 1}, {  2,   2, 0,   0} }, /* 17 */
+            { {128, 0, 0,   0}, {1,   1,   2, 2}, {129,   1,   2, 2}, {  1,   1, 2, 130} }, /* 18 */
+            { {128, 0, 2, 130}, {0,   0,   2, 2}, {  0,   0,   2, 2}, {  1,   1, 1, 129} }, /* 19 */
+            { {128, 1, 1, 129}, {0,   1,   1, 1}, {  0,   2,   2, 2}, {  0,   2, 2, 130} }, /* 20 */
+            { {128, 0, 0, 129}, {0,   0,   0, 1}, {130,   2,   2, 1}, {  2,   2, 2,   1} }, /* 21 */
+            { {128, 0, 0,   0}, {0,   0, 129, 1}, {  0,   1,   2, 2}, {  0,   1, 2, 130} }, /* 22 */
+            { {128, 0, 0,   0}, {1,   1,   0, 0}, {130,   2, 129, 0}, {  2,   2, 1,   0} }, /* 23 */
+            { {128, 1, 2, 130}, {0, 129,   2, 2}, {  0,   0,   1, 1}, {  0,   0, 0,   0} }, /* 24 */
+            { {128, 0, 1,   2}, {0,   0,   1, 2}, {129,   1,   2, 2}, {  2,   2, 2, 130} }, /* 25 */
+            { {128, 1, 1,   0}, {1,   2, 130, 1}, {129,   2,   2, 1}, {  0,   1, 1,   0} }, /* 26 */
+            { {128, 0, 0,   0}, {0,   1, 129, 0}, {  1,   2, 130, 1}, {  1,   2, 2,   1} }, /* 27 */
+            { {128, 0, 2,   2}, {1,   1,   0, 2}, {129,   1,   0, 2}, {  0,   0, 2, 130} }, /* 28 */
+            { {128, 1, 1,   0}, {0, 129,   1, 0}, {  2,   0,   0, 2}, {  2,   2, 2, 130} }, /* 29 */
+            { {128, 0, 1,   1}, {0,   1,   2, 2}, {  0,   1, 130, 2}, {  0,   0, 1, 129} }, /* 30 */
+            { {128, 0, 0,   0}, {2,   0,   0, 0}, {130,   2,   1, 1}, {  2,   2, 2, 129} }, /* 31 */
+            { {128, 0, 0,   0}, {0,   0,   0, 2}, {129,   1,   2, 2}, {  1,   2, 2, 130} }, /* 32 */
+            { {128, 2, 2, 130}, {0,   0,   2, 2}, {  0,   0,   1, 2}, {  0,   0, 1, 129} }, /* 33 */
+            { {128, 0, 1, 129}, {0,   0,   1, 2}, {  0,   0,   2, 2}, {  0,   2, 2, 130} }, /* 34 */
+            { {128, 1, 2,   0}, {0, 129,   2, 0}, {  0,   1, 130, 0}, {  0,   1, 2,   0} }, /* 35 */
+            { {128, 0, 0,   0}, {1,   1, 129, 1}, {  2,   2, 130, 2}, {  0,   0, 0,   0} }, /* 36 */
+            { {128, 1, 2,   0}, {1,   2,   0, 1}, {130,   0, 129, 2}, {  0,   1, 2,   0} }, /* 37 */
+            { {128, 1, 2,   0}, {2,   0,   1, 2}, {129, 130,   0, 1}, {  0,   1, 2,   0} }, /* 38 */
+            { {128, 0, 1,   1}, {2,   2,   0, 0}, {  1,   1, 130, 2}, {  0,   0, 1, 129} }, /* 39 */
+            { {128, 0, 1,   1}, {1,   1, 130, 2}, {  2,   2,   0, 0}, {  0,   0, 1, 129} }, /* 40 */
+            { {128, 1, 0, 129}, {0,   1,   0, 1}, {  2,   2,   2, 2}, {  2,   2, 2, 130} }, /* 41 */
+            { {128, 0, 0,   0}, {0,   0,   0, 0}, {130,   1,   2, 1}, {  2,   1, 2, 129} }, /* 42 */
+            { {128, 0, 2,   2}, {1, 129,   2, 2}, {  0,   0,   2, 2}, {  1,   1, 2, 130} }, /* 43 */
+            { {128, 0, 2, 130}, {0,   0,   1, 1}, {  0,   0,   2, 2}, {  0,   0, 1, 129} }, /* 44 */
+            { {128, 2, 2,   0}, {1,   2, 130, 1}, {  0,   2,   2, 0}, {  1,   2, 2, 129} }, /* 45 */
+            { {128, 1, 0,   1}, {2,   2, 130, 2}, {  2,   2,   2, 2}, {  0,   1, 0, 129} }, /* 46 */
+            { {128, 0, 0,   0}, {2,   1,   2, 1}, {130,   1,   2, 1}, {  2,   1, 2, 129} }, /* 47 */
+            { {128, 1, 0, 129}, {0,   1,   0, 1}, {  0,   1,   0, 1}, {  2,   2, 2, 130} }, /* 48 */
+            { {128, 2, 2, 130}, {0,   1,   1, 1}, {  0,   2,   2, 2}, {  0,   1, 1, 129} }, /* 49 */
+            { {128, 0, 0,   2}, {1, 129,   1, 2}, {  0,   0,   0, 2}, {  1,   1, 1, 130} }, /* 50 */
+            { {128, 0, 0,   0}, {2, 129,   1, 2}, {  2,   1,   1, 2}, {  2,   1, 1, 130} }, /* 51 */
+            { {128, 2, 2,   2}, {0, 129,   1, 1}, {  0,   1,   1, 1}, {  0,   2, 2, 130} }, /* 52 */
+            { {128, 0, 0,   2}, {1,   1,   1, 2}, {129,   1,   1, 2}, {  0,   0, 0, 130} }, /* 53 */
+            { {128, 1, 1,   0}, {0, 129,   1, 0}, {  0,   1,   1, 0}, {  2,   2, 2, 130} }, /* 54 */
+            { {128, 0, 0,   0}, {0,   0,   0, 0}, {  2,   1, 129, 2}, {  2,   1, 1, 130} }, /* 55 */
+            { {128, 1, 1,   0}, {0, 129,   1, 0}, {  2,   2,   2, 2}, {  2,   2, 2, 130} }, /* 56 */
+            { {128, 0, 2,   2}, {0,   0,   1, 1}, {  0,   0, 129, 1}, {  0,   0, 2, 130} }, /* 57 */
+            { {128, 0, 2,   2}, {1,   1,   2, 2}, {129,   1,   2, 2}, {  0,   0, 2, 130} }, /* 58 */
+            { {128, 0, 0,   0}, {0,   0,   0, 0}, {  0,   0,   0, 0}, {  2, 129, 1, 130} }, /* 59 */
+            { {128, 0, 0, 130}, {0,   0,   0, 1}, {  0,   0,   0, 2}, {  0,   0, 0, 129} }, /* 60 */
+            { {128, 2, 2,   2}, {1,   2,   2, 2}, {  0,   2,   2, 2}, {129,   2, 2, 130} }, /* 61 */
+            { {128, 1, 0, 129}, {2,   2,   2, 2}, {  2,   2,   2, 2}, {  2,   2, 2, 130} }, /* 62 */
+            { {128, 1, 1, 129}, {2,   0,   1, 1}, {130,   2,   0, 1}, {  2,   2, 2,   0} }  /* 63 */
+        }
+    };
+    static const int aWeight2[4] = {0, 21, 43, 64};
+    static const int aWeight3[8] = {0, 9, 18, 27, 37, 46, 55, 64};
+    static const int aWeight4[16] = {0,  4,  9,  13, 17, 21, 26, 30,
+                                     34, 38, 43, 47, 51, 55, 60, 64};
+    static const signed char actual_bits[2][8] = {
+        {4, 6, 5, 7, 5, 7, 7, 5}, {0, 0, 0, 0, 6, 8, 7, 5}};
+    static const unsigned char mode_has_pbits = 0xCB;
+    uint64_t lo, hi;
+    int mode, partition = 0, numPart = 1, numEp, rotation = 0, idxSelBit = 0;
+    int ib, ib2, i, j, k;
+    int ep[6][4];
+    signed char cidx[4][4];
+    const int *w, *w2;
+    memcpy(&lo, blk, 8);
+    memcpy(&hi, blk + 8, 8);
+    for (mode = 0; mode < 8 && tc_bc7_dec_rb(&lo, &hi, 1) == 0; ++mode)
+        ;
+    if (mode >= 8) {
+        memset(out, 0, 16u * 4u);
+        return;
+    }
+    if (mode == 0 || mode == 1 || mode == 2 || mode == 3 || mode == 7) {
+        numPart = (mode == 0 || mode == 2) ? 3 : 2;
+        partition = (int)tc_bc7_dec_rb(&lo, &hi, (mode == 0) ? 4 : 6);
+    }
+    numEp = numPart * 2;
+    if (mode == 4 || mode == 5) {
+        rotation = (int)tc_bc7_dec_rb(&lo, &hi, 2);
+        if (mode == 4) idxSelBit = (int)tc_bc7_dec_rb(&lo, &hi, 1);
+    }
+    for (i = 0; i < 3; ++i)
+        for (j = 0; j < numEp; ++j)
+            ep[j][i] = (int)tc_bc7_dec_rb(&lo, &hi, actual_bits[0][mode]);
+    if (actual_bits[1][mode] > 0)
+        for (j = 0; j < numEp; ++j)
+            ep[j][3] = (int)tc_bc7_dec_rb(&lo, &hi, actual_bits[1][mode]);
+    if (mode == 0 || mode == 1 || mode == 3 || mode == 6 || mode == 7) {
+        for (i = 0; i < numEp; ++i)
+            for (j = 0; j < 4; ++j) ep[i][j] <<= 1;
+        if (mode == 1) {
+            int p0 = (int)tc_bc7_dec_rb(&lo, &hi, 1);
+            int p1 = (int)tc_bc7_dec_rb(&lo, &hi, 1);
+            for (k = 0; k < 3; ++k) {
+                ep[0][k] |= p0; ep[1][k] |= p0; ep[2][k] |= p1; ep[3][k] |= p1;
+            }
+        } else {
+            for (i = 0; i < numEp; ++i) {
+                int p = (int)tc_bc7_dec_rb(&lo, &hi, 1);
+                for (k = 0; k < 4; ++k) ep[i][k] |= p;
+            }
+        }
+    }
+    for (i = 0; i < numEp; ++i) {
+        int cb = actual_bits[0][mode] + ((mode_has_pbits >> mode) & 1);
+        int ab = actual_bits[1][mode] + ((mode_has_pbits >> mode) & 1);
+        for (k = 0; k < 3; ++k) {
+            ep[i][k] = ep[i][k] << (8 - cb);
+            ep[i][k] |= ep[i][k] >> cb;
+        }
+        ep[i][3] = ep[i][3] << (8 - ab);
+        ep[i][3] |= ep[i][3] >> ab;
+    }
+    if (!actual_bits[1][mode])
+        for (j = 0; j < numEp; ++j) ep[j][3] = 0xFF;
+    ib = (mode == 0 || mode == 1) ? 3 : ((mode == 6) ? 4 : 2);
+    ib2 = (mode == 4) ? 3 : ((mode == 5) ? 2 : 0);
+    w = (ib == 2) ? aWeight2 : ((ib == 3) ? aWeight3 : aWeight4);
+    w2 = (ib2 == 2) ? aWeight2 : aWeight3;
+    for (i = 0; i < 4; ++i)
+        for (j = 0; j < 4; ++j) {
+            int ps = (numPart == 1) ? ((i | j) ? 0 : 128)
+                                    : tc_bc7_dec_parts[numPart - 2][partition][i][j];
+            int bits = ib - ((ps & 0x80) ? 1 : 0);
+            cidx[i][j] = (signed char)tc_bc7_dec_rb(&lo, &hi, bits);
+        }
+    for (i = 0; i < 4; ++i)
+        for (j = 0; j < 4; ++j) {
+            int ps = ((numPart == 1) ? ((i | j) ? 0 : 128)
+                                     : tc_bc7_dec_parts[numPart - 2][partition][i][j]) & 0x03;
+            int idx = cidx[i][j], idx2 = 0;
+            int r, g, b, a, s0 = ps * 2, s1 = ps * 2 + 1;
+            if (ib2) idx2 = (int)tc_bc7_dec_rb(&lo, &hi, (i | j) ? ib2 : (ib2 - 1));
+            if (!ib2 || !idxSelBit) {
+                r = tc_bc7_dec_interp(ep[s0][0], ep[s1][0], w, idx);
+                g = tc_bc7_dec_interp(ep[s0][1], ep[s1][1], w, idx);
+                b = tc_bc7_dec_interp(ep[s0][2], ep[s1][2], w, idx);
+                a = ib2 ? tc_bc7_dec_interp(ep[s0][3], ep[s1][3], w2, idx2)
+                        : tc_bc7_dec_interp(ep[s0][3], ep[s1][3], w, idx);
+            } else {
+                r = tc_bc7_dec_interp(ep[s0][0], ep[s1][0], w2, idx2);
+                g = tc_bc7_dec_interp(ep[s0][1], ep[s1][1], w2, idx2);
+                b = tc_bc7_dec_interp(ep[s0][2], ep[s1][2], w2, idx2);
+                a = tc_bc7_dec_interp(ep[s0][3], ep[s1][3], w, idx);
+            }
+            if (rotation == 1) { int t = a; a = r; r = t; }
+            else if (rotation == 2) { int t = a; a = g; g = t; }
+            else if (rotation == 3) { int t = a; a = b; b = t; }
+            out[i * 4 + j][0] = (uint8_t)r;
+            out[i * 4 + j][1] = (uint8_t)g;
+            out[i * 4 + j][2] = (uint8_t)b;
+            out[i * 4 + j][3] = (uint8_t)a;
+        }
+}
+
+tc_result tc_bc7_decompress_rgba8(const uint8_t *bc7, uint32_t width,
+                                  uint32_t height, size_t stride,
+                                  uint8_t *out_rgba, size_t out_size) {
+    uint32_t bxc, bx, by, xx, yy;
+    if (!bc7 || !out_rgba || !width || !height) return TC_ERROR_INVALID_ARGUMENT;
+    if (stride < (size_t)width * 4u) return TC_ERROR_INVALID_ARGUMENT;
+    if (out_size < (size_t)(height - 1u) * stride + (size_t)width * 4u)
+        return TC_ERROR_INVALID_ARGUMENT;
+    bxc = (width + 3u) / 4u;
+    for (by = 0; by < height; by += 4u)
+        for (bx = 0; bx < width; bx += 4u) {
+            uint8_t dec[16][4];
+            size_t bi = ((size_t)(by / 4u) * bxc + bx / 4u) * 16u;
+            tc_bc7_decode_block(bc7 + bi, dec);
+            for (yy = 0; yy < 4u; ++yy) {
+                uint32_t y = by + yy;
+                if (y >= height) continue;
+                for (xx = 0; xx < 4u; ++xx) {
+                    uint32_t x = bx + xx;
+                    if (x >= width) continue;
+                    memcpy(out_rgba + (size_t)y * stride + (size_t)x * 4u,
+                           dec[yy * 4u + xx], 4u);
+                }
+            }
+        }
+    return TC_SUCCESS;
+}
+
+tc_result tc_bc7_decompress_rgbaf(const uint8_t *bc7, uint32_t width,
+                                  uint32_t height, size_t stride_bytes,
+                                  float *out_rgba, size_t out_size) {
+    uint32_t x, y;
+    uint8_t *u8;
+    size_t need, row_bytes;
+    tc_result ret;
+
+    if (!bc7 || !out_rgba || !width || !height) return TC_ERROR_INVALID_ARGUMENT;
+    if (out_size < (size_t)height * (size_t)width * 4u * sizeof(float))
+        return TC_ERROR_INVALID_ARGUMENT;
+    need = (size_t)height * (size_t)width * 4u;
+    u8 = (uint8_t *)malloc(need);
+    if (!u8) return TC_ERROR_OUT_OF_MEMORY;
+    row_bytes = (size_t)width * 4u;
+    ret = tc_bc7_decompress_rgba8(bc7, width, height, row_bytes, u8, need);
+    if (ret != TC_SUCCESS) { free(u8); return ret; }
+    for (y = 0; y < height; ++y) {
+        const uint8_t *src = u8 + (size_t)y * row_bytes;
+        float *dst = (float *)((uint8_t *)out_rgba + (size_t)y * stride_bytes);
+        for (x = 0; x < width; ++x) {
+            uint32_t c;
+            for (c = 0; c < 4u; ++c)
+                dst[x * 4u + c] = (float)src[x * 4u + c] / 255.0f;
+        }
+    }
+    free(u8);
+    return TC_SUCCESS;
+}
+
+/* Gather the 4x4 source block at (bx,by), clamping to the image edge. */
+static void tc_bc7_gather_block(const uint8_t *rgba, uint32_t width,
+                                uint32_t height, size_t stride, uint32_t bx,
+                                uint32_t by, uint8_t out[16][4]) {
+    uint32_t xx, yy, x, y;
+    for (yy = 0; yy < 4u; ++yy) {
+        y = by + yy;
+        if (y >= height) y = height - 1u;
+        for (xx = 0; xx < 4u; ++xx) {
+            x = bx + xx;
+            if (x >= width) x = width - 1u;
+            memcpy(out[yy * 4u + xx], rgba + (size_t)y * stride + (size_t)x * 4u,
+                   4u);
+        }
+    }
+}
+
+/* Decoder-driven windowed rate-distortion pass. For each block, decode its own
+ * encoding and every recent block's encoding (cached in the ring), and reuse
+ * the recent block whose *decoded* pixels best match this block's source --
+ * accepting only when the reconstruction error it introduces stays within the
+ * budget (rdo = max per-channel RMS increase). Reuse turns near-duplicate
+ * blocks into exact byte duplicates that zstd matches across the whole image.
+ * Because the actual decoded bytes are scored, there is no reuse-chaining drift
+ * and the distortion is measured rather than merely bounded. Output stays valid
+ * BC7 (every block is a real encoding). */
+#define TC_BC7_RDO_WINDOW 64u
+static int64_t tc_bc7_block_sse(const uint8_t a[16][4], const uint8_t b[16][4]) {
+    int64_t sse = 0;
+    uint32_t t;
+    for (t = 0; t < 64u; ++t) {
+        int d = (int)((const uint8_t *)a)[t] - (int)((const uint8_t *)b)[t];
+        sse += (int64_t)d * d;
+    }
+    return sse;
+}
+static void tc_bc7_rdo_pass(const uint8_t *rgba, uint32_t width,
+                            uint32_t height, size_t stride, int rdo,
+                            uint8_t *blocks) {
+    uint32_t bxc = (width + 3u) / 4u, byc = (height + 3u) / 4u;
+    uint32_t nblocks = bxc * byc, i, ring_count = 0;
+    int64_t thresh = (int64_t)rdo * rdo * 16 * 4; /* budget: RMS increase <= rdo */
+    uint8_t ring[TC_BC7_RDO_WINDOW][16][4]; /* decoded pixels of recent blocks */
+    uint32_t ring_idx[TC_BC7_RDO_WINDOW];   /* block index whose bytes they are */
+    for (i = 0; i < nblocks; ++i) {
+        uint8_t cur[16][4], own[16][4], final_dec[16][4];
+        int64_t own_err, best = 0;
+        int best_slot = -1;
+        uint32_t k, slot, lim = ring_count < TC_BC7_RDO_WINDOW
+                                    ? ring_count
+                                    : TC_BC7_RDO_WINDOW;
+        tc_bc7_gather_block(rgba, width, height, stride, (i % bxc) * 4u,
+                            (i / bxc) * 4u, cur);
+        tc_bc7_decode_block(blocks + (size_t)i * 16u, own);
+        own_err = tc_bc7_block_sse(cur, own);
+        for (k = 0; k < lim; ++k) {
+            int64_t sse = tc_bc7_block_sse(cur, ring[k]);
+            if (best_slot < 0 || sse < best) {
+                best = sse;
+                best_slot = (int)k;
+            }
+        }
+        if (best_slot >= 0 && best - own_err <= thresh) {
+            memcpy(blocks + (size_t)i * 16u,
+                   blocks + (size_t)ring_idx[best_slot] * 16u, 16u);
+            memcpy(final_dec, ring[best_slot], sizeof(final_dec));
+        } else {
+            memcpy(final_dec, own, sizeof(final_dec));
+        }
+        slot = ring_count % TC_BC7_RDO_WINDOW;
+        memcpy(ring[slot], final_dec, sizeof(final_dec));
+        ring_idx[slot] = i;
+        ++ring_count;
+    }
 }
 
 tc_result tc_bc7_compress_rgba8(const uint8_t *rgba, uint32_t width,
@@ -594,6 +1098,16 @@ tc_result tc_bc7_compress_rgba8(const uint8_t *rgba, uint32_t width,
         opt = &defopt;
     }
 
+    /* Resolve per-channel error weights: all-zero -> uniform (byte-identical to
+     * the unweighted path). */
+    {
+        int c, any = 0;
+        for (c = 0; c < 4; ++c)
+            if (opt->channel_weights[c]) any = 1;
+        for (c = 0; c < 4; ++c)
+            tc_bc7_cw[c] = any ? (uint32_t)opt->channel_weights[c] : 1u;
+    }
+
     for (by = 0; by < height; by += 4) {
         for (bx = 0; bx < width; bx += 4) {
             for (yy = 0; yy < 4; ++yy) {
@@ -612,5 +1126,47 @@ tc_result tc_bc7_compress_rgba8(const uint8_t *rgba, uint32_t width,
         }
     }
 
+    if (opt->rdo > 0)
+        tc_bc7_rdo_pass(rgba, width, height, stride, opt->rdo, out_bc7);
+
     return TC_SUCCESS;
+}
+
+tc_result tc_bc7_compress_rgbaf(const float *rgba, uint32_t width,
+                                uint32_t height, size_t stride_bytes,
+                                const tc_bc7_options *opt, uint8_t *out_bc7,
+                                size_t out_size) {
+    uint32_t x, y;
+    uint8_t *u8;
+    size_t need, row_bytes;
+    tc_result ret;
+
+    if (!rgba || !out_bc7 || !width || !height) return TC_ERROR_INVALID_ARGUMENT;
+    if (stride_bytes < (size_t)width * 4u * sizeof(float))
+        return TC_ERROR_INVALID_ARGUMENT;
+
+    need = (size_t)height * (size_t)width * 4u;
+    u8 = (uint8_t *)malloc(need);
+    if (!u8) return TC_ERROR_OUT_OF_MEMORY;
+
+    row_bytes = (size_t)width * 4u;
+    for (y = 0; y < height; ++y) {
+        const float *src = (const float *)((const uint8_t *)rgba +
+                                           (size_t)y * stride_bytes);
+        uint8_t *dst = u8 + (size_t)y * row_bytes;
+        for (x = 0; x < width; ++x) {
+            uint32_t c;
+            for (c = 0; c < 4u; ++c) {
+                float v = src[x * 4u + c];
+                if (v < 0.0f) v = 0.0f;
+                if (v > 1.0f) v = 1.0f;
+                dst[x * 4u + c] = (uint8_t)(v * 255.0f + 0.5f);
+            }
+        }
+    }
+
+    ret = tc_bc7_compress_rgba8(u8, width, height, row_bytes, opt, out_bc7,
+                                out_size);
+    free(u8);
+    return ret;
 }

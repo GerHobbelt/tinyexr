@@ -3,7 +3,7 @@
  * translation units (texcomp.c + texcomp_<codec>.c).
  *
  * Copyright (c) 2014-2026 Syoyo Fujita and TinyEXR authors
- * SPDX-License-Identifier: BSD-3-Clause
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #ifndef TINYEXR_TEXCOMP_INTERNAL_H_
@@ -78,12 +78,39 @@ int tc_astc_hdr_color_roundtrip(uint32_t level, int value);
 void tc_astc_cem11_pack(const int lns0[3], const int lns1[3], int level,
                         uint8_t v[6]);
 int tc_astc_cem11_unpack(const uint8_t v[6], int out0[3], int out1[3]);
+/* HDR alpha endpoint codec (extra 2 values of CEM 14/15) + CEM 15 (HDR RGB +
+ * HDR alpha, 8 values) wrappers. LNS domain like CEM 11. */
+void tc_astc_hdr_alpha_pack(int alns0, int alns1, uint8_t out[2]);
+void tc_astc_hdr_alpha_unpack(const uint8_t in[2], int *out0, int *out1);
+void tc_astc_cem15_pack(const int lns0[3], const int lns1[3], int alns0,
+                        int alns1, int level, uint8_t v[8]);
+int tc_astc_cem15_unpack(const uint8_t v[8], int out0[4], int out1[4]);
+/* CEM 7 (HDR RGB base+scale, 4 values) pack/unpack; LNS domain like CEM 11. */
+void tc_astc_cem7_pack(const int e0[3], const int e1[3], int level,
+                       uint8_t v[4]);
+int tc_astc_cem7_unpack(const uint8_t v[4], int out0[3], int out1[3]);
+/* Single-subset CEM 7 (base+scale) 4x4 block encoder. */
+uint64_t tc_encode_astc_hdr_cem7_block(const int lns[16][3], uint8_t out[16]);
 /* Per-texel CEM 11 4x4 block encoder (defined in texcomp_astc.c, which owns
  * the ASTC block/ISE machinery). `lns` is 16 texels of 16-bit LNS RGB; returns
  * the reconstruction SSE in the LNS domain (for mode selection). */
 uint64_t tc_encode_astc_hdr_cem11_block(const int lns[16][3], uint8_t out[16]);
+/* Single-subset CEM 15 (HDR RGB + HDR alpha) 4x4 block encoder; lns is RGBA. */
+uint64_t tc_encode_astc_hdr_cem15_block(const int lns[16][4], uint8_t out[16]);
 /* Two-subset CEM 11 block; UINT64_MAX if no usable partition. */
 uint64_t tc_encode_astc_hdr_cem11_2subset_block(const int lns[16][3],
                                                 uint8_t out[16]);
+
+/* ---- ASTC block decoder (defined in texcomp_astc_decode.c) --------------- */
+/* Decode one ASTC 2D block with footprint bx x by to RGBA8 (row-major, 4 bytes
+ * per texel). bx,by are the block footprint (both <= 12). Returns 1 on success,
+ * 0 on an invalid or unsupported encoding (HDR, 3D, reserved modes). */
+int tc_astc_decode_block_rgba8(const uint8_t block[16], uint32_t bx,
+                               uint32_t by, uint8_t out_rgba[16*4]);
+/* Decode a full ASTC image; out_rgba must hold width*height*4 bytes. Returns 1
+ * on success, 0 on any decode error in any block. */
+int tc_astc_decode_image_rgba8(const uint8_t *blocks, uint32_t width,
+                               uint32_t height, uint32_t bx, uint32_t by,
+                               uint8_t *out_rgba);
 
 #endif /* TINYEXR_TEXCOMP_INTERNAL_H_ */

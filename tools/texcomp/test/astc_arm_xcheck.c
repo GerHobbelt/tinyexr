@@ -1,4 +1,8 @@
-/* Self-contained CI cross-check for the vendored Arm astcenc backend.
+/*
+ * Copyright (c) 2014-2026 Syoyo Fujita and TinyEXR authors
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Self-contained CI cross-check for the vendored Arm astcenc backend.
  *
  * Builds only with -DTEXCOMP_HAVE_ASTCENC. Encodes one deterministic image
  * with both the pure-C `tc` encoder and the vendored astcenc encoder, decodes
@@ -169,6 +173,117 @@ int main(void) {
                 parm, ptc, TOL);
         return 1;
     }
+    /* UASTC LDR 4x4: constrained encode must decode cleanly and use only the
+     * single-subset CEM 8/12 modes (or the solid void-extent). */
+    {
+        static uint8_t ublk[(W / 4) * (H / 4) * 16];
+        tc_astc_options uopt;
+        size_t un, b;
+        double pu;
+        tc_astc_options_init(&uopt);
+        uopt.block_x = 4;
+        uopt.block_y = 4;
+        uopt.uastc = 1;
+        un = tc_astc_compressed_size(W, H, &uopt);
+        if (tc_astc_compress_rgba8(img, W, H, W * 4u, &uopt, ublk, un) !=
+            TC_SUCCESS) {
+            fprintf(stderr, "FAIL: uastc encode\n");
+            return 1;
+        }
+        if (astc_decode(ublk, un, W, H, 4, 4, dec_tc) != 0) {
+            fprintf(stderr, "FAIL: uastc decode\n");
+            return 1;
+        }
+        for (b = 0; b + 16 <= un; b += 16) {
+            const uint8_t *p = ublk + b;
+            unsigned bm = (unsigned)p[0] | ((unsigned)(p[1] & 7u) << 8);
+            unsigned pc;
+            if ((bm & 0x1ffu) == 0x1fcu) continue; /* void-extent (solid) */
+            pc = ((unsigned)p[1] >> 3) & 3u; /* partition count - 1 */
+            /* UASTC uses at most 3 subsets; single-subset CEM = bits 13..16
+             * (3 in byte 1, 1 in byte 2) and must be LA (4), RGB (8) or
+             * RGBA (12). */
+            if (pc > 2u) {
+                fprintf(stderr, "FAIL: uastc block %zu has %u subsets\n",
+                        b / 16u, pc + 1u);
+                return 1;
+            }
+            if (pc == 0u) {
+                unsigned cem =
+                    (((unsigned)p[1] >> 5) & 7u) | (((unsigned)p[2] & 1u) << 3);
+                if (cem != 4u && cem != 8u && cem != 12u) {
+                    fprintf(stderr,
+                            "FAIL: uastc block %zu single-subset CEM %u\n",
+                            b / 16u, cem);
+                    return 1;
+                }
+            }
+        }
+        pu = psnr8(img, dec_tc, sizeof(img));
+        printf("uastc-ldr 64x64: %.2f dB (constrained modes)\n", pu);
+        if (pu < FLOOR) {
+            fprintf(stderr, "FAIL: uastc psnr %.2f below floor\n", pu);
+            return 1;
+        }
+
+        /* Grayscale + alpha correlated gradient: the CEM 4 (luminance+alpha)
+         * modes carry this in 4 endpoint values (vs 8 for CEM 12), so they win
+         * on grayscale and must round-trip through astcenc. Assert at least one
+         * CEM 4 block is emitted and the image clears a high floor. */
+        {
+            uint32_t x2, y2, seen_cem4 = 0;
+            double pg;
+            for (y2 = 0; y2 < H; ++y2)
+                for (x2 = 0; x2 < W; ++x2) {
+                    double t = (double)((x2 & 3u) + (y2 & 3u)) / 6.0;
+                    uint8_t l = (uint8_t)(30.0 + t * 200.0);
+                    uint8_t *px = img + ((size_t)y2 * W + x2) * 4u;
+                    px[0] = px[1] = px[2] = l;
+                    px[3] = (uint8_t)(50.0 + t * 150.0);
+                }
+            if (tc_astc_compress_rgba8(img, W, H, W * 4u, &uopt, ublk, un) !=
+                TC_SUCCESS) {
+                fprintf(stderr, "FAIL: uastc gray encode\n");
+                return 1;
+            }
+            if (astc_decode(ublk, un, W, H, 4, 4, dec_tc) != 0) {
+                fprintf(stderr, "FAIL: uastc gray decode\n");
+                return 1;
+            }
+            for (b = 0; b + 16 <= un; b += 16) {
+                const uint8_t *p = ublk + b;
+                unsigned bm = (unsigned)p[0] | ((unsigned)(p[1] & 7u) << 8);
+                unsigned pc, cem;
+                if ((bm & 0x1ffu) == 0x1fcu) continue;
+                pc = ((unsigned)p[1] >> 3) & 3u;
+                if (pc == 0u) {
+                    cem = (((unsigned)p[1] >> 5) & 7u) |
+                          (((unsigned)p[2] & 1u) << 3);
+                } else {
+                    /* all-same-CEM multi-partition: 6-bit field at bit 23 =
+                     * (cem << 2), so cem = field >> 2. */
+                    unsigned field = (((unsigned)p[2] >> 7) & 1u) |
+                                     (((unsigned)p[3] & 0x1fu) << 1);
+                    cem = field >> 2;
+                }
+                if (cem == 4u) seen_cem4 = 1;
+            }
+            pg = psnr8(img, dec_tc, sizeof(img));
+            printf("uastc-ldr grayscale+alpha: %.2f dB (cem4 used=%u)\n", pg,
+                   seen_cem4);
+            if (!seen_cem4) {
+                fprintf(stderr, "FAIL: uastc emitted no CEM 4 block on "
+                                "grayscale+alpha\n");
+                return 1;
+            }
+            if (pg < 35.0) {
+                fprintf(stderr, "FAIL: uastc grayscale psnr %.2f below floor\n",
+                        pg);
+                return 1;
+            }
+        }
+    }
+
     printf("astc arm xcheck: OK\n");
     return 0;
 }
