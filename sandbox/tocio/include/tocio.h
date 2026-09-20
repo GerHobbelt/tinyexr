@@ -70,6 +70,7 @@ typedef enum toc_op_kind {
     TOC_OP_LUT1D,      /* per-channel 1D interpolation over a domain */
     TOC_OP_LUT3D,      /* trilinear/tetrahedral over an NxNxN cube */
     TOC_OP_FIXEDFUNC,  /* ACES fixed function (style id + params) */
+    TOC_OP_ACES_OUTPUT,/* ACES 2.0 output transform (CAM16 JMh tonescale+gamut) */
     TOC_OP_NOOP
 } toc_op_kind;
 
@@ -134,7 +135,7 @@ typedef struct toc_op {
             float scale[4], offset[4], min[4], max[4];
             int clamp_lo, clamp_hi;
         } range;
-        struct { float e[4]; } exponent;
+        struct { float e[4]; int mirror; } exponent; /* mirror: sign(x)*pow(|x|,e) */
         /* MonCurve (ExponentWithLinear): forward is
          *   y = (x > breakpoint) ? pow(x*scale + offset, gamma) : x*slope
          * with all five params precomputed per channel from (gamma,offset).
@@ -142,6 +143,7 @@ typedef struct toc_op {
         struct {
             float scale[4], offset[4], gamma[4], breakpoint[4], slope[4];
             int inverse;
+            int mirror; /* odd extension for x<0: sign(x)*curve(|x|) */
         } exp_linear;
         struct {
             /* out = (antilog/log)(in) using base, per-channel affine params */
@@ -169,6 +171,9 @@ typedef struct toc_op {
         toc_lut1d lut1d;
         toc_lut3d lut3d;
         struct { int style; float params[8]; int nparams; } fixedfunc;
+        /* ACES 2.0 output transform. `t` points at a precomputed parameter+table
+         * blob owned by the op list (toc_aces2, defined in toc_internal.h). */
+        struct { const void *t; int inverse; } aces;
     } u;
 } toc_op;
 

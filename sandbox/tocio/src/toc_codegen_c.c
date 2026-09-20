@@ -72,15 +72,22 @@ static void op_range(toc_sb *sb, const toc_op *op) {
 
 static void op_exponent(toc_sb *sb, const toc_op *op) {
     static const char *cn[4] = {"r", "g", "b", "a"};
-    int c;
+    int c, mir = op->u.exponent.mirror;
     for (c = 0; c < 4; ++c) {
-        toc_sb_puts(sb, "  ");
-        toc_sb_puts(sb, cn[c]);
-        toc_sb_puts(sb, " = tc_powf(");
-        toc_sb_puts(sb, cn[c]);
-        toc_sb_puts(sb, ">0.0f?");
-        toc_sb_puts(sb, cn[c]);
-        toc_sb_puts(sb, ":0.0f, ");
+        const char *v = cn[c];
+        toc_sb_puts(sb, "  "); toc_sb_puts(sb, v); toc_sb_puts(sb, " = ");
+        if (mir) {
+            /* sign(v)*tc_powf(|v|, e) */
+            toc_sb_puts(sb, "("); toc_sb_puts(sb, v);
+            toc_sb_puts(sb, "<0.0f?-1.0f:1.0f)*tc_powf(");
+            toc_sb_puts(sb, v); toc_sb_puts(sb, "<0.0f?-");
+            toc_sb_puts(sb, v); toc_sb_puts(sb, ":"); toc_sb_puts(sb, v);
+            toc_sb_puts(sb, ", ");
+        } else {
+            toc_sb_puts(sb, "tc_powf("); toc_sb_puts(sb, v);
+            toc_sb_puts(sb, ">0.0f?"); toc_sb_puts(sb, v);
+            toc_sb_puts(sb, ":0.0f, ");
+        }
         emit_hf(sb, op->u.exponent.e[c]);
         toc_sb_puts(sb, ");\n");
     }
@@ -88,30 +95,40 @@ static void op_exponent(toc_sb *sb, const toc_op *op) {
 
 static void op_exp_linear(toc_sb *sb, const toc_op *op) {
     static const char *cn[3] = {"r", "g", "b"};
-    int c;
+    int c, mir = op->u.exp_linear.mirror;
     for (c = 0; c < 3; ++c) {
         float scale = op->u.exp_linear.scale[c], off = op->u.exp_linear.offset[c];
         float g = op->u.exp_linear.gamma[c], brk = op->u.exp_linear.breakpoint[c];
         float slope = op->u.exp_linear.slope[c];
+        const char *v = cn[c];
+        const char *iv = mir ? "_a" : v; /* input the curve reads */
         toc_sb_puts(sb, "  ");
-        toc_sb_puts(sb, cn[c]);
-        toc_sb_puts(sb, " = (");
+        if (mir) {
+            /* {float _s=sign(v),_a=|v|; v = _s*(curve(_a));} */
+            toc_sb_puts(sb, "{float _s="); toc_sb_puts(sb, v);
+            toc_sb_puts(sb, "<0.0f?-1.0f:1.0f,_a="); toc_sb_puts(sb, v);
+            toc_sb_puts(sb, "<0.0f?-"); toc_sb_puts(sb, v); toc_sb_puts(sb, ":");
+            toc_sb_puts(sb, v); toc_sb_puts(sb, ";"); toc_sb_puts(sb, v);
+            toc_sb_puts(sb, " = _s*((");
+        } else {
+            toc_sb_puts(sb, v); toc_sb_puts(sb, " = (");
+        }
         if (!op->u.exp_linear.inverse) {
-            toc_sb_puts(sb, cn[c]); toc_sb_puts(sb, ">");
+            toc_sb_puts(sb, iv); toc_sb_puts(sb, ">");
             emit_hf(sb, brk); toc_sb_puts(sb, ") ? tc_powf(");
-            toc_sb_puts(sb, cn[c]); toc_sb_puts(sb, "*"); emit_hf(sb, scale);
+            toc_sb_puts(sb, iv); toc_sb_puts(sb, "*"); emit_hf(sb, scale);
             toc_sb_puts(sb, "+"); emit_hf(sb, off); toc_sb_puts(sb, ", ");
             emit_hf(sb, g); toc_sb_puts(sb, ") : ");
-            toc_sb_puts(sb, cn[c]); toc_sb_puts(sb, "*"); emit_hf(sb, slope);
+            toc_sb_puts(sb, iv); toc_sb_puts(sb, "*"); emit_hf(sb, slope);
         } else {
-            toc_sb_puts(sb, cn[c]); toc_sb_puts(sb, ">");
+            toc_sb_puts(sb, iv); toc_sb_puts(sb, ">");
             emit_hf(sb, brk * slope); toc_sb_puts(sb, ") ? (tc_powf(");
-            toc_sb_puts(sb, cn[c]); toc_sb_puts(sb, ", "); emit_hf(sb, 1.0f / g);
+            toc_sb_puts(sb, iv); toc_sb_puts(sb, ", "); emit_hf(sb, 1.0f / g);
             toc_sb_puts(sb, ")-"); emit_hf(sb, off); toc_sb_puts(sb, ")/");
             emit_hf(sb, scale); toc_sb_puts(sb, " : ");
-            toc_sb_puts(sb, cn[c]); toc_sb_puts(sb, "/"); emit_hf(sb, slope);
+            toc_sb_puts(sb, iv); toc_sb_puts(sb, "/"); emit_hf(sb, slope);
         }
-        toc_sb_puts(sb, ";\n");
+        toc_sb_puts(sb, mir ? ");}\n" : ";\n");
     }
 }
 
@@ -343,11 +360,11 @@ static const char *FIXEDFUNC_SRC_XYZ =
 static const char *FIXEDFUNC_SRC_HDR =
     "static float tc_pq_enc(float L){float m1=0.1593017578125f,m2=78.84375f,"
     "c1=0.8359375f,c2=18.8515625f,c3=18.6875f,Lm;if(L<=0.0f)return 0.0f;"
-    "Lm=tc_powf(L,m1);return tc_powf((c1+c2*Lm)/(1.0f+c3*Lm),m2);}\n"
+    "Lm=tc_powf(L*0.01f,m1);return tc_powf((c1+c2*Lm)/(1.0f+c3*Lm),m2);}\n"
     "static float tc_pq_dec(float N){float m1=0.1593017578125f,m2=78.84375f,"
     "c1=0.8359375f,c2=18.8515625f,c3=18.6875f,Np,nu,de;if(N<=0.0f)return 0.0f;"
     "Np=tc_powf(N,1.0f/m2);nu=Np-c1;if(nu<0.0f)nu=0.0f;de=c2-c3*Np;"
-    "if(de<=0.0f)return 0.0f;return tc_powf(nu/de,1.0f/m1);}\n"
+    "if(de<=0.0f)return 0.0f;return tc_powf(nu/de,1.0f/m1)*100.0f;}\n"
     "static float tc_hlg_enc(float E){float a=0.17883277f,b=0.28466892f,"
     "c=0.55991073f;if(E<=0.0f)return 0.0f;if(E<=1.0f/12.0f)return "
     "tc_exp2f(0.5f*tc_log2f(3.0f*E));return a*(tc_log2f(12.0f*E-b)*"

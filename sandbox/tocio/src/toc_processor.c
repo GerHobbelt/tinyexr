@@ -49,6 +49,14 @@ static int read_scalar(const toc_node *parent, const char *key, float *out) {
     return scalar_to_float(toc_node_scalar(v), out);
 }
 
+/* Log/LogCamera params are named with snake_case in OCIO YAML configs
+ * (log_side_slope) but camelCase in CLF/CTF (logSideSlope). Accept either. */
+static int read_vec2(const toc_node *parent, const char *snake, const char *camel,
+                     float *out, int maxn) {
+    int n = read_vec(parent, snake, out, maxn);
+    return n ? n : read_vec(parent, camel, out, maxn);
+}
+
 static void matvec4(const float *m /*row-major*/, const float *v, float *out) {
     int r;
     for (r = 0; r < 4; ++r)
@@ -139,10 +147,10 @@ toc_result toc_lower_transform(const toc_config *cfg, toc_op_list *list,
         float ns[3] = {1, 1, 1}, no[3] = {0, 0, 0};
         int i;
         read_scalar(node, "base", &base);
-        read_vec(node, "logSideSlope", ls, 3);
-        read_vec(node, "logSideOffset", lo, 3);
-        read_vec(node, "linSideSlope", ns, 3);
-        read_vec(node, "linSideOffset", no, 3);
+        read_vec2(node, "log_side_slope", "logSideSlope", ls, 3);
+        read_vec2(node, "log_side_offset", "logSideOffset", lo, 3);
+        read_vec2(node, "lin_side_slope", "linSideSlope", ns, 3);
+        read_vec2(node, "lin_side_offset", "linSideOffset", no, 3);
         op = toc_op_list_push(list, TOC_OP_LOG);
         if (!op) return TOC_ERROR_OUT_OF_MEMORY;
         op->u.log.base = base;
@@ -164,13 +172,13 @@ toc_result toc_lower_transform(const toc_config *cfg, toc_op_list *list,
         float brk[3] = {0, 0, 0}, lslope[3];
         int has_lslope, i;
         read_scalar(node, "base", &base);
-        read_vec(node, "logSideSlope", ls, 3);
-        read_vec(node, "logSideOffset", lo, 3);
-        read_vec(node, "linSideSlope", ns, 3);
-        read_vec(node, "linSideOffset", no, 3);
-        if (read_vec(node, "linSideBreak", brk, 3) == 0)
+        read_vec2(node, "log_side_slope", "logSideSlope", ls, 3);
+        read_vec2(node, "log_side_offset", "logSideOffset", lo, 3);
+        read_vec2(node, "lin_side_slope", "linSideSlope", ns, 3);
+        read_vec2(node, "lin_side_offset", "linSideOffset", no, 3);
+        if (read_vec2(node, "lin_side_break", "linSideBreak", brk, 3) == 0)
             return TOC_ERROR_PARSE; /* required */
-        has_lslope = read_vec(node, "linearSlope", lslope, 3) != 0;
+        has_lslope = read_vec2(node, "linear_slope", "linearSlope", lslope, 3) != 0;
         op = toc_op_list_push(list, TOC_OP_LOG_CAMERA);
         if (!op) return TOC_ERROR_OUT_OF_MEMORY;
         op->u.logcam.base = base;
@@ -658,6 +666,37 @@ static toc_result emit_from_ref(const toc_config *cfg, toc_op_list *list,
     return walk(cfg, list, t, invert ^ needinv);
 }
 
+/* A colorspace flagged `isdata: true` is not color-managed: OCIO passes data
+ * colorspaces through unchanged, so ANY conversion touching one (as src or dst)
+ * is the identity. */
+static int cs_is_data(const toc_config *cfg, const char *name) {
+    const toc_node *cs =
+        toc_cfg_find_colorspace(cfg, toc_cfg_resolve_role(cfg, name));
+    return cs && toc_cfg_is_data(cs);
+}
+
+/* Reference domain of a colorspace: 1 = display-referred, 0 = scene-referred.
+ * OCIO v2 has two reference spaces; a plain colorspace<->colorspace conversion
+ * stays within one. Bridging scene<->display requires a view transform (and the
+ * interchange roles), which toc_processor_from_colorspaces does not model - so
+ * such a request is reported UNSUPPORTED rather than silently mis-converted. */
+static int cs_ref_domain(const toc_config *cfg, const char *name) {
+    const char *rn = toc_cfg_resolve_role(cfg, name);
+    const toc_node *cs = toc_cfg_find_colorspace(cfg, rn);
+    if (!cs) return 0;
+    if (toc_node_map_get(cs, "to_display_reference") ||
+        toc_node_map_get(cs, "from_display_reference"))
+        return 1;
+    if (toc_node_map_get(cs, "to_scene_reference") ||
+        toc_node_map_get(cs, "from_scene_reference") ||
+        toc_node_map_get(cs, "to_reference") ||
+        toc_node_map_get(cs, "from_reference"))
+        return 0;
+    /* No explicit transform (the colorspace *is* a reference): classify by the
+     * section it was declared in. */
+    return toc_cfg_cs_in_display_section(cfg, rn);
+}
+
 /* ---- public builders ----------------------------------------------------- */
 static toc_op_list *new_list(const toc_allocator *a) {
     toc_op_list *l = (toc_op_list *)toc_malloc(a, sizeof(*l));
@@ -678,7 +717,29 @@ toc_result toc_processor_from_colorspaces(const toc_config *cfg, const char *src
     *out = NULL;
     list = new_list(a);
     if (!list) return TOC_ERROR_OUT_OF_MEMORY;
-    rc = emit_to_ref(cfg, list, src, 0);
+    if (cs_is_data(cfg, src) || cs_is_data(cfg, dst)) {
+        *out = list; /* data colorspace -> identity passthrough */
+        return TOC_SUCCESS;
+    }
+    rc = emit_to_ref(cfg, list, src, 0); /* src -> its own (scene or display) ref */
+    if (TOC_OK(rc) && cs_ref_domain(cfg, src) != cs_ref_domain(cfg, dst)) {
+        /* Bridge scene<->display via the config's default view transform, the way
+         * OCIO's getProcessor connects the two reference spaces. */
+        const toc_node *vt = toc_cfg_default_view_transform(cfg);
+        const toc_node *tf = NULL;
+        int vt_inv = (cs_ref_domain(cfg, src) == 1); /* display src -> invert VT */
+        if (vt) {
+            tf = toc_node_map_get(vt, "from_scene_reference");
+            if (!tf) tf = toc_node_map_get(vt, "from_reference");
+            if (!tf) {
+                tf = toc_node_map_get(vt, "to_scene_reference");
+                if (!tf) tf = toc_node_map_get(vt, "to_reference");
+                vt_inv = !vt_inv;
+            }
+        }
+        if (!tf) rc = TOC_ERROR_UNSUPPORTED;
+        else rc = walk(cfg, list, tf, vt_inv);
+    }
     if (TOC_OK(rc)) rc = emit_from_ref(cfg, list, dst, 0);
     if (!TOC_OK(rc)) {
         toc_op_list_free(list);
@@ -705,10 +766,32 @@ toc_result toc_processor_from_display_view(const toc_config *cfg,
     views = d ? toc_node_map_get(d, display) : NULL;
     if (!views || views->kind != TOC_NODE_SEQ) return TOC_ERROR_NOT_FOUND;
     vnode = NULL;
-    for (i = 0; i < views->n_items; ++i) {
-        const char *vn = toc_node_scalar(toc_node_map_get(views->items[i],
-                                                          "name"));
-        if (vn && strcmp(vn, view) == 0) { vnode = views->items[i]; break; }
+    for (i = 0; i < views->n_items && !vnode; ++i) {
+        const toc_node *it = views->items[i];
+        if (it->kind == TOC_NODE_SEQ) {
+            /* `!<Views> [name, ...]` references views defined in shared_views. */
+            size_t j;
+            for (j = 0; j < it->n_items; ++j) {
+                const char *nm = toc_node_scalar(it->items[j]);
+                if (nm && strcmp(nm, view) == 0) {
+                    const toc_node *sv = toc_node_map_get(cfg->root, "shared_views");
+                    size_t k;
+                    if (sv && sv->kind == TOC_NODE_SEQ)
+                        for (k = 0; k < sv->n_items; ++k) {
+                            const char *svn = toc_node_scalar(
+                                toc_node_map_get(sv->items[k], "name"));
+                            if (svn && strcmp(svn, view) == 0) {
+                                vnode = sv->items[k];
+                                break;
+                            }
+                        }
+                    break;
+                }
+            }
+        } else {
+            const char *vn = toc_node_scalar(toc_node_map_get(it, "name"));
+            if (vn && strcmp(vn, view) == 0) vnode = it;
+        }
     }
     if (!vnode) return TOC_ERROR_NOT_FOUND;
     /* Determine view type, build pipeline.
@@ -720,6 +803,12 @@ toc_result toc_processor_from_display_view(const toc_config *cfg,
     if (!a) a = toc_default_allocator();
     list = new_list(a);
     if (!list) return TOC_ERROR_OUT_OF_MEMORY;
+    /* A view onto a data colorspace (e.g. "Raw"), or a data source, is an
+     * identity passthrough - data is never color-managed. */
+    if (cs_is_data(cfg, src_cs) || (view_cs && cs_is_data(cfg, view_cs))) {
+        *out = list;
+        return TOC_SUCCESS;
+    }
     /* 1. src -> reference */
     rc = emit_to_ref(cfg, list, src_cs, 0);
     if (!TOC_OK(rc)) goto fail;
@@ -749,19 +838,43 @@ toc_result toc_processor_from_display_view(const toc_config *cfg,
             if (tf) { rc = walk(cfg, list, tf, 0); if (!TOC_OK(rc)) goto fail; }
         }
     }
-    /* 3. apply view_transform (if present) */
+    /* 3. apply view_transform (if present). OCIO v2 ViewTransforms convert the
+     * scene reference to the display reference via from_scene_reference (or the
+     * inverse of to_scene_reference); accept the legacy *_reference too. */
     if (view_vt) {
         const toc_node *vt = toc_cfg_find_view_transform(cfg, view_vt);
         const toc_node *tf;
+        int vt_inv = 0;
         if (!vt) { rc = TOC_ERROR_NOT_FOUND; goto fail; }
-        tf = toc_node_map_get(vt, "from_reference");
-        if (!tf) { rc = TOC_ERROR_UNSUPPORTED; goto fail; }
-        rc = walk(cfg, list, tf, 0);
+        tf = toc_node_map_get(vt, "from_scene_reference");
+        if (!tf) tf = toc_node_map_get(vt, "from_reference");
+        if (!tf) {
+            tf = toc_node_map_get(vt, "to_scene_reference");
+            if (!tf) tf = toc_node_map_get(vt, "to_reference");
+            vt_inv = 1;
+        }
+        if (tf) {
+            rc = walk(cfg, list, tf, vt_inv);
+        } else {
+            /* This VT operates from the display reference (e.g. "Video
+             * (colorimetric)"); bridge scene->display via the default VT, then
+             * apply this VT's display-reference op. */
+            const toc_node *dtf = toc_node_map_get(vt, "from_display_reference");
+            const toc_node *dvt = toc_cfg_default_view_transform(cfg);
+            const toc_node *btf = dvt ? toc_node_map_get(dvt, "from_scene_reference")
+                                      : NULL;
+            if (btf == NULL && dvt) btf = toc_node_map_get(dvt, "from_reference");
+            if (!dtf || !btf) { rc = TOC_ERROR_UNSUPPORTED; goto fail; }
+            rc = walk(cfg, list, btf, 0);             /* scene ref -> display ref */
+            if (TOC_OK(rc)) rc = walk(cfg, list, dtf, 0); /* this VT (display ref) */
+        }
         if (!TOC_OK(rc)) goto fail;
     }
-    /* 4. display colorspace (view_cs for simple, display_colorspace for VT views) */
+    /* 4. display colorspace (view_cs for simple, display_colorspace for VT views).
+     * The token <USE_DISPLAY_NAME> means "the display's own colorspace". */
     view_dc = view_cs ? view_cs
                       : toc_node_scalar(toc_node_map_get(vnode, "display_colorspace"));
+    if (view_dc && strcmp(view_dc, "<USE_DISPLAY_NAME>") == 0) view_dc = display;
     if (view_dc) {
         rc = emit_from_ref(cfg, list, view_dc, 0);
         if (!TOC_OK(rc)) goto fail;

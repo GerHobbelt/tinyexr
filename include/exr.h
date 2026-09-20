@@ -149,6 +149,13 @@ typedef struct exr_header {
     float screen_window_center_y;
     float screen_window_width;
 
+    /* CIE xy primaries + whitepoint, in OpenEXR order:
+     * red.x,red.y, green.x,green.y, blue.x,blue.y, white.x,white.y.
+     * Only valid when has_chromaticities != 0; otherwise consumers default to
+     * Rec.709/sRGB primaries (the OpenEXR default). */
+    uint8_t has_chromaticities;
+    float chromaticities[8];
+
     int32_t num_channels;
     exr_channel *channels; /* sorted by name; owned by the image/reader */
 
@@ -622,6 +629,25 @@ typedef enum exr_simd_caps {
 uint32_t exr_simd_capabilities(void);
 const char *exr_simd_info(void);
 
+/* zlib (DEFLATE) backend used by ZIP/ZIPS/PXR24. The in-tree pure-C codec is
+ * always available; the vendored libdeflate is compiled in for hosted builds
+ * (DEFLATE=auto|libdeflate) and is faster on natural-image data. Freestanding
+ * and WASM builds only ever have the in-tree codec. */
+typedef enum exr_zlib_backend {
+    EXR_ZLIB_AUTO = 0,    /* the build-time default backend */
+    EXR_ZLIB_INTREE,      /* force the in-tree pure-C codec */
+    EXR_ZLIB_LIBDEFLATE   /* force libdeflate (else EXR_ERROR_UNSUPPORTED) */
+} exr_zlib_backend;
+
+/* Select the zlib backend for subsequent (de)compression. Not thread-safe with
+ * concurrent decoding: call before kicking off a decode, not during one.
+ * Returns EXR_ERROR_UNSUPPORTED if libdeflate is requested but not compiled in
+ * (the backend is left unchanged). */
+exr_result exr_zlib_set_backend(exr_zlib_backend backend);
+
+/* Name of the active zlib backend ("in-tree" or "libdeflate"). */
+const char *exr_zlib_backend_name(void);
+
 /* Pixel-format conversion (runtime SIMD-dispatched). */
 void exr_half_to_float(const uint16_t *src, float *dst, size_t count);
 void exr_float_to_half(const float *src, uint16_t *dst, size_t count);
@@ -742,6 +768,13 @@ typedef enum exr_colorspace {
  * primaries to `to` primaries (Bradford-adapted across whitepoints). */
 exr_result exr_color_matrix(exr_colorspace from, exr_colorspace to, float m[9]);
 
+/* Fill `yw` with the RGB luminance weights (summing to 1) derived from CIE
+ * chromaticities (OpenEXR order: red/green/blue/white xy). When `present` is 0
+ * or the primaries are degenerate, falls back to Rec.709 (0.2126, 0.7152,
+ * 0.0722). Pass `&header.chromaticities[0]` and `header.has_chromaticities`. */
+exr_result exr_luminance_weights(const float chroma[8], int present,
+                                 float yw[3]);
+
 /* Apply a row-major 3x3 to interleaved float RGB(A); alpha passes through.
  * In-place allowed. */
 exr_result exr_color_apply_matrix(float *dst, const float *src,
@@ -800,6 +833,22 @@ exr_result exr_lut3d_parse_cube(const exr_allocator *a, const char *text,
 exr_result exr_part_to_rgba_float(const exr_allocator *a, const exr_part *part,
                                   float **out, int *out_width, int *out_height,
                                   int *out_channels);
+
+/* True (1) when `part` is a luminance-chroma image: a full-res `Y` plus
+ * subsampled `RY`/`BY` chroma and no direct `R`/`G`/`B` channels. Such parts
+ * carry color that exr_part_to_rgba_float leaves as raw Y/RY/BY (grayscale to a
+ * naive viewer); use exr_part_yc_to_rgba_float to reconstruct true color. */
+int exr_part_is_luminance_chroma(const exr_part *part);
+
+/* Reconstruct a luminance-chroma (`Y`/`RY`/`BY`) part into a freshly allocated
+ * interleaved RGBA float buffer (`w*h*4`, alpha = `A` channel or 1.0). Chroma is
+ * upsampled to full resolution and combined with Y using luminance weights from
+ * the header's chromaticities (Rec.709 when absent). *out must be freed with the
+ * same allocator. Returns EXR_ERROR_INVALID_ARGUMENT if the part is not
+ * luminance-chroma (test with exr_part_is_luminance_chroma first). */
+exr_result exr_part_yc_to_rgba_float(const exr_allocator *a,
+                                     const exr_part *part, float **out,
+                                     int *out_width, int *out_height);
 
 /* Scatter an interleaved float buffer into freshly allocated planar channels of
  * `dst_type`, filling `out` (a single-part-style exr_part: header.channels and

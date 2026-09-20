@@ -479,6 +479,7 @@ typedef struct {
     uint8_t **payloads;
     size_t *sizes;
     exr_result *rc;
+    int job_base; /* chunk index of job 0 (1 = chunk 0 done inline; 0 = all parallel) */
 } sl_enc_ctx;
 
 static exr_result encode_scanline_one(sl_enc_ctx *c, uint32_t ci) {
@@ -510,7 +511,7 @@ static exr_result encode_scanline_one(sl_enc_ctx *c, uint32_t ci) {
 
 static void encode_scanline_job(void *vc, int job) {
     sl_enc_ctx *c = (sl_enc_ctx *)vc;
-    uint32_t ci = (uint32_t)job + 1u; /* chunk 0 compressed inline first */
+    uint32_t ci = (uint32_t)job + (uint32_t)c->job_base;
     c->rc[ci] = encode_scanline_one(c, ci);
 }
 
@@ -526,6 +527,7 @@ typedef struct {
     uint8_t **payloads;
     size_t *sizes;
     exr_result *rc;
+    int job_base; /* tile index of job 0 (1 = tile 0 done inline; 0 = all parallel) */
 } tl_enc_ctx;
 
 static exr_result encode_tile_one(tl_enc_ctx *c, uint32_t idx) {
@@ -563,8 +565,26 @@ static exr_result encode_tile_one(tl_enc_ctx *c, uint32_t idx) {
 
 static void encode_tile_job(void *vc, int job) {
     tl_enc_ctx *c = (tl_enc_ctx *)vc;
-    uint32_t idx = (uint32_t)job + 1u; /* tile 0 compressed inline first */
+    uint32_t idx = (uint32_t)job + (uint32_t)c->job_base;
     c->rc[idx] = encode_tile_one(c, idx);
+}
+
+/* Codecs whose first-use lazy global init is not thread-safe must have it warmed
+ * on one thread before the workers run; then all chunks/tiles can be compressed
+ * in parallel (no serial chunk 0). Currently only HTJ2K (the VLC/UVLC encode
+ * tables). Returns 1 if warmed (=> caller may parallelize all jobs). */
+static int encode_warmup_for_parallel(exr_compression comp) {
+    if (comp == EXR_COMPRESSION_HTJ2K256 || comp == EXR_COMPRESSION_HTJ2K32) {
+        /* Warm every process-global lazy init the workers could touch, on this
+         * one thread, so the parallel encode only reads them (no data race):
+         * the SIMD-tier cache, the SIMD function-pointer table, and the HTJ2K
+         * VLC/UVLC encode tables. */
+        exr_cpu_caps();
+        exr_simd_init();
+        exr_jph_warmup_encode_tables();
+        return 1;
+    }
+    return 0;
 }
 
 /* Two-phase scanline encode: compress all chunks in parallel into per-chunk
@@ -594,10 +614,21 @@ static exr_result encode_parallel_scanline(
         ec.images = (void *const *)pt->images; ec.xmin = xmin; ec.ymin = ymin;
         ec.ymax = ymax; ec.width = pt->width; ec.lpb = lpb; ec.comp = comp;
         ec.payloads = payloads; ec.sizes = sizes; ec.rc = rcs;
-        rcs[0] = encode_scanline_one(&ec, 0); /* warm lazy inits */
-        if (EXR_OK(rcs[0]))
-            exr_parallel_for(exr_get_num_threads(), (int)(n - 1),
+        if (encode_warmup_for_parallel(comp)) {
+            /* Lazy inits warmed on this thread: compress every chunk in parallel
+             * (no serial chunk 0), so scaling is not capped by one serial chunk. */
+            ec.job_base = 0;
+            exr_parallel_for(exr_get_num_threads(), (int)n,
                              encode_scanline_job, &ec);
+        } else {
+            /* Compress chunk 0 inline first to warm any lazy init the codec does,
+             * then run the rest in parallel. */
+            ec.job_base = 1;
+            rcs[0] = encode_scanline_one(&ec, 0);
+            if (EXR_OK(rcs[0]))
+                exr_parallel_for(exr_get_num_threads(), (int)(n - 1),
+                                 encode_scanline_job, &ec);
+        }
     }
     for (ci = 0; ci < n; ++ci)
         if (!EXR_OK(rcs[ci])) { rc = rcs[ci]; break; }
@@ -645,10 +676,17 @@ static exr_result encode_parallel_tiled(
         ec.width = pt->width; ec.height = pt->height; ec.tx = tx; ec.ty = ty;
         ec.nxt = nxt; ec.comp = comp;
         ec.payloads = payloads; ec.sizes = sizes; ec.rc = rcs;
-        rcs[0] = encode_tile_one(&ec, 0); /* warm lazy inits */
-        if (EXR_OK(rcs[0]))
-            exr_parallel_for(exr_get_num_threads(), (int)(n - 1),
+        if (encode_warmup_for_parallel(comp)) {
+            ec.job_base = 0;
+            exr_parallel_for(exr_get_num_threads(), (int)n,
                              encode_tile_job, &ec);
+        } else {
+            ec.job_base = 1;
+            rcs[0] = encode_tile_one(&ec, 0); /* warm lazy inits */
+            if (EXR_OK(rcs[0]))
+                exr_parallel_for(exr_get_num_threads(), (int)(n - 1),
+                                 encode_tile_job, &ec);
+        }
     }
     for (idx = 0; idx < n; ++idx)
         if (!EXR_OK(rcs[idx])) { rc = rcs[idx]; break; }
@@ -1211,7 +1249,18 @@ struct exr_writer {
     uint64_t *soff_pos;    /* [part] file offset of the reserved offset table */
     uint64_t *smax_pos;    /* [part] file offset of maxSamplesPerPixel value (deep) */
     int32_t *smax;         /* [part] running max sample count (deep) */
+    /* Optional GPU HTJ2K block-encode hook (set by the GPU backend); used by
+     * exr_writer_write_scanline_block_canon for HTJ2K parts. */
+    exr_jph_gpu_block_encode_fn gpu_jph_fn;
+    void *gpu_jph_user;
 };
+
+void exr_writer_set_gpu_jph_encoder(exr_writer *w,
+                                    exr_jph_gpu_block_encode_fn fn, void *user) {
+    if (!w) return;
+    w->gpu_jph_fn = fn;
+    w->gpu_jph_user = user;
+}
 
 /* Internal: the allocator a writer was created with (used by exr_stdio.c to free
  * buffers returned by exr_writer_finalize_to_memory). */
@@ -1697,6 +1746,75 @@ exr_result exr_writer_write_scanline_block(exr_writer *w, int32_t part,
     rc = stream_emit_flat(w, part, ci, 0, 0, 0, 0, 0, y0, payload, payload_size);
     exr_free(a, payload);
     return rc;
+}
+
+/* Internal: stream one scanline block from an already-gathered canonical block
+ * (per-scanline, then per-channel in sorted order). Used by the GPU backend,
+ * which performs the planar->canonical gather on the device. `block` must be
+ * exactly the size exr_block_uncompressed_size() reports for this block. */
+exr_result exr_writer_write_scanline_block_canon(exr_writer *w, int32_t part,
+                                                 int32_t y0, const uint8_t *block,
+                                                 size_t block_size) {
+    const exr_part *pt;
+    const exr_header *h;
+    const exr_allocator *a;
+    int ymin, ymax, lpb, nlines;
+    uint32_t ci;
+    size_t blk_size, payload_size = 0;
+    uint8_t *payload = NULL;
+    exr_codec_ctx cx;
+    exr_result rc;
+
+    if (!w || !block || !w->streaming) return EXR_ERROR_INVALID_ARGUMENT;
+    if (part < 0 || part >= w->num_parts) return EXR_ERROR_INVALID_ARGUMENT;
+    pt = &w->parts[part];
+    h = &pt->header;
+    a = &w->alloc;
+    if (h->tiled || header_is_deep(h)) return EXR_ERROR_INVALID_ARGUMENT;
+    ymin = h->data_window.min_y;
+    ymax = h->data_window.max_y;
+    lpb = exr_lines_per_block(w->scomp);
+    if (y0 < ymin || y0 > ymax || ((y0 - ymin) % lpb) != 0)
+        return EXR_ERROR_INVALID_ARGUMENT;
+    ci = (uint32_t)((y0 - ymin) / lpb);
+    if (ci >= w->schunk[part]) return EXR_ERROR_INVALID_ARGUMENT;
+    nlines = lpb;
+    if (y0 + nlines - 1 > ymax) nlines = ymax - y0 + 1;
+
+    rc = exr_block_uncompressed_size(h->channels, h->num_channels,
+                                     h->data_window.min_x, y0, pt->width, nlines,
+                                     &blk_size);
+    if (!EXR_OK(rc)) return rc;
+    if (block_size != blk_size) return EXR_ERROR_INVALID_ARGUMENT;
+    cx.alloc = a;
+    cx.compression = w->scomp;
+    cx.channels = w->ssorted[part];
+    cx.num_channels = h->num_channels;
+    cx.x = h->data_window.min_x;
+    cx.y = y0;
+    cx.width = pt->width;
+    cx.num_lines = nlines;
+    rc = EXR_ERROR_UNSUPPORTED;
+    if (w->gpu_jph_fn &&
+        (w->scomp == EXR_COMPRESSION_HTJ2K256 ||
+         w->scomp == EXR_COMPRESSION_HTJ2K32)) {
+        rc = exr_jph_compress_gpu(&cx, block, blk_size, &payload, &payload_size,
+                                  w->gpu_jph_fn, w->gpu_jph_user);
+    }
+    if (rc == EXR_ERROR_UNSUPPORTED) /* not HTJ2K, or a non-i32 block: CPU path */
+        rc = exr_compress_block(&cx, block, blk_size, &payload, &payload_size);
+    if (!EXR_OK(rc)) return rc;
+    rc = stream_emit_flat(w, part, ci, 0, 0, 0, 0, 0, y0, payload, payload_size);
+    exr_free(a, payload);
+    return rc;
+}
+
+/* Internal: the sorted channel order the writer uses for `part` (maps sorted
+ * output position -> header.channels index), so the GPU gather can build the
+ * canonical block in the same order. Returns NULL if part is out of range. */
+const int *exr_writer_sorted_order(exr_writer *w, int32_t part) {
+    if (!w || part < 0 || part >= w->num_parts) return NULL;
+    return w->sorder ? w->sorder[part] : NULL;
 }
 
 exr_result exr_writer_write_tile(exr_writer *w, int32_t part, int32_t tile_x,

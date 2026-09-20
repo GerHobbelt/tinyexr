@@ -74,6 +74,18 @@ static inline int exr_add_ovf(size_t a, size_t b, size_t *out) {
 #endif
 }
 
+/* Function attribute that suppresses UBSan's signed-integer-overflow check.
+ * The reversible 5/3 wavelet lifting steps are defined to wrap modulo 2^64
+ * (two's complement); this is exact for real coefficient ranges and only trips
+ * the sanitizer on the synthetic random-int64 parity inputs. The attribute
+ * changes no generated code, so annotated transforms stay bit-identical; other
+ * UBSan checks (bounds, null, etc.) remain active inside the function. */
+#if defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 8)
+#define EXR_NO_SANITIZE_SIO __attribute__((no_sanitize("signed-integer-overflow")))
+#else
+#define EXR_NO_SANITIZE_SIO
+#endif
+
 /* ============================================================================
  * Little-endian readers / writers (EXR is always little-endian on disk)
  * ========================================================================== */
@@ -212,6 +224,14 @@ exr_result jph_inverse_53_i32_avx2(const int32_t *low, size_t low_count,
                                    const int32_t *high, size_t high_count,
                                    int32_t *out, size_t out_count,
                                    int64_t *ev, int64_t *od);
+/* Internal bounded all-HALF decode variants: same math as the checked kernels,
+ * but omit int32 overflow tests when the JPH profile's component precision keeps
+ * reconstructed coefficients safely inside int32. */
+exr_result jph_inverse_53_i32_bounded_avx2(const int32_t *low, size_t low_count,
+                                           const int32_t *high,
+                                           size_t high_count, int32_t *out,
+                                           size_t out_count, int64_t *ev,
+                                           int64_t *od);
 /* Forward reversible 5/3 1D lifting (int64), bit-identical to the scalar
  * jph_forward_53_i64; ev/od are caller scratch of >= ceil(n/2) int64 each. */
 exr_result jph_forward_53_i64_avx2(const int64_t *src, size_t n, int64_t *low,
@@ -223,6 +243,9 @@ exr_result jph_forward_53_i64_avx2(const int64_t *src, size_t n, int64_t *low,
 exr_result jph_inverse_53_vert_i32_avx2(const int32_t *temp, size_t rw,
                                         size_t lh, size_t hh,
                                         int32_t *data, size_t width);
+exr_result jph_inverse_53_vert_i32_bounded_avx2(const int32_t *temp, size_t rw,
+                                               size_t lh, size_t hh,
+                                               int32_t *data, size_t width);
 /* AVX2 inverse reversible 5/3 1D (int64, float/32-bit decode path); bit-identical
  * to jph_inverse_53_i64. ev/od are caller scratch (>= low/high counts). */
 exr_result jph_inverse_53_i64_avx2(const int64_t *low, size_t low_count,
@@ -238,12 +261,116 @@ exr_result jph_inverse_53_vert_i64_avx2(const int64_t *temp, size_t rw,
  * to the scalar extraction loop in jph_decode_block. */
 void jph_extract_signmag_i32_to_i64_avx2(int64_t *out, const uint32_t *buf,
                                          size_t n, unsigned shift);
+/* Same conversion for the all-HALF/int32 decode path; stores signed int32
+ * coefficients directly, avoiding an int64 codeblock round trip. */
+void jph_extract_signmag_i32_to_i32_avx2(int32_t *out, const uint32_t *buf,
+                                         size_t n, unsigned shift);
+/* AVX2 cleanup-pass MagSgn reconstruction for the <=15-bit path. Decodes four
+ * HT quads (8 columns x 2 rows) from interleaved scratch inf/u words and writes
+ * OpenJPH sign-magnitude codeblock words. bottom_vn receives left/right bottom
+ * v_n values for each quad: L0,R0,L1,R1,L2,R2,L3,R3. */
+void jph_decode_four_quad16_avx2(uint32_t *row0, uint32_t *row1,
+                                 uint16_t bottom_vn[8],
+                                 const uint16_t *inf_uq,
+                                 const uint32_t u_q[4],
+                                 const uint64_t *bits, uint64_t real_bits,
+                                 uint64_t *cursor, unsigned p16);
+typedef struct {
+    const uint8_t *data;
+    uint8_t tmp[48];
+    uint32_t bits;
+    uint32_t unstuff;
+    int size;
+} JphFrwdAvx2;
+void jph_frwd_init_ff_avx2(JphFrwdAvx2 *msp, const uint8_t *data, int size);
+void jph_decode_four_quad16_frwd_avx2(uint32_t *row0, uint32_t *row1,
+                                      uint16_t bottom_vn[8],
+                                      const uint16_t *inf_uq,
+                                      const uint32_t u_q[4],
+                                      JphFrwdAvx2 *magsgn,
+                                      unsigned p16);
+void jph_decode_two_quad32_frwd_avx2(uint32_t *row0, uint32_t *row1,
+                                     uint32_t bottom_vn[4],
+                                     const uint16_t *inf_uq,
+                                     const uint32_t u_q[2],
+                                     JphFrwdAvx2 *magsgn, unsigned p);
 /* AVX2 vertical (column) forward reversible 5/3 (int64), row-wise across all
  * columns; bit-identical to jph_forward_53_vert_i64. data's interleaved rows
  * (stride width) -> subband layout in temp (stride rw): lh low-rows, hh high. */
 exr_result jph_forward_53_vert_i64_avx2(const int64_t *data, size_t width,
                                         size_t rw, size_t lh, size_t hh,
                                         int64_t *temp);
+/* AVX2 forward reversible 5/3 1D lifting (int32, int64 intermediates, 8 lanes).
+ * Bit-identical to jph_forward_53_i32; deinterleaves int32 src -> int64 ev/od
+ * scratch, then predict (high) and update (low) with floor-div-by-2^s. Outputs
+ * int32 low/high arrays. ev/od are caller scratch of >= ceil(n/2) int64 each. */
+exr_result jph_forward_53_i32_avx2(const int32_t *src, size_t n, int32_t *low,
+                                    size_t low_count, int32_t *high,
+                                    size_t high_count, int64_t *ev, int64_t *od);
+/* AVX2 vertical (column) forward reversible 5/3 (int32), row-wise across all
+ * columns; bit-identical to jph_forward_53_vert_i32. data's interleaved rows
+ * (stride width) -> subband layout in temp (stride rw): lh low-rows, hh high. */
+exr_result jph_forward_53_vert_i32_avx2(const int32_t *data, size_t width,
+                                        size_t rw, size_t lh, size_t hh,
+                                        int32_t *temp);
+/* SSE2 int32 quad sample preparation for the HT encode block.
+ * Processes 4 samples of a 2x2 quad at once via SSE2 load/shuffle/compute.
+ * Updates rho (|=), e_qmax (max), e_q[4], s[4], and max_val in one pass. */
+void jph_encode_prepare_quad_i32_sse2(const int64_t *plane_data,
+                                       uint32_t stride, uint32_t x0,
+                                       uint32_t y0, uint32_t x, uint32_t y,
+                                       uint32_t shift, uint32_t p,
+                                       int *rho, int *e_qmax, int e_q[4],
+                                       uint64_t s[4], uint64_t *max_val);
+void jph_encode_prepare_quad_from32_sse2(const int32_t *plane_data,
+                                          uint32_t stride, uint32_t x0,
+                                          uint32_t y0, uint32_t x, uint32_t y,
+                                          uint32_t shift, uint32_t p,
+                                          int *rho, int *e_qmax, int e_q[4],
+                                          uint64_t s[4], uint64_t *max_val);
+/* AVX2 8-quad (16x2) sample preparation: computes e_q/s/rho/e_qmax for 8 quads
+ * from a zero-padded contiguous tile (row0[16] then row1[16]), folding the max
+ * |coefficient| into *max_val. Outputs are sample-major: index [k*8+q] is sample
+ * k (0..3) of quad q (0..7). Bit-identical to jph_prep_quad_body_sse2 per quad. */
+void jph_enc_proc_pixel_8q_avx2(const int32_t *tile, uint32_t shift, uint32_t p,
+                                int32_t eq[32], int32_t sarr[32],
+                                int32_t rho8[8], int32_t eqmax8[8],
+                                uint64_t *max_val);
+/* AVX2 8-quad context kernel: vectorizes the per-quad bookkeeping (c_q, eps,
+ * kappa, U_q, u_q) and the E/CX line-state updates, bit-identical to the scalar
+ * encoder. e_line/cx_line are a flat int32 line-state indexed by quad position
+ * (zero-init at codeblock start, sized n_vec*8 + slack). initial!=0 -> y=0 row
+ * (proc_cq1, kappa==1); else main rows (proc_cq2, max_e-derived kappa). */
+void jph_enc_context_8q_avx2(int initial, const int32_t eq[32],
+                             const int32_t rho8[8], const int32_t eqmax8[8],
+                             int32_t *e_line, int32_t *cx_line, uint32_t xv,
+                             int *prev_cq, int *prev_e, int *prev_cx,
+                             int32_t cq8[8], int32_t eps8[8], int32_t uq8[8],
+                             int32_t Uq8[8]);
+/* AVX2 8-quad MagSgn-prep kernel: computes m_n and the masked magnitude
+ * cwd_s = s & ((1<<m_n)-1) for all 8 quads (sample-major [k*8+q]); the serial
+ * pair assembly + bit-append stay with the caller. i32 path only (m_n<=30). */
+void jph_enc_ms_prep_8q_avx2(const int32_t rho8[8], const int32_t Uq8[8],
+                             const int32_t tuple8[8], const int32_t sarr[32],
+                             int32_t m_n[32], int32_t cwd_s[32]);
+/* Half-pixel deinterleave: bytes → int32 (SSE2/AVX2), sign-extending LE uint16.
+ * Returns the number of pixels processed by the SIMD loop. */
+size_t jph_deinterleave_half_sse2(const uint8_t *src, int32_t *dst,
+                                   size_t count);
+size_t jph_deinterleave_half_avx2(const uint8_t *src, int32_t *dst,
+                                   size_t count);
+/* Reversible Color Transform (int32, all-HALF path). Each processes vectors
+ * whose three inputs are all within +/-2^28 (where the int32 math is exact and
+ * cannot overflow int32), in place; returns the element count processed. The
+ * caller finishes the remainder (and the precise int32 overflow check) scalar. */
+size_t jph_inverse_rct_i32_sse2(int32_t *c0, int32_t *c1, int32_t *c2,
+                                size_t count);
+size_t jph_inverse_rct_i32_avx2(int32_t *c0, int32_t *c1, int32_t *c2,
+                                size_t count);
+size_t jph_forward_rct_i32_sse2(int32_t *c0, int32_t *c1, int32_t *c2,
+                                size_t count);
+size_t jph_forward_rct_i32_avx2(int32_t *c0, int32_t *c1, int32_t *c2,
+                                size_t count);
 #endif
 
 /* Scalar references for the JPH NLT type-3 involution (v<0 -> -v-bias). */
@@ -574,6 +701,35 @@ typedef struct exr_codec_ctx {
 exr_result exr_decompress_block(const exr_codec_ctx *ctx, const uint8_t *src,
                                 size_t src_size, uint8_t *dst, size_t dst_size);
 
+/* Fetch the raw compressed chunk bytes + codec ctx for block `idx` without
+ * decompressing (used by the GPU backend for device-side reconstruction). The
+ * returned pointer is valid until the next reader fetch. */
+exr_result exr_reader_block_raw(exr_reader *r, int32_t part, uint32_t idx,
+                                exr_block_info *out_bi, const uint8_t **out_cdata,
+                                size_t *out_csize, exr_codec_ctx *out_ctx);
+
+/* Streaming encode seam for the GPU backend: write one scanline block from a
+ * pre-gathered canonical buffer (the device does the planar->canonical gather),
+ * and query the writer's sorted channel order. Declared in exr_writer.c. */
+exr_result exr_writer_write_scanline_block_canon(exr_writer *w, int32_t part,
+                                                 int32_t y0, const uint8_t *block,
+                                                 size_t block_size);
+const int *exr_writer_sorted_order(exr_writer *w, int32_t part);
+
+/* Install a GPU HTJ2K block-encode hook; exr_writer_write_scanline_block_canon
+ * then routes HTJ2K parts through it (falling back to the CPU coder per-chunk
+ * for non-i32-eligible blocks). Declared after exr_jph_gpu_block_encode_fn. */
+struct exr_jph_enc_plan;
+typedef exr_result (*exr_jph_gpu_block_encode_fn)(void *user,
+                                                  const struct exr_jph_enc_plan *plan,
+                                                  unsigned char *out_bytes,
+                                                  unsigned int out_stride,
+                                                  unsigned int *out_missing,
+                                                  unsigned int *out_len0,
+                                                  unsigned int *out_size);
+void exr_writer_set_gpu_jph_encoder(exr_writer *w,
+                                    exr_jph_gpu_block_encode_fn fn, void *user);
+
 /* Uncompressed byte size of one scanline block / tile region. */
 exr_result exr_block_uncompressed_size(const exr_channel *channels,
                                        int32_t num_channels, int32_t x,
@@ -586,6 +742,15 @@ exr_result exr_rle_decompress(const exr_allocator *a, const uint8_t *src,
                               size_t src_size, uint8_t *dst, size_t dst_size);
 exr_result exr_zip_decompress(const exr_allocator *a, const uint8_t *src,
                               size_t src_size, uint8_t *dst, size_t dst_size);
+
+/* Entropy-decode only: produce the pre-reconstruction buffer (after inflate /
+ * RLE-expand, BEFORE the byte predictor + even/odd deinterleave). `dst` must be
+ * dst_size bytes. The GPU backend uses these so the reconstruction passes can
+ * run as kernels; the CPU path keeps doing predictor+interleave on the host. */
+exr_result exr_zip_inflate_only(const uint8_t *src, size_t src_size,
+                                uint8_t *dst, size_t dst_size);
+exr_result exr_rle_expand_only(const uint8_t *src, size_t src_size,
+                               uint8_t *dst, size_t dst_size);
 exr_result exr_pxr24_decompress(const exr_codec_ctx *ctx, const uint8_t *src,
                                 size_t src_size, uint8_t *dst, size_t dst_size);
 exr_result exr_piz_decompress(const exr_codec_ctx *ctx, const uint8_t *src,
@@ -597,6 +762,115 @@ exr_result exr_zstd_decompress(const exr_allocator *a, const uint8_t *src,
                                size_t src_size, uint8_t *dst, size_t dst_size);
 exr_result exr_jph_decompress(const exr_codec_ctx *ctx, const uint8_t *src,
                               size_t src_size, uint8_t *dst, size_t dst_size);
+
+/* ---- GPU HTJ2K seam ------------------------------------------------------
+ * The HT block coder is bit-serial within a code-block but embarrassingly
+ * parallel across code-blocks, so the GPU backend collects every code-block of
+ * a chunk into a flat plan, decodes them all in one kernel launch (one thread
+ * per block), then the CPU scatters + runs the inverse transforms. These
+ * read-only seams expose the plan, the (runtime-built) HT tables, and a single
+ * reference/fallback block decode, without leaking the file-local jph structs.
+ */
+typedef struct exr_jph_cb_record {
+    uint32_t width, height;       /* code-block dims (<=128 x <=32) */
+    uint32_t missing_msbs, active_passes;
+    uint32_t length0, length1;    /* lcup, len2 */
+    uint32_t kmax;
+    uint32_t comp, res, band, x0, y0;
+    uint32_t dst_row, dst_col;    /* origin in the component plane */
+    uint32_t plane_w, plane_h;    /* component plane dims */
+    size_t   data_offset;         /* byte offset into plan->data */
+    size_t   data_size;
+    int      i32_eligible;        /* missing_msbs<30 && kmax<=30 (else CPU) */
+} exr_jph_cb_record;
+
+typedef struct exr_jph_cb_plan {
+    exr_jph_cb_record *records;
+    size_t num_records;
+    uint8_t *data;                /* contiguous copy of the tile codestream */
+    size_t data_size;
+    int num_components;
+} exr_jph_cb_plan;
+
+/* Parse an HTJ2K chunk and collect its code-block plan (no decode). */
+exr_result exr_jph_collect_codeblocks(const exr_codec_ctx *ctx,
+                                      const uint8_t *src, size_t src_size,
+                                      exr_jph_cb_plan *out);
+void exr_jph_cb_plan_free(const exr_allocator *a, exr_jph_cb_plan *plan);
+
+/* Whole-image GPU decode: the backend supplies a batch block-decode callback
+ * (decodes every i32-eligible record of `plan` into `coeffs` at tile_offsets[i],
+ * stride (width+7)&~7). exr_jph_decompress_gpu collects the chunk's plan, calls
+ * the hook, scatters the tiles into the component planes, then runs the inverse
+ * transforms + store on the CPU. Returns EXR_ERROR_UNSUPPORTED (so the caller
+ * falls back to exr_jph_decompress) when any code-block is not i32-eligible. */
+typedef exr_result (*exr_jph_gpu_block_decode_fn)(void *user,
+                                                  const exr_jph_cb_plan *plan,
+                                                  const size_t *tile_offsets,
+                                                  size_t coeff_count,
+                                                  int32_t *coeffs);
+exr_result exr_jph_decompress_gpu(const exr_codec_ctx *ctx, const uint8_t *src,
+                                  size_t src_size, uint8_t *dst, size_t dst_size,
+                                  exr_jph_gpu_block_decode_fn fn, void *user);
+
+/* The runtime-built HT VLC tables (opaque to the backend; layout: four arrays
+ * vlc_tbl0[1024], vlc_tbl1[1024], uvlc_tbl0[320], uvlc_tbl1[256], all uint16).
+ * Returns pointers + element counts so the backend can upload them verbatim. */
+exr_result exr_jph_ht_tables(const uint16_t **vlc0, const uint16_t **vlc1,
+                             const uint16_t **uvlc0, const uint16_t **uvlc1);
+
+/* Reference/fallback: decode one code-block (i32 path) into out[stride*h]. */
+exr_result exr_jph_decode_one_block_i32(const exr_jph_cb_record *rec,
+                                        const uint8_t *data, int32_t *out,
+                                        uint32_t out_stride);
+
+/* ---- GPU HTJ2K encode seam ----------------------------------------------
+ * Symmetric to the decode plan: collect every code-block's (post-transform)
+ * int32 coefficient tile + dims/kmax so the GPU can encode them all in one
+ * launch, then the CPU assembles the codestream. */
+typedef struct exr_jph_enc_record {
+    uint32_t width, height, kmax;
+    int      plane_is_i32;        /* all-HALF i32 plane (GPU-eligible path) */
+    size_t   coeff_offset;        /* int32 element offset into plan->coeffs */
+} exr_jph_enc_record;
+
+typedef struct exr_jph_enc_plan {
+    exr_jph_enc_record *records;
+    size_t num_records;
+    int32_t *coeffs;              /* concatenated cb_w*cb_h tiles, stride=cb_w */
+    size_t coeff_count;
+} exr_jph_enc_plan;
+
+/* Run the forward transforms for one EXR block and collect its code-block
+ * encode plan (no entropy coding / codestream emission). */
+exr_result exr_jph_collect_encode_blocks(const exr_codec_ctx *ctx,
+                                         const uint8_t *block, size_t n,
+                                         exr_jph_enc_plan *out);
+void exr_jph_enc_plan_free(const exr_allocator *a, exr_jph_enc_plan *plan);
+
+/* Runtime-built HT encode tables: g_vlc_enc_tbl0/1 (uint16[2048] each) and the
+ * uvlc table packed as uint8[75*6] = {pre,pre_len,suf,suf_len,ext,ext_len}. */
+exr_result exr_jph_ht_enc_tables(const uint16_t **vlc0, const uint16_t **vlc1,
+                                 const uint8_t **uvlc_packed);
+
+/* Reference/fallback: encode one i32 code-block (cleanup pass) from its tile. */
+exr_result exr_jph_encode_one_block_i32(const exr_jph_enc_record *rec,
+                                        const int32_t *coeffs, uint8_t *out,
+                                        size_t out_cap, uint32_t *out_missing,
+                                        uint32_t *out_len0, size_t *out_size);
+
+/* Whole-image GPU encode: the backend supplies a batch block-encode callback
+ * (encodes every i32-eligible record of `plan`; block i's cleanup bytes land at
+ * out_bytes + i*out_stride, with per-block missing/len0/size in the out arrays).
+ * exr_jph_compress_gpu builds the planes + plan, calls the hook, then assembles
+ * the codestream from the GPU block outputs on the CPU. Returns
+ * EXR_ERROR_UNSUPPORTED (caller falls back to exr_jph_compress) when any
+ * code-block is not i32-eligible. (exr_jph_gpu_block_encode_fn is declared
+ * above, near exr_writer_set_gpu_jph_encoder.) */
+exr_result exr_jph_compress_gpu(const exr_codec_ctx *ctx, const uint8_t *block,
+                                size_t n, uint8_t **out_data, size_t *out_size,
+                                exr_jph_gpu_block_encode_fn fn, void *user);
+
 exr_result exr_jph_inverse_53_i32(const int32_t *low, size_t low_count,
                                   const int32_t *high, size_t high_count,
                                   int32_t *out, size_t out_count);
@@ -730,21 +1004,43 @@ exr_result exr_deflate_zlib(const exr_allocator *a, const uint8_t *src,
 /* Adler-32 (zlib trailer). */
 uint32_t exr_adler32(const uint8_t *data, size_t n, uint32_t adler);
 
-/* Optional libdeflate backend for ZIP/ZIPS/PXR24 (gated by EXR_USE_LIBDEFLATE,
- * default off). The in-tree encoder/inflate above stay the default and remain
- * the only path for freestanding builds. ZIP/PXR24 call these via the
- * EXR_DEFLATE_ZLIB / EXR_INFLATE_ZLIB macros so the choice is a build flag. */
+/* libdeflate backend for ZIP/ZIPS/PXR24 (compiled in for DEFLATE=auto|libdeflate
+ * via EXR_USE_LIBDEFLATE). The in-tree encoder/inflate above remain the only
+ * path for freestanding and WASM builds. ZIP/PXR24 reach whichever backend is
+ * active through the exr_zlib_inflate / exr_zlib_deflate pointers below. */
 #ifdef EXR_USE_LIBDEFLATE
 exr_result exr_ld_deflate_zlib(const exr_allocator *a, const uint8_t *src,
                                size_t n, uint8_t **out_data, size_t *out_size);
 exr_result exr_ld_inflate_zlib(const uint8_t *src, size_t src_size, uint8_t *dst,
                                size_t dst_cap, size_t *out_size);
-#define EXR_DEFLATE_ZLIB exr_ld_deflate_zlib
-#define EXR_INFLATE_ZLIB exr_ld_inflate_zlib
-#else
-#define EXR_DEFLATE_ZLIB exr_deflate_zlib
-#define EXR_INFLATE_ZLIB exr_inflate_zlib
 #endif
+
+/* Build-time default for the runtime backend when both are compiled in. The
+ * Makefile sets this to 1 for DEFLATE=auto|libdeflate. Freestanding and WASM
+ * builds never define EXR_USE_LIBDEFLATE, so only the in-tree path is linked
+ * and the pointers below resolve to it regardless of this value. */
+#ifndef EXR_ZLIB_DEFAULT_LIBDEFLATE
+#define EXR_ZLIB_DEFAULT_LIBDEFLATE 0
+#endif
+
+/* Runtime-selectable zlib backend. ZIP/ZIPS/PXR24 call through these pointers
+ * (defined in exr_codec.c, statically initialised to the build default). When
+ * libdeflate is not compiled in they can only ever point at the in-tree codec.
+ * Override with exr_zlib_set_backend() (public, exr.h) before decoding; the
+ * pointers are read-only during decode, so do not flip them mid-run. */
+typedef exr_result (*exr_zlib_inflate_fn)(const uint8_t *src, size_t src_size,
+                                          uint8_t *dst, size_t dst_cap,
+                                          size_t *out_size);
+typedef exr_result (*exr_zlib_deflate_fn)(const exr_allocator *a,
+                                          const uint8_t *src, size_t n,
+                                          uint8_t **out_data, size_t *out_size);
+/* _Atomic so a write in exr_zlib_set_backend() races defined-behaviour-ly with
+ * reads in the codec functions: a concurrent reader sees old-or-new, never a
+ * torn value. (The documented contract is still "set before decoding"; this is
+ * belt-and-suspenders.) Pointer-sized atomics are lock-free and lower to plain
+ * loads/stores, so this adds no libcall and stays freestanding-clean. */
+extern _Atomic exr_zlib_inflate_fn exr_zlib_inflate;
+extern _Atomic exr_zlib_deflate_fn exr_zlib_deflate;
 
 /* fpnge-derived literal DEFLATE encoder with a PSHUFB Huffman-table lookup.
  * The PSHUFB-friendly table: symbols 0-15 and 240-255 are looked up by low
@@ -824,6 +1120,12 @@ exr_result exr_jph_forward_nlt_type3_i32(int32_t *data, size_t count,
                                          uint32_t bit_depth);
 exr_result exr_jph_compress(const exr_codec_ctx *ctx, const uint8_t *block,
                             size_t n, uint8_t **out_data, size_t *out_size);
+
+/* Build the HTJ2K encode VLC/UVLC tables up front. Call once on a single thread
+ * before compressing chunks concurrently: the lazy table init in exr_jph_compress
+ * is not thread-safe (sets its ready flag before the table is built), so the
+ * parallel encode path warms it here instead of racing in the workers. */
+void exr_jph_warmup_encode_tables(void);
 
 /* Encode dispatch: compress one canonical block per ctx->compression. */
 exr_result exr_compress_block(const exr_codec_ctx *ctx, const uint8_t *block,

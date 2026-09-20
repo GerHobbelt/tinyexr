@@ -9,22 +9,33 @@ embed into your application. It comes in two flavours:
 
 - **[v3 — pure-C11 rewrite (main)](#v3--pure-c11-rewrite-recommended).** The
   current main development line and the recommended version going forward.
-- **[v1 — single-header C++ (old, stable)](#v1--single-header-c-stable).** The
-  original `tinyexr.h`; still a solid, battle-tested choice today.
+- **[v1 — single-header C++ (old, deprecated)](#v1--single-header-c-stable).** The
+  original `tinyexr.h`; still a solid, but sunsetting.
 
 > 🌐 **Live demo (v3):** [**TinyEXR v3 WASM viewer**](https://syoyo.github.io/tinyexr/) — decode and view `.exr`
 > entirely in the browser (drag-and-drop; all v3 codecs: ZIP / PIZ / PXR24 / B44 / ZSTD / HTJ2K).
 > Spectral EXRs get a wavelength scrubber + **CIE→sRGB color** preview, deep images a 3D
 > point cloud, and the whole UI is **mobile/touch-friendly** with a fullscreen mode.
 
+> 🎨 **Live demo (tocio):** [**tocio OCIO + ACES 2.0 viewer**](https://syoyo.github.io/tinyexr/tocio/) — decode an
+> EXR and apply an **OpenColorIO** transform (incl. the **ACES 2.0** output transforms) on **WebGL2**, with a
+> live, editable OCIO config that **JIT-compiles to a GLSL shader**. See [tocio](#tocio--tiny-pure-c11-opencolorio-engine) below.
+
 **Performance (v3) at a glance** — single-thread decode/encode vs the reference
-OpenEXR library, with the optional **libdeflate** backend on/off (and HTJ2K,
+OpenEXR library, with the vendored **libdeflate** backend on/off (and HTJ2K,
 which has no deflate path). With the same backend TinyEXR meets or beats OpenEXR
 on the deflate family:
 
 ![Decode throughput: tinyexr libdeflate on/off vs OpenEXR](doc/perf-libdeflate-htj2k-decode.png)
 
 ![Encode throughput: tinyexr libdeflate on/off vs OpenEXR](doc/perf-libdeflate-htj2k-encode.png)
+
+On **ARM64 (Apple M1 / NEON)**, single-thread in-tree throughput — same shape:
+TinyEXR leads the cheap codecs (none / rle / b44) and is near parity on HTJ2K:
+
+![Decode throughput, single thread (Apple M1 / NEON)](doc/perf-arm-decode.png)
+
+![Encode throughput, single thread (Apple M1 / NEON)](doc/perf-arm-encode.png)
 
 See [Performance vs OpenEXR](#performance-vs-openexr) below and
 [`doc/performance-vs-openexr.md`](doc/performance-vs-openexr.md) for the full
@@ -49,7 +60,7 @@ codec-by-codec and multi-threaded numbers.
 | WASM | ✅ core + browser viewer | loader only (experimental/js) |
 | SIMD | SSE2 / SSE4.1 / AVX2 / F16C / NEON | — |
 | Threading | C11 threads (opt-in) | C++11 thread / OpenMP |
-| Dependencies | none in core (optional zstd / libdeflate) | miniz (bundled) + optional zfp |
+| Dependencies | none in core; vendored zstd + libdeflate (libdeflate default on hosted, dropped in freestanding/WASM) | miniz (bundled) + optional zfp |
 
 ---
 
@@ -76,6 +87,12 @@ Build: `make lib` (`build/libtinyexr3.a`), `make test-c`, `make c11-gate`.
 Unit tests live in `test/unit/test_exr_v3.c` (run under ASan/UBSan via `make
 test-c`); `make fuzz-corpus` replays the fuzzer corpus.
 
+The zlib backend for ZIP/ZIPS/PXR24 is selected with `DEFLATE=auto|libdeflate|intree`
+(default `auto` → vendored **libdeflate**, faster on natural-image data). `intree`
+builds the dependency-free pure-C codec only; freestanding and WASM builds always
+use it. Both codecs link under `auto`, so you can switch at runtime with
+`exr_zlib_set_backend()` (e.g. for testing or to honor a custom allocator).
+
 ## Performance vs OpenEXR
 
 Benchmarked against the reference **OpenEXR** library (4.0-dev) on an idle AMD
@@ -83,16 +100,24 @@ Ryzen 9 3950X (Zen2), `asakusa.exr` 660×440, fully in-memory, both pinned to th
 same thread count. Throughput in megapixels/s. Full writeup + charts:
 [`doc/performance-vs-openexr.md`](doc/performance-vs-openexr.md).
 
-- **Single thread, default (dependency-free) decode:** TinyEXR is faster on the
-  cheap codecs — **uncompressed ~3.4×** (2699 vs 789) and **RLE ~2.5×**
-  (230 vs 93). OpenEXR leads the compressed codecs (ZIP ~1.2×, PXR24 ~1.8×,
-  ZIPS ~2.1×, PIZ ~2.7×, HTJ2K ~2.5–3×), thanks to its libdeflate / tuned
-  PIZ / OpenJPH backends.
+- **Single thread, dependency-free decode** (`DEFLATE=intree`): TinyEXR is faster
+  on the cheap codecs — **uncompressed ~3.4×** (2699 vs 789) and **RLE ~2.5×**
+  (230 vs 93). With the pure-C deflate codec OpenEXR leads the compressed family
+  (ZIP ~1.2×, PXR24 ~1.8×, ZIPS ~2.1×, PIZ ~2.7×, HTJ2K ~2.5–3×), thanks to its
+  libdeflate / tuned PIZ / OpenJPH backends.
 - **Single-thread encode:** ties/wins on RLE/PIZ/B44; OpenEXR is ~1.5× on
   ZIP/ZIPS, ~1.8× on PXR24, ~4× on HTJ2K.
-- **Optional libdeflate backend** (`make … LIBDEFLATE=1`, off by default): with
-  the same backend TinyEXR **matches or beats** OpenEXR on the deflate family —
-  e.g. ZIP decode **1.37×** (80.8 vs 58.8), sizes byte-identical.
+- **Default decode uses libdeflate** (`DEFLATE=auto`): with the same backend
+  TinyEXR **matches or beats** OpenEXR on the deflate family — ZIP decode
+  **1.37×** (80.8 vs 58.8), sizes byte-identical. On a broad natural-image corpus
+  this is a large lift over the in-tree codec (ZIP ~+73%, ZIPS ~+63%, PXR24 ~+55%).
+  The in-tree inflate is *faster* than libdeflate on smooth, highly-compressible
+  data (~+8% on 4K texture packs) but slower on high-entropy natural images, so
+  libdeflate is the safer hosted default; both link and switch at runtime via
+  `exr_zlib_set_backend()`.
+- **In-tree codec tuning:** **PIZ decode ~+14%** (inline Huffman literal store +
+  tighter canonical-table scan); ZSTD (vendored upstream) decodes ~410–420 Mpix/s
+  here, ahead of the libdeflate ZIP path.
 - **Multi-threaded** (opt-in C11 threads, `make … THREADS=1` +
   `exr_set_num_threads(n)`): per-block parallel encode/decode scales **~5×
   (ZIP) to ~8.8× (ZIPS)** to 16 threads. At 16 threads TinyEXR **out-decodes
@@ -220,8 +245,11 @@ Contribution is welcome!
 
 - [ ] Parallelize the deep and mipmap/ripmap paths (encode/decode are
   single-threaded there; flat scanline + single-level tiled already parallelize).
-- [ ] Full luminance-chroma color: subsampled `Y` + `RY`/`BY` decode currently
-  mis-handles the chroma planes, so such images render as grayscale `Y` only.
+- [ ] Full luminance-chroma color in the browser **viewer**: the core now
+  reconstructs subsampled `Y` + `RY`/`BY` to RGBA
+  (`exr_part_yc_to_rgba_float`, used by the `examples/wasm` binding), but the
+  streaming `web/viewer/` still renders such images as grayscale `Y` pending a
+  whole-part hook through the reconstruction helper.
 - [ ] ARM/NEON throughput benchmarks (NEON kernels are correctness-verified under
   qemu but not yet benchmarked).
 - [ ] Larger-image / higher-channel-count performance sweeps.
@@ -233,8 +261,52 @@ Contribution is welcome!
 - **Core** — 3-clause BSD, dependency-free. The HTJ2K/JPH and DEFLATE/PIZ/B44
   codec implementations are original in-tree code.
 - **zstd** (`deps/zstd/`, optional, on by default) — BSD-3-Clause, Facebook.
-- **libdeflate** (vendored, optional ZIP/ZIPS/PXR24 backend, off by default) —
+- **libdeflate** (vendored ZIP/ZIPS/PXR24 backend, default on hosted builds via
+  `DEFLATE=auto`; `DEFLATE=intree` and freestanding/WASM use the pure-C codec) —
   MIT.
+
+---
+
+# tocio — tiny pure-C11 OpenColorIO engine
+
+Alongside the EXR codec, this repo ships **tocio** (`sandbox/tocio/`): a tiny,
+self-contained, **pure-C11** [OpenColorIO](https://opencolorio.org) config engine
+and code generator. It parses an OCIO config (a YAML subset), resolves a colour
+transform into a flat op list, and runs it on the CPU, ahead-of-time as
+C / GLSL / Metal source, or through a small JIT — with first-class **ACES 2.0**
+support.
+
+> 🎨 **Live demo:** [**tocio OCIO + ACES 2.0 viewer**](https://syoyo.github.io/tinyexr/tocio/)
+> — decode an EXR and apply an OCIO transform on **WebGL2**, with a live, editable
+> OCIO config that **JIT-compiles to a GLSL shader**.
+
+Highlights:
+
+| Area | Support |
+|---|---|
+| **Language** | Pure C11, freestanding-capable (no libc/libm beyond `stdint`/`stddef`; all heap via an allocator hook), zero external dependencies |
+| **Config** | OCIO YAML-subset parser: colorspaces, roles, displays/views, view transforms, looks, scene↔display reference bridging; Iridas `.cube`, Sony `.spi1d`/`.spi3d`, and ACES **CLF** LUT files |
+| **Execution** | CPU interpreter (scalar + **SSE2/AVX2**, **NEON**), AOT **C** source, **GLSL** (WebGL2 / Vulkan) and **Metal** shader generators, and a **JIT** (x86-64 SSE2/AVX + AArch64 NEON machine code; emits GLSL under WASM) |
+| **ACES** | **ACES 2.0** output transforms (CAM16 *JMh* tonescale + chroma / gamut compression) — SDR, HDR, and **D60-simulation** variants; ACEScc / ACEScct / ACEScg / ACES2065-1, the 1.3 RGC gamut-compress LMT, ARRI / Sony / RED / Panasonic camera-log inputs, and sRGB / Rec.1886 / PQ / DCDM / Display-P3 display encodings |
+| **Ops** | Matrix, range, exponent / MonCurve, log / log-camera, fixed-function, 1D/3D LUT — invertible where the math allows |
+
+**Validated against the real configs.** `make tocio-validate` parses the
+AcademySoftwareFoundation ACES OCIO configs and compares every transform tocio
+builds against PyOpenColorIO (the C++ reference engine) on fixed samples —
+currently **350 / 377 transforms verified, 0 mismatches** on in-range samples.
+
+Build & test:
+
+```sh
+make tocio-lib         # build/libtocio.a
+make tocio-test        # unit tests
+make tocio-fetch-ref   # fetch the ACES OCIO configs (once)
+make tocio-validate    # numerical validation vs PyOpenColorIO
+make wasm-tocio-demo   # web/tocio/ browser demo (needs Emscripten)
+```
+
+See [`sandbox/tocio/`](sandbox/tocio/) for the engine and
+[`web/tocio/`](web/tocio/) for the demo.
 
 ---
 

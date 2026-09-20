@@ -152,6 +152,11 @@ typedef struct {
  * narrows to the final 16/32-bit sample at store time. */
 typedef struct {
     int64_t *data;
+    /* For all-HALF parts the reversible 5/3 coefficients fit int32, so the
+     * encode pipeline carries them in a narrower int32 plane and the codeblock
+     * encoder reads it natively (no int32->int64 widening). When data32 is
+     * non-NULL it is the source of truth and `data` is unused. */
+    int32_t *data32;
     uint32_t w;
     uint32_t h;
 } JphPlane64;
@@ -672,9 +677,15 @@ static exr_result jph_i64_to_i32(int64_t v, int32_t *out) {
 
 exr_result exr_jph_inverse_rct_i32(int32_t *c0, int32_t *c1, int32_t *c2,
                                    size_t count) {
-    size_t i;
+    size_t i = 0;
     if ((!c0 || !c1 || !c2) && count) return EXR_ERROR_INVALID_ARGUMENT;
-    for (i = 0; i < count; ++i) {
+#if defined(EXR_X86)
+    if (exr_cpu_caps() & EXR_SIMD_AVX2)
+        i = jph_inverse_rct_i32_avx2(c0, c1, c2, count);
+    else if (exr_cpu_caps() & EXR_SIMD_SSE2)
+        i = jph_inverse_rct_i32_sse2(c0, c1, c2, count);
+#endif
+    for (; i < count; ++i) {
         int64_t y = c0[i];
         int64_t db = c1[i];
         int64_t dr = c2[i];
@@ -830,11 +841,41 @@ static size_t jph_ceil_div_pow2_size(size_t v, unsigned shift) {
     return v;
 }
 
-exr_result exr_jph_inverse_53_2d_i32(const exr_allocator *a, int32_t *data,
-                                     size_t width, size_t height,
-                                     unsigned levels) {
+typedef struct {
+    uint16_t *scratch;
+    size_t scratch_cap;
+    uint32_t *v_n32;
+    size_t v_n32_cap;
+    uint32_t *buf32;
+    size_t buf32_cap;
+    int32_t *inv53_temp32;
+    size_t inv53_temp32_cap;
+    int64_t *inv53_ev64;
+    size_t inv53_ev64_cap;
+    int64_t *inv53_od64;
+    size_t inv53_od64_cap;
+    uint64_t *magsgn_bits;
+    size_t magsgn_bits_cap;
+    uint64_t *sigprop_bits;
+    size_t sigprop_bits_cap;
+} JphDecodeWorkspace;
+
+static exr_result jph_ws_reserve_raw(const exr_allocator *a, void **ptr,
+                                     size_t *cap, size_t count,
+                                     size_t elem_size);
+
+static exr_result jph_inverse_53_2d_i32_ws(const exr_allocator *a, int32_t *data,
+                                           size_t width, size_t height,
+                                           unsigned levels,
+                                           JphDecodeWorkspace *ws,
+                                           int bounded) {
     unsigned level;
     int use_simd = 0;
+#if !defined(EXR_X86)
+    /* `bounded` selects the int32 vs int64-intermediate AVX2 variant; the NEON
+     * and scalar paths use a single (always-safe) implementation. */
+    (void)bounded;
+#endif
     if (!a) a = exr_default_allocator();
     if (!data && width && height) return EXR_ERROR_INVALID_ARGUMENT;
     if (levels > 32) return EXR_ERROR_INVALID_ARGUMENT;
@@ -844,6 +885,27 @@ exr_result exr_jph_inverse_53_2d_i32(const exr_allocator *a, int32_t *data,
 #elif defined(EXR_NEON)
     use_simd = 1;
 #endif
+    if (ws) {
+        size_t max_temp_count, max_scratch_len;
+        exr_result rc;
+        if (exr_mul_ovf(width, height, &max_temp_count))
+            return EXR_ERROR_CORRUPT;
+        max_scratch_len = width > height ? width : height;
+        rc = jph_ws_reserve_raw(a, (void **)&ws->inv53_temp32,
+                                &ws->inv53_temp32_cap, max_temp_count,
+                                sizeof(int32_t));
+        if (rc != EXR_SUCCESS) return rc;
+        if (use_simd) {
+            rc = jph_ws_reserve_raw(a, (void **)&ws->inv53_ev64,
+                                    &ws->inv53_ev64_cap, max_scratch_len,
+                                    sizeof(int64_t));
+            if (rc != EXR_SUCCESS) return rc;
+            rc = jph_ws_reserve_raw(a, (void **)&ws->inv53_od64,
+                                    &ws->inv53_od64_cap, max_scratch_len,
+                                    sizeof(int64_t));
+            if (rc != EXR_SUCCESS) return rc;
+        }
+    }
 
     for (level = levels; level > 0; --level) {
         size_t rw = jph_ceil_div_pow2_size(width, level - 1u);
@@ -864,13 +926,25 @@ exr_result exr_jph_inverse_53_2d_i32(const exr_allocator *a, int32_t *data,
         if (exr_mul_ovf(scratch_len, sizeof(int64_t), &sb64))
             return EXR_ERROR_CORRUPT;
 
-        temp = (int32_t *)exr_malloc(a, temp_bytes);
-        if (use_simd) {
-            ev = (int64_t *)exr_malloc(a, sb64);
-            od = (int64_t *)exr_malloc(a, sb64);
+        if (ws) {
+            temp = ws->inv53_temp32;
+            if (use_simd) {
+                ev = ws->inv53_ev64;
+                od = ws->inv53_od64;
+            }
+        } else {
+            temp = (int32_t *)exr_malloc(a, temp_bytes);
+            if (use_simd) {
+                ev = (int64_t *)exr_malloc(a, sb64);
+                od = (int64_t *)exr_malloc(a, sb64);
+            }
         }
         if (!temp || (use_simd && (!ev || !od))) {
-            exr_free(a, temp); exr_free(a, ev); exr_free(a, od);
+            if (!ws) {
+                exr_free(a, temp);
+                exr_free(a, ev);
+                exr_free(a, od);
+            }
             return EXR_ERROR_OUT_OF_MEMORY;
         }
 
@@ -878,9 +952,15 @@ exr_result exr_jph_inverse_53_2d_i32(const exr_allocator *a, int32_t *data,
         for (y = 0; y < rh; ++y) {
             const int32_t *row = data + y * width;
 #if defined(EXR_X86)
-            if (use_simd)
-                rc = jph_inverse_53_i32_avx2(row, lw, row + lw, hw,
-                                             temp + y * rw, rw, ev, od);
+            if (use_simd) {
+                if (bounded)
+                    rc = jph_inverse_53_i32_bounded_avx2(row, lw, row + lw, hw,
+                                                         temp + y * rw, rw, ev,
+                                                         od);
+                else
+                    rc = jph_inverse_53_i32_avx2(row, lw, row + lw, hw,
+                                                 temp + y * rw, rw, ev, od);
+            }
             else
 #elif defined(EXR_NEON)
             if (use_simd)
@@ -895,8 +975,14 @@ exr_result exr_jph_inverse_53_2d_i32(const exr_allocator *a, int32_t *data,
         /* Vertical (column) pass, row-wise across all columns -- no gather/
          * scatter. temp's lh low-rows / hh high-rows -> interleaved data rows. */
 #if defined(EXR_X86)
-        if (use_simd)
-            rc = jph_inverse_53_vert_i32_avx2(temp, rw, lh, hh, data, width);
+        if (use_simd) {
+            if (bounded)
+                rc = jph_inverse_53_vert_i32_bounded_avx2(temp, rw, lh, hh,
+                                                          data, width);
+            else
+                rc = jph_inverse_53_vert_i32_avx2(temp, rw, lh, hh, data,
+                                                  width);
+        }
         else
 #elif defined(EXR_NEON)
         if (use_simd)
@@ -906,12 +992,20 @@ exr_result exr_jph_inverse_53_2d_i32(const exr_allocator *a, int32_t *data,
             rc = exr_jph_inverse_53_vert_i32(temp, rw, lh, hh, data, width);
 
 done_level:
-        exr_free(a, temp);
-        exr_free(a, ev);
-        exr_free(a, od);
+        if (!ws) {
+            exr_free(a, temp);
+            exr_free(a, ev);
+            exr_free(a, od);
+        }
         if (rc != EXR_SUCCESS) return rc;
     }
     return EXR_SUCCESS;
+}
+
+exr_result exr_jph_inverse_53_2d_i32(const exr_allocator *a, int32_t *data,
+                                     size_t width, size_t height,
+                                     unsigned levels) {
+    return jph_inverse_53_2d_i32_ws(a, data, width, height, levels, NULL, 0);
 }
 
 /* ---- int64 decode variants -----------------------------------------------
@@ -919,6 +1013,7 @@ done_level:
  * that >=32-bit-precision components (whose reversible-wavelet coefficients can
  * exceed int32) decode losslessly. The final samples fit in 16/32 bits and are
  * narrowed back to int32 at store time. */
+EXR_NO_SANITIZE_SIO
 exr_result jph_inverse_53_i64(const int64_t *low, size_t low_count,
                               const int64_t *high, size_t high_count,
                               int64_t *out, size_t out_count) {
@@ -953,6 +1048,7 @@ exr_result jph_inverse_53_i64(const int64_t *low, size_t low_count,
  * full int64 (no narrowing / range check): `temp` holds lh low-rows then hh
  * high-rows (stride rw); writes the rh interleaved rows into `data` (stride
  * width). Per column this is exactly jph_inverse_53_i64. */
+EXR_NO_SANITIZE_SIO
 exr_result jph_inverse_53_vert_i64(const int64_t *temp, size_t rw,
                                    size_t lh, size_t hh,
                                    int64_t *data, size_t width) {
@@ -1860,8 +1956,40 @@ typedef struct {
     JphPlaneD *planes;
     uint16_t num_planes;
     int use_i32; /* all components HALF -> int32 coefficient planes */
+    int use_avx2;
     size_t codeblocks;
+    JphDecodeWorkspace ws;
 } JphDecodeState;
+
+static void jph_decode_workspace_free(const exr_allocator *a,
+                                      JphDecodeWorkspace *ws) {
+    if (!a) a = exr_default_allocator();
+    if (!ws) return;
+    exr_free(a, ws->scratch);
+    exr_free(a, ws->v_n32);
+    exr_free(a, ws->buf32);
+    exr_free(a, ws->inv53_temp32);
+    exr_free(a, ws->inv53_ev64);
+    exr_free(a, ws->inv53_od64);
+    exr_free(a, ws->magsgn_bits);
+    exr_free(a, ws->sigprop_bits);
+    memset(ws, 0, sizeof(*ws));
+}
+
+static exr_result jph_ws_reserve_raw(const exr_allocator *a, void **ptr,
+                                     size_t *cap, size_t count,
+                                     size_t elem_size) {
+    void *p;
+    size_t bytes;
+    if (count <= *cap) return EXR_SUCCESS;
+    if (exr_mul_ovf(count, elem_size, &bytes)) return EXR_ERROR_CORRUPT;
+    p = exr_malloc(a, bytes);
+    if (!p) return EXR_ERROR_OUT_OF_MEMORY;
+    exr_free(a, *ptr);
+    *ptr = p;
+    *cap = count;
+    return EXR_SUCCESS;
+}
 
 static void jph_free_component_planes(const exr_allocator *a, JphPlaneD *planes,
                                       uint16_t num_planes) {
@@ -1964,23 +2092,20 @@ void jph_pack_i32_to_half_scalar(uint8_t *dst, const int32_t *src, size_t n) {
     }
 }
 
-static void jph_pack_i32_to_half(uint8_t *dst, const int32_t *src, size_t n) {
-#if defined(EXR_X86)
-    uint32_t caps = exr_cpu_caps();
-    if (caps & EXR_SIMD_AVX2) { jph_pack_i32_to_half_avx2(dst, src, n); return; }
-    if (caps & EXR_SIMD_SSE41) { jph_pack_i32_to_half_sse41(dst, src, n); return; }
-#elif defined(EXR_NEON)
-    jph_pack_i32_to_half_neon(dst, src, n);
-    return;
-#endif
-    jph_pack_i32_to_half_scalar(dst, src, n);
-}
-
 static exr_result jph_store_component_planes_to_block(
     const exr_codec_ctx *ctx, const JphProfile *jp, const uint16_t *map,
     const JphPlaneD *planes, uint8_t *dst, size_t dst_size) {
     size_t off = 0;
     int32_t line, file_c;
+    void (*pack_i32_to_half)(uint8_t *, const int32_t *, size_t) =
+        jph_pack_i32_to_half_scalar;
+#if defined(EXR_X86)
+    uint32_t caps = exr_cpu_caps();
+    if (caps & EXR_SIMD_AVX2) pack_i32_to_half = jph_pack_i32_to_half_avx2;
+    else if (caps & EXR_SIMD_SSE41) pack_i32_to_half = jph_pack_i32_to_half_sse41;
+#elif defined(EXR_NEON)
+    pack_i32_to_half = jph_pack_i32_to_half_neon;
+#endif
     if (!ctx || !jp || !map || !planes || !dst) return EXR_ERROR_INVALID_ARGUMENT;
     for (line = 0; line < ctx->num_lines; ++line) {
         int32_t yy = ctx->y + line;
@@ -2013,7 +2138,7 @@ static exr_result jph_store_component_planes_to_block(
                 size_t span = (size_t)(uint32_t)nx * 2u;
                 if (off > dst_size || span > dst_size - off)
                     return EXR_ERROR_CORRUPT;
-                jph_pack_i32_to_half(dst + off, srow, (size_t)(uint32_t)nx);
+                pack_i32_to_half(dst + off, srow, (size_t)(uint32_t)nx);
                 off += span;
                 continue;
             }
@@ -2030,14 +2155,21 @@ static exr_result jph_store_component_planes_to_block(
 
 static exr_result jph_postprocess_component_planes(const exr_allocator *a,
                                                    const JphProfile *jp,
-                                                   JphPlaneD *planes) {
+                                                   JphPlaneD *planes,
+                                                   JphDecodeWorkspace *ws) {
     uint16_t c;
     if (!jp || !planes) return EXR_ERROR_INVALID_ARGUMENT;
     for (c = 0; c < jp->csiz; ++c) {
         exr_result rc;
+        int bounded = 0;
         if (planes[c].d32)
-            rc = exr_jph_inverse_53_2d_i32(a, planes[c].d32, planes[c].w,
-                                           planes[c].h, jp->num_decomps);
+        {
+            unsigned bps = ((unsigned)jp->ssiz[c] & 0x7fu) + 1u;
+            bounded = (bps <= 16u);
+            rc = jph_inverse_53_2d_i32_ws(a, planes[c].d32, planes[c].w,
+                                          planes[c].h, jp->num_decomps, ws,
+                                          bounded);
+        }
         else if (planes[c].d64)
             rc = jph_inverse_53_2d_i64(a, planes[c].d64, planes[c].w,
                                        planes[c].h, jp->num_decomps);
@@ -2480,7 +2612,7 @@ static uint32_t jph_mask32(uint32_t nbits) {
     return nbits >= 32u ? UINT32_MAX : ((UINT32_C(1) << nbits) - 1u);
 }
 
-static uint64_t jph_mask64(uint32_t nbits) {
+static inline uint64_t jph_mask64(uint32_t nbits) {
     return nbits >= 64u ? UINT64_MAX : ((UINT64_C(1) << nbits) - 1u);
 }
 
@@ -2505,22 +2637,10 @@ typedef struct {
 /* Unstuff `size` bytes of `data` into `out` (LSB-first); returns the bit count.
  * `out` must be zeroed and hold >= size/8 + 3 words. */
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-/* Is there a 0xFF byte in d[0..n)? Word-wise SWAR scan (endian-independent: it
- * tests for a byte value). Returns at the first hit, so the slow path pays only
- * up to the first 0xFF. Only the little-endian memcpy fast path uses it. */
-static int jph_mem_has_ff(const uint8_t *d, uint32_t n) {
-    uint32_t i = 0u;
-    for (; i + 8u <= n; i += 8u) {
-        uint64_t v, x;
-        memcpy(&v, d + i, 8u);
-        x = ~v; /* 0x00 in each lane that held 0xFF */
-        if ((x - UINT64_C(0x0101010101010101)) & ~x &
-            UINT64_C(0x8080808080808080))
-            return 1;
-    }
-    for (; i < n; ++i)
-        if (d[i] == 0xFFu) return 1;
-    return 0;
+static int jph_word_has_ff(uint64_t v) {
+    uint64_t x = ~v; /* 0x00 in each lane that held 0xFF */
+    return ((x - UINT64_C(0x0101010101010101)) & ~x &
+            UINT64_C(0x8080808080808080)) != 0u;
 }
 #endif
 
@@ -2531,13 +2651,30 @@ static uint64_t jph_unstuff_bits(const uint8_t *data, uint32_t size,
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
     /* Common-case fast path: with no 0xFF byte every byte contributes 8 bits at
      * a byte-aligned offset, so the host-order bit buffer is byte-identical to
-     * the input -- a plain copy. The fetch side reads `out` in the same host
-     * order, and `out` (calloc'd, >= size/8+3 words) keeps its zero tail. */
-    if (data && !jph_mem_has_ff(data, size)) {
-        memcpy(out, data, size);
+     * the input. Copy and scan in one pass; if a stuffed byte appears, clear the
+     * partial copy and fall back to the general bit packer below. */
+    if (data) {
+        uint32_t i = 0u;
+        uint8_t *out8 = (uint8_t *)out;
+        for (; i + 8u <= size; i += 8u) {
+            uint64_t v;
+            memcpy(&v, data + i, 8u);
+            out[i >> 3u] = v;
+            if (jph_word_has_ff(v)) {
+                goto slow_unstuff;
+            }
+        }
+        for (; i < size; ++i) {
+            uint8_t b = data[i];
+            out8[i] = b;
+            if (b == 0xFFu) {
+                goto slow_unstuff;
+            }
+        }
         return (uint64_t)size * 8u;
     }
 #endif
+slow_unstuff:
     /* Slow path (stuffed stream): accumulate bits in a register and flush whole
      * words, instead of a per-byte read-modify-write of out[] plus a split-store
      * branch. `acc` holds the `accbits` not-yet-flushed low bits of word `w`. */
@@ -2545,6 +2682,7 @@ static uint64_t jph_unstuff_bits(const uint8_t *data, uint32_t size,
         uint64_t acc = 0u;
         uint32_t accbits = 0u;
         size_t w = 0u;
+        size_t out_words = (size_t)size / 8u + 3u;
         for (idx = 0u; idx < size; ++idx) {
             uint8_t b = data ? data[idx] : 0u;
             uint32_t ub = prevff ? 7u : 8u;
@@ -2561,7 +2699,8 @@ static uint64_t jph_unstuff_bits(const uint8_t *data, uint32_t size,
             }
             prevff = (b == 0xffu) ? 1u : 0u;
         }
-        if (accbits) out[w] = acc;
+        if (accbits) out[w++] = acc;
+        if (w < out_words) memset(out + w, 0, (out_words - w) * sizeof(uint64_t));
     }
     return nbits;
 }
@@ -2697,7 +2836,8 @@ static uint64_t jph_decode_magsgn_sample64(JphMagSgn *magsgn, uint32_t inf,
     return val;
 }
 
-static int jph_clz64(uint64_t v); /* defined below; used in the magnitude pass */
+static inline int jph_clz64(uint64_t v);
+static inline int jph_clz32(uint32_t v);
 
 static exr_result jph_decode_block64_cleanup(const JphCodeblockSeg *seg,
                                              const JphHtTables *htab,
@@ -2751,7 +2891,7 @@ static exr_result jph_decode_block64_cleanup(const JphCodeblockSeg *seg,
     mmsbp2 = missing_msbs + 2u;
     sstr = ((width + 2u) + 7u) & ~7u;
 
-    scratch_count = (size_t)sstr * JPH_QUAD_MAX_PER_ROW;
+    scratch_count = (size_t)sstr * (((height + 1u) >> 1u) + 1u);
     v_n_count = JPH_V_N_SIZE;
     buf_count = (size_t)sstr * (height < 4u ? 4u : height);
 
@@ -3306,10 +3446,13 @@ done:
 /* Decode a single HT codeblock and write the resulting signed coefficient
  * samples into `out` (int64; 32-bit components can exceed int32), indexed by
  * row*stride + col. kmax is the band's K_max (for shift normalization). */
-static exr_result jph_decode_block(const JphCodeblockSeg *seg,
-                                    const JphHtTables *htab,
-                                    int64_t *out, uint32_t out_stride,
-                                    uint32_t kmax) {
+static exr_result jph_decode_block_core(const JphCodeblockSeg *seg,
+                                        const JphHtTables *htab,
+                                        int64_t *out64, int32_t *out32,
+                                        uint32_t out_stride, uint32_t kmax,
+                                        const exr_allocator *a,
+                                        JphDecodeWorkspace *ws,
+                                        int use_avx2) {
     uint32_t width = seg->width;
     uint32_t height = seg->height;
     uint32_t missing_msbs = seg->missing_msbs;
@@ -3327,16 +3470,23 @@ static exr_result jph_decode_block(const JphCodeblockSeg *seg,
     size_t scratch_count, v_n_count, buf_count;
     exr_jph_mel_reader mel;
     JphVlcRev vlc;
-    JphMagSgn magsgn;
+    JphMagSgn magsgn = {0};
+#if defined(EXR_X86)
+    JphFrwdAvx2 magsgn_frwd; /* AVX2 forward-magsgn fast path only */
+#endif
     uint32_t run, vlc_val, c_q;
     uint16_t *sp;
     uint32_t *dp;
     int64_t prev_v_n;
+    int use_four16 = 0;
+    int use_frwd16 = 0;
+    int use_frwd32 = 0;
     int i;
     exr_result rc;
     (void)i;
 
-    if (!seg || !htab || !out) return EXR_ERROR_INVALID_ARGUMENT;
+    if (!a) a = exr_default_allocator();
+    if (!seg || !htab || (!out64 && !out32)) return EXR_ERROR_INVALID_ARGUMENT;
     /* Defense-in-depth: HT codeblocks are at most 128x32 (callers/validation
      * enforce this).  Re-check locally so the fixed-size scratch math below
      * cannot be driven OOB if a future caller skips the guard. */
@@ -3347,7 +3497,8 @@ static exr_result jph_decode_block(const JphCodeblockSeg *seg,
     if (num_passes < 1u || num_passes > 3u) return EXR_ERROR_UNSUPPORTED;
 
     if (missing_msbs >= 30u || kmax > 30u) {
-        return jph_decode_block64_cleanup(seg, htab, out, out_stride, kmax);
+        if (out32) return EXR_ERROR_UNSUPPORTED;
+        return jph_decode_block64_cleanup(seg, htab, out64, out_stride, kmax);
     }
     if (missing_msbs == 29u && num_passes > 1u) num_passes = 1u;
 
@@ -3359,43 +3510,100 @@ static exr_result jph_decode_block(const JphCodeblockSeg *seg,
 
     p = 30u - missing_msbs;
     mmsbp2 = missing_msbs + 2u;
+    use_frwd16 = use_avx2 && mmsbp2 < 16u;
+#if defined(EXR_X86)
+    use_frwd32 = use_avx2 && mmsbp2 >= 16u;
+#endif
+#if defined(EXR_X86) && defined(EXR_JPH_ENABLE_AVX2_FOUR_QUAD16) && \
+    EXR_JPH_ENABLE_AVX2_FOUR_QUAD16
+    use_four16 = !use_frwd16 && use_avx2 && mmsbp2 < 16u;
+#endif
+#if !defined(EXR_X86)
+    /* The AVX2 forward-magsgn fast paths these gate are compiled out off x86. */
+    (void)use_frwd16;
+    (void)use_four16;
+#endif
 
     sstr = ((width + 2u) + 7u) & ~7u;
 
-    scratch_count = (size_t)sstr * JPH_QUAD_MAX_PER_ROW;
-    v_n_count = JPH_V_N_SIZE;
-    /* The MagSgn step writes to the second row of every quad pair even when
-     * the codeblock is 1 row tall, and the last non-initial quad pair writes
-     * one past the last row, so the internal codeblock buffer must always
-     * have at least 4 rows to avoid OOB writes. */
-    buf_count = (size_t)sstr * (height < 4u ? 4u : height);
+    scratch_count = (size_t)sstr * (((height + 1u) >> 1u) + 1u);
+    v_n_count = (use_frwd32 ? 2u : 1u) * JPH_V_N_SIZE;
+    /* The vector MagSgn step writes to the second row of every quad pair.  For
+     * odd-height codeblocks, keep one padded row so the forward-reader vector
+     * path can consume the final paired row instead of falling back to the
+     * pre-unstuffed scalar reader. */
+    {
+        uint32_t buf_rows = height + (height & 1u);
+        if (buf_rows < 4u) buf_rows = 4u;
+        buf_count = (size_t)sstr * buf_rows;
+    }
 
-    scratch = (uint16_t *)exr_calloc(exr_default_allocator(), scratch_count,
-                                    sizeof(uint16_t));
-    v_n_scratch = (uint32_t *)exr_calloc(exr_default_allocator(), v_n_count,
-                                         sizeof(uint32_t));
-    buf = (uint32_t *)exr_calloc(exr_default_allocator(),
-                                 buf_count ? buf_count : 1u, sizeof(uint32_t));
-    magsgn_bits = (uint64_t *)exr_calloc(exr_default_allocator(),
-                                         jph_magsgn_words(lcup - scup),
-                                         sizeof(uint64_t));
-    sigprop_bits = (uint64_t *)exr_calloc(exr_default_allocator(),
-                                          jph_magsgn_words(lengths2),
-                                          sizeof(uint64_t));
-    if (!scratch || !v_n_scratch || !buf || !magsgn_bits || !sigprop_bits) {
-        exr_free(exr_default_allocator(), scratch);
-        exr_free(exr_default_allocator(), v_n_scratch);
-        exr_free(exr_default_allocator(), buf);
-        exr_free(exr_default_allocator(), magsgn_bits);
-        exr_free(exr_default_allocator(), sigprop_bits);
-        return EXR_ERROR_OUT_OF_MEMORY;
+    if (ws) {
+        size_t magsgn_words =
+            (use_frwd16 || use_frwd32) ? 0u : jph_magsgn_words(lcup - scup);
+        size_t sigprop_words = jph_magsgn_words(lengths2);
+        rc = jph_ws_reserve_raw(a, (void **)&ws->scratch,
+                                &ws->scratch_cap, scratch_count,
+                                sizeof(uint16_t));
+        if (rc != EXR_SUCCESS) goto done;
+        rc = jph_ws_reserve_raw(a, (void **)&ws->v_n32,
+                                &ws->v_n32_cap, v_n_count, sizeof(uint32_t));
+        if (rc != EXR_SUCCESS) goto done;
+        rc = jph_ws_reserve_raw(a, (void **)&ws->buf32,
+                                &ws->buf32_cap, buf_count ? buf_count : 1u,
+                                sizeof(uint32_t));
+        if (rc != EXR_SUCCESS) goto done;
+        if (!use_frwd16 && !use_frwd32) {
+            rc = jph_ws_reserve_raw(a, (void **)&ws->magsgn_bits,
+                                    &ws->magsgn_bits_cap, magsgn_words,
+                                    sizeof(uint64_t));
+            if (rc != EXR_SUCCESS) goto done;
+        }
+        rc = jph_ws_reserve_raw(a, (void **)&ws->sigprop_bits,
+                                &ws->sigprop_bits_cap, sigprop_words,
+                                sizeof(uint64_t));
+        if (rc != EXR_SUCCESS) goto done;
+        scratch = ws->scratch;
+        v_n_scratch = ws->v_n32;
+        buf = ws->buf32;
+        magsgn_bits = ws->magsgn_bits;
+        sigprop_bits = ws->sigprop_bits;
+        if (!use_frwd16 && !use_frwd32)
+            memset(magsgn_bits, 0, magsgn_words * sizeof(uint64_t));
+        memset(sigprop_bits, 0, sigprop_words * sizeof(uint64_t));
+    } else {
+        size_t magsgn_words =
+            (use_frwd16 || use_frwd32) ? 0u : jph_magsgn_words(lcup - scup);
+        scratch = (uint16_t *)exr_calloc(a, scratch_count, sizeof(uint16_t));
+        v_n_scratch = (uint32_t *)exr_calloc(a, v_n_count,
+                                             sizeof(uint32_t));
+        buf = (uint32_t *)exr_calloc(a, buf_count ? buf_count : 1u,
+                                     sizeof(uint32_t));
+        if (!use_frwd16 && !use_frwd32)
+            magsgn_bits = (uint64_t *)exr_calloc(a, magsgn_words,
+                                                 sizeof(uint64_t));
+        sigprop_bits = (uint64_t *)exr_calloc(a,
+                                              jph_magsgn_words(lengths2),
+                                              sizeof(uint64_t));
+    }
+    if (!scratch || !v_n_scratch || !buf ||
+        (!use_frwd16 && !use_frwd32 && !magsgn_bits) || !sigprop_bits) {
+        rc = EXR_ERROR_OUT_OF_MEMORY;
+        goto done;
     }
 
     exr_jph_mel_init(&mel, seg->data + lcup - scup, (size_t)scup - 1u);
     rc = jph_vlc_rev_init(&vlc, seg->data, lcup, scup);
     if (rc != EXR_SUCCESS) goto done;
-    rc = jph_magsgn_init(&magsgn, seg->data, lcup - scup, magsgn_bits);
-    if (rc != EXR_SUCCESS) goto done;
+#if defined(EXR_X86)
+    if (use_frwd16 || use_frwd32) {
+        jph_frwd_init_ff_avx2(&magsgn_frwd, seg->data, (int)(lcup - scup));
+    } else
+#endif
+    {
+        rc = jph_magsgn_init(&magsgn, seg->data, lcup - scup, magsgn_bits);
+        if (rc != EXR_SUCCESS) goto done;
+    }
 
     if (exr_jph_mel_get_run(&mel, &run, &i) != EXR_SUCCESS) i = 0;
     if (i) run = (run << 1) | 1u;
@@ -3475,7 +3683,7 @@ static exr_result jph_decode_block(const JphCodeblockSeg *seg,
             sp += 4u;
         }
     }
-    sp[0] = sp[1] = 0u;
+    memset(sp, 0, 8u * sizeof(uint16_t));
 
     /* Non-initial rows of quads */
     {
@@ -3558,7 +3766,7 @@ static exr_result jph_decode_block(const JphCodeblockSeg *seg,
                 }
                 sp += 4u;
             }
-            sp[0] = sp[1] = 0u;
+            memset(sp, 0, 8u * sizeof(uint16_t));
         }
     }
 
@@ -3569,6 +3777,79 @@ static exr_result jph_decode_block(const JphCodeblockSeg *seg,
         prev_v_n = 0;
         sp = scratch;
         dp = buf;
+#if defined(EXR_X86)
+        if (use_frwd32) {
+            while (x < width) {
+                uint32_t u_q[2];
+                uint32_t bottom_vn[4];
+                u_q[0] = sp[1];
+                u_q[1] = sp[3];
+                if (u_q[0] > mmsbp2 || u_q[1] > mmsbp2) {
+                    rc = EXR_ERROR_CORRUPT;
+                    goto done;
+                }
+                jph_decode_two_quad32_frwd_avx2(dp, dp + sstr, bottom_vn, sp,
+                                                u_q, &magsgn_frwd, p);
+                for (uint32_t qn = 0u; qn < 2u; ++qn) {
+                    vp[0] = (uint32_t)(prev_v_n | bottom_vn[2u * qn]);
+                    prev_v_n = bottom_vn[2u * qn + 1u];
+                    ++vp;
+                }
+                dp += 4u;
+                x += 4u;
+                sp += 4u;
+            }
+        } else if (use_frwd16) {
+            while (x < width) {
+                uint32_t u_q[4];
+                uint16_t bottom_vn[8];
+                u_q[0] = sp[1];
+                u_q[1] = sp[3];
+                u_q[2] = sp[5];
+                u_q[3] = sp[7];
+                if (u_q[0] > mmsbp2 || u_q[1] > mmsbp2 ||
+                    u_q[2] > mmsbp2 || u_q[3] > mmsbp2) {
+                    rc = EXR_ERROR_CORRUPT;
+                    goto done;
+                }
+                jph_decode_four_quad16_frwd_avx2(dp, dp + sstr, bottom_vn, sp,
+                                                 u_q, &magsgn_frwd, p - 16u);
+                for (uint32_t qn = 0u; qn < 4u; ++qn) {
+                    vp[0] = (uint32_t)(prev_v_n | bottom_vn[2u * qn]);
+                    prev_v_n = bottom_vn[2u * qn + 1u];
+                    ++vp;
+                }
+                dp += 8u;
+                x += 8u;
+                sp += 8u;
+            }
+        } else if (use_four16 && height > 1u) {
+            while (x + 8u <= width) {
+                uint32_t u_q[4];
+                uint16_t bottom_vn[8];
+                u_q[0] = sp[1];
+                u_q[1] = sp[3];
+                u_q[2] = sp[5];
+                u_q[3] = sp[7];
+                if (u_q[0] > mmsbp2 || u_q[1] > mmsbp2 ||
+                    u_q[2] > mmsbp2 || u_q[3] > mmsbp2) {
+                    rc = EXR_ERROR_CORRUPT;
+                    goto done;
+                }
+                jph_decode_four_quad16_avx2(dp, dp + sstr, bottom_vn, sp, u_q,
+                                            magsgn.buf, magsgn.real_bits,
+                                            &magsgn.cursor, p - 16u);
+                for (uint32_t qn = 0u; qn < 4u; ++qn) {
+                    vp[0] = (uint32_t)(prev_v_n | bottom_vn[2u * qn]);
+                    prev_v_n = bottom_vn[2u * qn + 1u];
+                    ++vp;
+                }
+                dp += 8u;
+                x += 8u;
+                sp += 8u;
+            }
+        }
+#endif /* EXR_X86 */
         while (x < width) {
             uint32_t inf = sp[0];
             uint32_t U_q = sp[1];
@@ -3620,6 +3901,101 @@ static exr_result jph_decode_block(const JphCodeblockSeg *seg,
             prev_v_n = 0;
             sp = scratch + (y >> 1u) * sstr;
             dp = buf + y * sstr;
+#if defined(EXR_X86)
+            if (use_frwd32) {
+                while (x < width) {
+                    uint32_t u_q[2];
+                    uint32_t bottom_vn[4];
+                    for (uint32_t qn = 0u; qn < 2u; ++qn) {
+                        uint32_t inf = sp[2u * qn];
+                        uint32_t gamma = inf & 0xF0u;
+                        uint32_t emax_src = vp[qn] | vp[qn + 1u] | 2u;
+                        uint32_t emax = 31u - (uint32_t)jph_clz32(emax_src);
+                        uint32_t kappa;
+                        gamma &= gamma - 0x10u;
+                        kappa = gamma ? emax : 1u;
+                        u_q[qn] = (uint32_t)sp[2u * qn + 1u] + kappa;
+                    }
+                    if (u_q[0] > mmsbp2 || u_q[1] > mmsbp2) {
+                        rc = EXR_ERROR_CORRUPT;
+                        goto done;
+                    }
+                    jph_decode_two_quad32_frwd_avx2(dp, dp + sstr, bottom_vn,
+                                                    sp, u_q, &magsgn_frwd, p);
+                    for (uint32_t qn = 0u; qn < 2u; ++qn) {
+                        vp[0] = (uint32_t)(prev_v_n | bottom_vn[2u * qn]);
+                        prev_v_n = bottom_vn[2u * qn + 1u];
+                        ++vp;
+                    }
+                    dp += 4u;
+                    x += 4u;
+                    sp += 4u;
+                }
+            } else if (use_frwd16) {
+                while (x < width) {
+                    uint32_t u_q[4];
+                    uint16_t bottom_vn[8];
+                    for (uint32_t qn = 0u; qn < 4u; ++qn) {
+                        uint32_t inf = sp[2u * qn];
+                        uint32_t gamma = inf & 0xF0u;
+                        uint32_t emax_src = vp[qn] | vp[qn + 1u] | 2u;
+                        uint32_t emax = 31u - (uint32_t)jph_clz32(emax_src);
+                        uint32_t kappa;
+                        gamma &= gamma - 0x10u;
+                        kappa = gamma ? emax : 1u;
+                        u_q[qn] = (uint32_t)sp[2u * qn + 1u] + kappa;
+                    }
+                    if (u_q[0] > mmsbp2 || u_q[1] > mmsbp2 ||
+                        u_q[2] > mmsbp2 || u_q[3] > mmsbp2) {
+                        rc = EXR_ERROR_CORRUPT;
+                        goto done;
+                    }
+                    jph_decode_four_quad16_frwd_avx2(dp, dp + sstr, bottom_vn,
+                                                     sp, u_q, &magsgn_frwd,
+                                                     p - 16u);
+                    for (uint32_t qn = 0u; qn < 4u; ++qn) {
+                        vp[0] = (uint32_t)(prev_v_n | bottom_vn[2u * qn]);
+                        prev_v_n = bottom_vn[2u * qn + 1u];
+                        ++vp;
+                    }
+                    dp += 8u;
+                    x += 8u;
+                    sp += 8u;
+                }
+            } else if (use_four16 && y + 1u < height) {
+                while (x + 8u <= width) {
+                    uint32_t u_q[4];
+                    uint16_t bottom_vn[8];
+                    for (uint32_t qn = 0u; qn < 4u; ++qn) {
+                        uint32_t inf = sp[2u * qn];
+                        uint32_t gamma = inf & 0xF0u;
+                        uint32_t emax_src = vp[qn] | vp[qn + 1u] | 2u;
+                        uint32_t emax = 31u - (uint32_t)jph_clz32(emax_src);
+                        uint32_t kappa;
+                        gamma &= gamma - 0x10u;
+                        kappa = gamma ? emax : 1u;
+                        u_q[qn] = (uint32_t)sp[2u * qn + 1u] + kappa;
+                    }
+                    if (u_q[0] > mmsbp2 || u_q[1] > mmsbp2 ||
+                        u_q[2] > mmsbp2 || u_q[3] > mmsbp2) {
+                        rc = EXR_ERROR_CORRUPT;
+                        goto done;
+                    }
+                    jph_decode_four_quad16_avx2(dp, dp + sstr, bottom_vn, sp,
+                                                u_q, magsgn.buf,
+                                                magsgn.real_bits,
+                                                &magsgn.cursor, p - 16u);
+                    for (uint32_t qn = 0u; qn < 4u; ++qn) {
+                        vp[0] = (uint32_t)(prev_v_n | bottom_vn[2u * qn]);
+                        prev_v_n = bottom_vn[2u * qn + 1u];
+                        ++vp;
+                    }
+                    dp += 8u;
+                    x += 8u;
+                    sp += 8u;
+                }
+            }
+#endif /* EXR_X86 */
             while (x < width) {
                 uint32_t inf = sp[0];
                 uint32_t u_q = sp[1];
@@ -3908,26 +4284,32 @@ static exr_result jph_decode_block(const JphCodeblockSeg *seg,
     {
         uint32_t y;
         uint32_t shift = (kmax < 31u) ? 31u - kmax : 0u;
-#if defined(EXR_X86)
-        int use_avx2 = (exr_cpu_caps() & EXR_SIMD_AVX2) != 0;
-#endif
         for (y = 0u; y < height; ++y) {
             const uint32_t *brow = buf + (size_t)y * sstr;
-            int64_t *orow = out + (size_t)y * out_stride;
+            int64_t *orow64 = out64 ? out64 + (size_t)y * out_stride : NULL;
+            int32_t *orow32 = out32 ? out32 + (size_t)y * out_stride : NULL;
             uint32_t x;
 #if defined(EXR_X86)
-            if (use_avx2) {
-                jph_extract_signmag_i32_to_i64_avx2(orow, brow, width, shift);
+            if (use_avx2 && orow64) {
+                jph_extract_signmag_i32_to_i64_avx2(orow64, brow, width, shift);
+                continue;
+            }
+            if (use_avx2 && orow32) {
+                jph_extract_signmag_i32_to_i32_avx2(orow32, brow, width, shift);
                 continue;
             }
 #elif defined(EXR_NEON)
-            jph_extract_signmag_i32_to_i64_neon(orow, brow, width, shift);
-            continue;
+            if (orow64) {
+                jph_extract_signmag_i32_to_i64_neon(orow64, brow, width, shift);
+                continue;
+            }
 #endif
             for (x = 0u; x < width; ++x) {
                 uint32_t v = brow[x];
                 int32_t mag = (int32_t)((v & 0x7fffffffu) >> shift);
-                orow[x] = (v & 0x80000000u) ? -mag : mag;
+                int32_t outv = (v & 0x80000000u) ? -mag : mag;
+                if (orow32) orow32[x] = outv;
+                else orow64[x] = outv;
             }
         }
     }
@@ -3935,23 +4317,47 @@ static exr_result jph_decode_block(const JphCodeblockSeg *seg,
     rc = EXR_SUCCESS;
 
 done:
-    exr_free(exr_default_allocator(), scratch);
-    exr_free(exr_default_allocator(), v_n_scratch);
-    exr_free(exr_default_allocator(), buf);
-    exr_free(exr_default_allocator(), magsgn_bits);
-    exr_free(exr_default_allocator(), sigprop_bits);
+    if (!ws) {
+        exr_free(a, scratch);
+        exr_free(a, v_n_scratch);
+        exr_free(a, buf);
+        exr_free(a, magsgn_bits);
+        exr_free(a, sigprop_bits);
+    }
     return rc;
 }
 
+static exr_result jph_decode_block(const JphCodeblockSeg *seg,
+                                    const JphHtTables *htab,
+                                    int64_t *out, uint32_t out_stride,
+                                    uint32_t kmax, const exr_allocator *a) {
+    int use_avx2 = 0;
+#if defined(EXR_X86)
+    use_avx2 = (exr_cpu_caps() & EXR_SIMD_AVX2) != 0;
+#endif
+    return jph_decode_block_core(seg, htab, out, NULL, out_stride, kmax, a,
+                                 NULL, use_avx2);
+}
+
+static exr_result jph_decode_block_i32(const JphCodeblockSeg *seg,
+                                       const JphHtTables *htab,
+                                       int32_t *out, uint32_t out_stride,
+                                       uint32_t kmax, const exr_allocator *a,
+                                       JphDecodeWorkspace *ws, int use_avx2) {
+    return jph_decode_block_core(seg, htab, NULL, out, out_stride, kmax, a, ws,
+                                 use_avx2);
+}
+
 /* Subband-to-component-plane coordinate mapping. */
-static exr_result jph_subband_to_plane(const JphCodeblockSeg *seg,
-                                       const JphBandGeom *band,
-                                       const int64_t *cb, uint32_t cb_stride,
-                                       JphPlaneD *plane,
-                                       uint32_t num_decomps) {
+static exr_result jph_subband_origin(const JphCodeblockSeg *seg,
+                                     const JphBandGeom *band,
+                                     const JphPlaneD *plane,
+                                     uint32_t num_decomps,
+                                     uint32_t *out_row_off,
+                                     uint32_t *out_col_off) {
     uint32_t row_off, col_off;
-    uint32_t x, y;
-    if (!seg || !band || !cb || !plane || (!plane->d32 && !plane->d64)) {
+    if (!seg || !band || !plane || !out_row_off || !out_col_off ||
+        (!plane->d32 && !plane->d64)) {
         return EXR_ERROR_INVALID_ARGUMENT;
     }
     if (seg->band == 0u) {
@@ -3980,14 +4386,35 @@ static exr_result jph_subband_to_plane(const JphCodeblockSeg *seg,
     if (seg->x0 > band->w || seg->y0 > band->h) return EXR_ERROR_CORRUPT;
     if (seg->width > band->w - seg->x0) return EXR_ERROR_CORRUPT;
     if (seg->height > band->h - seg->y0) return EXR_ERROR_CORRUPT;
+    if (row_off + seg->y0 > plane->h ||
+        seg->height > plane->h - (row_off + seg->y0))
+        return EXR_ERROR_CORRUPT;
+    if (col_off + seg->x0 > plane->w ||
+        seg->width > plane->w - (col_off + seg->x0))
+        return EXR_ERROR_CORRUPT;
+
+    *out_row_off = row_off;
+    *out_col_off = col_off;
+    return EXR_SUCCESS;
+}
+
+static exr_result jph_subband_to_plane(const JphCodeblockSeg *seg,
+                                       const JphBandGeom *band,
+                                       const int64_t *cb, uint32_t cb_stride,
+                                       JphPlaneD *plane,
+                                       uint32_t num_decomps) {
+    uint32_t row_off, col_off;
+    uint32_t x, y;
+    exr_result rc;
+    if (!cb) return EXR_ERROR_INVALID_ARGUMENT;
+    rc = jph_subband_origin(seg, band, plane, num_decomps, &row_off, &col_off);
+    if (rc != EXR_SUCCESS) return rc;
 
     for (y = 0u; y < seg->height; ++y) {
         uint32_t g_row = row_off + seg->y0 + y;
-        if (g_row >= plane->h) return EXR_ERROR_CORRUPT;
         for (x = 0u; x < seg->width; ++x) {
             uint32_t g_col = col_off + seg->x0 + x;
             int64_t v = cb[y * cb_stride + x];
-            if (g_col >= plane->w) return EXR_ERROR_CORRUPT;
             /* All-half coefficients fit int32 (block32 path, kmax<=30). */
             if (plane->d32) plane->d32[g_row * plane->w + g_col] = (int32_t)v;
             else plane->d64[g_row * plane->w + g_col] = v;
@@ -4032,11 +4459,30 @@ static exr_result jph_decode_codeblock(void *user,
             return EXR_ERROR_CORRUPT;
         cb_size = (uint32_t)cb_bytes;
     }
+    if (st->planes[seg->comp].d32 && seg->missing_msbs < 30u &&
+        bands[seg->band].kmax <= 30u) {
+        uint32_t row_off, col_off;
+        JphPlaneD *plane = &st->planes[seg->comp];
+        int32_t *dst;
+        rc = jph_subband_origin(seg, &bands[seg->band], plane,
+                                st->jp->num_decomps, &row_off, &col_off);
+        if (rc != EXR_SUCCESS) return rc;
+        dst = plane->d32 + (size_t)(row_off + seg->y0) * plane->w +
+              (col_off + seg->x0);
+        rc = jph_decode_block_i32(seg, htab, dst, plane->w,
+                                  bands[seg->band].kmax, st->a, &st->ws,
+                                  st->use_avx2);
+        if (rc != EXR_SUCCESS) return rc;
+        if (exr_add_ovf(st->codeblocks, 1u, &st->codeblocks))
+            return EXR_ERROR_CORRUPT;
+        return EXR_SUCCESS;
+    }
+
     cb = (int64_t *)exr_calloc(st->a ? st->a : exr_default_allocator(),
                                cb_size ? cb_size : 1u, 1);
     if (!cb) return EXR_ERROR_OUT_OF_MEMORY;
-
-    rc = jph_decode_block(seg, htab, cb, cb_stride, bands[seg->band].kmax);
+    rc = jph_decode_block(seg, htab, cb, cb_stride, bands[seg->band].kmax,
+                          st->a);
     if (rc != EXR_SUCCESS) {
         exr_free(st->a ? st->a : exr_default_allocator(), cb);
         return rc;
@@ -4047,6 +4493,82 @@ static exr_result jph_decode_codeblock(void *user,
     if (rc != EXR_SUCCESS) return rc;
     if (exr_add_ovf(st->codeblocks, 1u, &st->codeblocks))
         return EXR_ERROR_CORRUPT;
+    return EXR_SUCCESS;
+}
+
+/* ---- GPU seam: code-block plan collector -------------------------------- */
+typedef struct {
+    const exr_allocator *a;
+    const JphProfile *jp;
+    JphPlaneD *planes;
+    uint16_t num_planes;
+    const uint8_t *tile_base;
+    exr_jph_cb_record *records;
+    size_t count;
+    size_t cap;
+    /* When gpu_fn is set, jph_decode_tile_payload decodes the collected blocks
+     * on the GPU and continues to scatter + inverse transform + store, instead
+     * of returning the plan to the caller. */
+    exr_jph_gpu_block_decode_fn gpu_fn;
+    void *gpu_user;
+} JphCollectState;
+
+static exr_result jph_collect_codeblock(void *user,
+                                        const JphCodeblockSeg *seg) {
+    JphCollectState *st = (JphCollectState *)user;
+    JphBandGeom bands[4];
+    JphPlaneD *plane;
+    uint32_t row_off, col_off, kmax;
+    exr_jph_cb_record *rec;
+    exr_result rc;
+    if (!st || !seg || !seg->data || seg->data_size == 0)
+        return EXR_ERROR_CORRUPT;
+    if (seg->comp >= st->num_planes) return EXR_ERROR_CORRUPT;
+    if (seg->width == 0u || seg->height == 0u ||
+        seg->width > 128u || seg->height > 32u)
+        return EXR_ERROR_CORRUPT;
+    plane = &st->planes[seg->comp];
+    rc = jph_build_band_geoms(st->jp, seg->comp, seg->res, bands, NULL);
+    if (rc != EXR_SUCCESS) return rc;
+    if (seg->band >= 4u || !bands[seg->band].exists) return EXR_ERROR_CORRUPT;
+    kmax = bands[seg->band].kmax;
+    rc = jph_subband_origin(seg, &bands[seg->band], plane,
+                            st->jp->num_decomps, &row_off, &col_off);
+    if (rc != EXR_SUCCESS) return rc;
+
+    if (st->count == st->cap) {
+        size_t ncap = st->cap ? st->cap * 2u : 256u;
+        exr_jph_cb_record *nr = (exr_jph_cb_record *)exr_malloc(
+            st->a, ncap * sizeof(*nr));
+        if (!nr) return EXR_ERROR_OUT_OF_MEMORY;
+        if (st->records) {
+            memcpy(nr, st->records, st->count * sizeof(*nr));
+            exr_free(st->a, st->records);
+        }
+        st->records = nr;
+        st->cap = ncap;
+    }
+    rec = &st->records[st->count++];
+    rec->width = seg->width;
+    rec->height = seg->height;
+    rec->missing_msbs = seg->missing_msbs;
+    rec->active_passes = seg->active_passes;
+    rec->length0 = seg->length0;
+    rec->length1 = seg->length1;
+    rec->kmax = kmax;
+    rec->comp = seg->comp;
+    rec->res = seg->res;
+    rec->band = seg->band;
+    rec->x0 = seg->x0;
+    rec->y0 = seg->y0;
+    rec->dst_row = row_off + seg->y0;
+    rec->dst_col = col_off + seg->x0;
+    rec->plane_w = plane->w;
+    rec->plane_h = plane->h;
+    rec->data_offset = (size_t)(seg->data - st->tile_base);
+    rec->data_size = seg->data_size;
+    rec->i32_eligible =
+        (plane->d32 != NULL && seg->missing_msbs < 30u && kmax <= 30u) ? 1 : 0;
     return EXR_SUCCESS;
 }
 
@@ -4124,7 +4646,8 @@ done:
 static exr_result jph_decode_tile_payload(const exr_codec_ctx *ctx,
                                           const JphProfile *jp,
                                           const uint16_t *map,
-                                          uint8_t *dst, size_t dst_size) {
+                                          uint8_t *dst, size_t dst_size,
+                                          JphCollectState *collect) {
     size_t expected = 0;
     size_t codeblocks = 0;
     JphDecodeState decode_state;
@@ -4137,7 +4660,7 @@ static exr_result jph_decode_tile_payload(const exr_codec_ctx *ctx,
                                      ctx->y, ctx->width, ctx->num_lines,
                                      &expected);
     if (rc != EXR_SUCCESS) return rc;
-    if (expected != dst_size) return EXR_ERROR_CORRUPT;
+    if (!collect && expected != dst_size) return EXR_ERROR_CORRUPT;
     if (jp->mc_trans != 0u && ctx->num_channels < 3) return EXR_ERROR_CORRUPT;
     decode_state.a = ctx->alloc ? ctx->alloc : exr_default_allocator();
     decode_state.jp = jp;
@@ -4152,9 +4675,83 @@ static exr_result jph_decode_tile_payload(const exr_codec_ctx *ctx,
             if (ctx->channels[i].pixel_type != EXR_PIXEL_HALF)
                 decode_state.use_i32 = 0;
     }
+#if defined(EXR_X86)
+    decode_state.use_avx2 = (exr_cpu_caps() & EXR_SIMD_AVX2) != 0;
+#endif
     rc = jph_alloc_component_planes(decode_state.a, jp, decode_state.use_i32,
                                     &decode_state.planes);
     if (rc != EXR_SUCCESS) return rc;
+    if (collect) {
+        /* GPU seam: walk the packets recording a code-block plan. */
+        collect->jp = jp;
+        collect->planes = decode_state.planes;
+        collect->num_planes = decode_state.num_planes;
+        collect->tile_base = jp->tile_data;
+        rc = jph_parse_tile_packets(ctx, jp, &codeblocks, jph_collect_codeblock,
+                                    collect);
+        if (rc != EXR_SUCCESS) goto done;
+        if (!collect->gpu_fn) goto done; /* pure-collect: hand plan to caller */
+
+        /* Whole-image GPU decode: decode all blocks on the device, scatter the
+         * tiles into the component planes, then inverse-transform + store. */
+        {
+            exr_jph_cb_plan plan;
+            size_t *offs = NULL, total = 0, i;
+            int32_t *coeffs = NULL;
+            int all_elig = 1;
+            for (i = 0; i < collect->count; ++i)
+                if (!collect->records[i].i32_eligible) { all_elig = 0; break; }
+            if (!all_elig) { rc = EXR_ERROR_UNSUPPORTED; goto done; }
+
+            offs = (size_t *)exr_malloc(decode_state.a,
+                                        (collect->count ? collect->count : 1u) *
+                                            sizeof(size_t));
+            if (!offs) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
+            for (i = 0; i < collect->count; ++i) {
+                uint32_t st = (collect->records[i].width + 7u) & ~7u;
+                offs[i] = total;
+                total += (size_t)st * collect->records[i].height;
+            }
+            coeffs = (int32_t *)exr_calloc(decode_state.a, total ? total : 1u,
+                                           sizeof(int32_t));
+            if (!coeffs) { exr_free(decode_state.a, offs); rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
+
+            memset(&plan, 0, sizeof(plan));
+            plan.records = collect->records;
+            plan.num_records = collect->count;
+            plan.data = (uint8_t *)(uintptr_t)jp->tile_data;
+            plan.data_size = jp->tile_data_size;
+            plan.num_components = (int)jp->csiz;
+            rc = collect->gpu_fn(collect->gpu_user, &plan, offs, total, coeffs);
+            if (rc != EXR_SUCCESS) { exr_free(decode_state.a, offs); exr_free(decode_state.a, coeffs); goto done; }
+
+            /* scatter each tile into its component plane (int32 path) */
+            for (i = 0; i < collect->count; ++i) {
+                const exr_jph_cb_record *rcd = &collect->records[i];
+                uint32_t st = (rcd->width + 7u) & ~7u, yy, xx;
+                JphPlaneD *pl = &decode_state.planes[rcd->comp];
+                const int32_t *tile = coeffs + offs[i];
+                if (!pl->d32) { rc = EXR_ERROR_UNSUPPORTED; break; }
+                for (yy = 0; yy < rcd->height; ++yy) {
+                    int32_t *drow = pl->d32 +
+                        (size_t)(rcd->dst_row + yy) * pl->w + rcd->dst_col;
+                    const int32_t *srow = tile + (size_t)yy * st;
+                    for (xx = 0; xx < rcd->width; ++xx) drow[xx] = srow[xx];
+                }
+            }
+            exr_free(decode_state.a, offs);
+            exr_free(decode_state.a, coeffs);
+            if (rc != EXR_SUCCESS) goto done;
+        }
+        rc = jph_postprocess_component_planes(decode_state.a, jp,
+                                              decode_state.planes,
+                                              &decode_state.ws);
+        if (rc != EXR_SUCCESS) goto done;
+        rc = jph_store_component_planes_to_block(ctx, jp, map,
+                                                 decode_state.planes, dst,
+                                                 dst_size);
+        goto done;
+    }
     rc = jph_parse_tile_packets(ctx, jp, &codeblocks, jph_decode_codeblock,
                                 &decode_state);
     if (rc != EXR_SUCCESS) goto done;
@@ -4164,7 +4761,8 @@ static exr_result jph_decode_tile_payload(const exr_codec_ctx *ctx,
     }
     if (codeblocks == 0 || codeblocks == decode_state.codeblocks) {
         rc = jph_postprocess_component_planes(decode_state.a, jp,
-                                              decode_state.planes);
+                                              decode_state.planes,
+                                              &decode_state.ws);
         if (rc != EXR_SUCCESS) goto done;
         rc = jph_store_component_planes_to_block(ctx, jp, map,
                                                  decode_state.planes, dst,
@@ -4174,6 +4772,7 @@ static exr_result jph_decode_tile_payload(const exr_codec_ctx *ctx,
     }
 
 done:
+    jph_decode_workspace_free(decode_state.a, &decode_state.ws);
     jph_free_component_planes(decode_state.a, decode_state.planes,
                               decode_state.num_planes);
     return rc;
@@ -4182,7 +4781,8 @@ done:
 static exr_result jph_validate_profile(const exr_codec_ctx *ctx,
                                        const uint16_t *map,
                                        const uint8_t *src, size_t src_size,
-                                       uint8_t *dst, size_t dst_size) {
+                                       uint8_t *dst, size_t dst_size,
+                                       JphCollectState *collect) {
     const exr_allocator *a = ctx->alloc ? ctx->alloc : exr_default_allocator();
     JphReader r;
     JphProfile jp;
@@ -4316,7 +4916,7 @@ static exr_result jph_validate_profile(const exr_codec_ctx *ctx,
         rc = jph_validate_siz_component(ctx, &jp, map, c);
         if (rc != EXR_SUCCESS) goto done;
     }
-    rc = jph_decode_tile_payload(ctx, &jp, map, dst, dst_size);
+    rc = jph_decode_tile_payload(ctx, &jp, map, dst, dst_size, collect);
 
 done:
     exr_free(a, jp.ssiz);
@@ -4393,9 +4993,132 @@ exr_result exr_jph_decompress(const exr_codec_ctx *ctx, const uint8_t *src,
         return EXR_ERROR_CORRUPT;
     }
     rc = jph_validate_profile(ctx, map, src + codestream_off,
-                              src_size - codestream_off, dst, dst_size);
+                              src_size - codestream_off, dst, dst_size, NULL);
     exr_free(ctx->alloc ? ctx->alloc : exr_default_allocator(), map);
     return rc;
+}
+
+/* ---- GPU seam: public-internal entry points ----------------------------- */
+exr_result exr_jph_collect_codeblocks(const exr_codec_ctx *ctx,
+                                      const uint8_t *src, size_t src_size,
+                                      exr_jph_cb_plan *out) {
+    const exr_allocator *a;
+    uint16_t *map = NULL;
+    size_t codestream_off = 0;
+    JphCollectState cs;
+    exr_result rc;
+
+    if (!ctx || !src || !out) return EXR_ERROR_INVALID_ARGUMENT;
+    a = ctx->alloc ? ctx->alloc : exr_default_allocator();
+    memset(out, 0, sizeof(*out));
+    memset(&cs, 0, sizeof(cs));
+    cs.a = a;
+
+    rc = jph_parse_ht_header(ctx, src, src_size, &map, &codestream_off);
+    if (rc != EXR_SUCCESS) return rc;
+    if (codestream_off >= src_size) {
+        exr_free(a, map);
+        return EXR_ERROR_CORRUPT;
+    }
+    /* jph_validate_profile -> jph_decode_tile_payload(collect) records the plan
+     * (and leaves cs.tile_base pointing into the validated codestream). */
+    rc = jph_validate_profile(ctx, map, src + codestream_off,
+                              src_size - codestream_off, NULL, 0, &cs);
+    exr_free(a, map);
+    if (rc != EXR_SUCCESS) {
+        exr_free(a, cs.records);
+        return rc;
+    }
+    /* Copy the tile codestream so record data_offsets stay valid after the
+     * caller frees src. tile_base points within [src, src+src_size). */
+    if (cs.count > 0 && cs.tile_base) {
+        size_t base_off = (size_t)(cs.tile_base - src);
+        size_t copy_size = src_size - base_off;
+        out->data = (uint8_t *)exr_malloc(a, copy_size ? copy_size : 1u);
+        if (!out->data) {
+            exr_free(a, cs.records);
+            return EXR_ERROR_OUT_OF_MEMORY;
+        }
+        memcpy(out->data, cs.tile_base, copy_size);
+        out->data_size = copy_size;
+    }
+    out->records = cs.records;
+    out->num_records = cs.count;
+    out->num_components = ctx->num_channels;
+    return EXR_SUCCESS;
+}
+
+void exr_jph_cb_plan_free(const exr_allocator *a, exr_jph_cb_plan *plan) {
+    if (!plan) return;
+    if (!a) a = exr_default_allocator();
+    exr_free(a, plan->records);
+    exr_free(a, plan->data);
+    memset(plan, 0, sizeof(*plan));
+}
+
+exr_result exr_jph_decompress_gpu(const exr_codec_ctx *ctx, const uint8_t *src,
+                                  size_t src_size, uint8_t *dst, size_t dst_size,
+                                  exr_jph_gpu_block_decode_fn fn, void *user) {
+    const exr_allocator *a;
+    uint16_t *map = NULL;
+    size_t codestream_off = 0;
+    JphCollectState cs;
+    exr_result rc;
+    if (!ctx || !src || !dst || !fn) return EXR_ERROR_INVALID_ARGUMENT;
+    a = ctx->alloc ? ctx->alloc : exr_default_allocator();
+    memset(&cs, 0, sizeof(cs));
+    cs.a = a;
+    cs.gpu_fn = fn;
+    cs.gpu_user = user;
+    rc = jph_parse_ht_header(ctx, src, src_size, &map, &codestream_off);
+    if (rc != EXR_SUCCESS) return rc;
+    if (codestream_off >= src_size) { exr_free(a, map); return EXR_ERROR_CORRUPT; }
+    rc = jph_validate_profile(ctx, map, src + codestream_off,
+                              src_size - codestream_off, dst, dst_size, &cs);
+    exr_free(a, map);
+    exr_free(a, cs.records);
+    return rc;
+}
+
+exr_result exr_jph_ht_tables(const uint16_t **vlc0, const uint16_t **vlc1,
+                             const uint16_t **uvlc0, const uint16_t **uvlc1) {
+    JphHtTables *t = NULL;
+    exr_result rc = jph_ht_ensure_tables(&t);
+    if (rc != EXR_SUCCESS) return rc;
+    if (vlc0) *vlc0 = t->vlc_tbl0;
+    if (vlc1) *vlc1 = t->vlc_tbl1;
+    if (uvlc0) *uvlc0 = t->uvlc_tbl0;
+    if (uvlc1) *uvlc1 = t->uvlc_tbl1;
+    return EXR_SUCCESS;
+}
+
+exr_result exr_jph_decode_one_block_i32(const exr_jph_cb_record *rec,
+                                        const uint8_t *data, int32_t *out,
+                                        uint32_t out_stride) {
+    JphCodeblockSeg seg;
+    JphHtTables *htab = NULL;
+    exr_result rc;
+    if (!rec || !data || !out) return EXR_ERROR_INVALID_ARGUMENT;
+    rc = jph_ht_ensure_tables(&htab);
+    if (rc != EXR_SUCCESS) return rc;
+    memset(&seg, 0, sizeof(seg));
+    seg.comp = rec->comp;
+    seg.res = rec->res;
+    seg.band = rec->band;
+    seg.x0 = rec->x0;
+    seg.y0 = rec->y0;
+    seg.missing_msbs = rec->missing_msbs;
+    seg.active_passes = rec->active_passes;
+    seg.length0 = rec->length0;
+    seg.length1 = rec->length1;
+    seg.width = rec->width;
+    seg.height = rec->height;
+    seg.data = data + rec->data_offset;
+    seg.data_size = rec->data_size;
+    /* Scalar reference (use_avx2=0): bit-identical to the SIMD path and to the
+     * GPU port, which mirrors the scalar reader/coder. */
+    return jph_decode_block_i32(&seg, htab, out, out_stride, rec->kmax,
+                                exr_default_allocator(), NULL, 0);
 }
 
 /* ----------------------------------------------------------------------------
@@ -4426,14 +5149,27 @@ static exr_result jph_forward_53_i32(const int32_t *src, size_t n,
     return EXR_SUCCESS;
 }
 
+/* Forward declarations for static functions defined after the 2D wrapper. */
+static exr_result jph_forward_53_vert_i32(const int32_t *data, size_t width,
+                                           size_t rw, size_t lh, size_t hh,
+                                           int32_t *temp);
+static exr_result jph_forward_53_1d_i32(const int32_t *src, size_t n,
+                                        int32_t *low, size_t lc, int32_t *high,
+                                        size_t hc, int use_simd, int64_t *ev,
+                                        int64_t *od);
+
 exr_result exr_jph_forward_53_2d_i32(const exr_allocator *a,
                                       int32_t *data, size_t width,
                                       size_t height, unsigned levels) {
     unsigned level;
+    int use_simd = 0;
     if (!a) a = exr_default_allocator();
     if (!data && width && height) return EXR_ERROR_INVALID_ARGUMENT;
     if (levels > 32) return EXR_ERROR_INVALID_ARGUMENT;
     if (width == 0 || height == 0 || levels == 0) return EXR_SUCCESS;
+#if defined(EXR_X86)
+    use_simd = (exr_cpu_caps() & EXR_SIMD_AVX2) != 0;
+#endif
 
     for (level = 1; level <= levels; ++level) {
         size_t rw = jph_ceil_div_pow2_size(width, level - 1u);
@@ -4442,7 +5178,8 @@ exr_result exr_jph_forward_53_2d_i32(const exr_allocator *a,
         size_t lh = (rh + 1u) / 2u, hh = rh / 2u;
         size_t temp_count, temp_bytes, scratch_len, scratch_bytes;
         int32_t *temp = NULL, *col_low = NULL, *col_high = NULL;
-        size_t y, x;
+        int64_t *ev = NULL, *od = NULL;
+        size_t y;
         exr_result rc = EXR_SUCCESS;
 
         if (rw == 0 || rh == 0) return EXR_ERROR_CORRUPT;
@@ -4456,30 +5193,42 @@ exr_result exr_jph_forward_53_2d_i32(const exr_allocator *a,
         temp = (int32_t *)exr_malloc(a, temp_bytes);
         col_low = (int32_t *)exr_malloc(a, scratch_bytes);
         col_high = (int32_t *)exr_malloc(a, scratch_bytes);
-        if (!temp || !col_low || !col_high) {
-            exr_free(a, temp); exr_free(a, col_low); exr_free(a, col_high);
+        if (use_simd) {
+            if (exr_mul_ovf(scratch_len, sizeof(int64_t), &scratch_bytes)) {
+                exr_free(a, temp); exr_free(a, col_low); exr_free(a, col_high);
+                return EXR_ERROR_CORRUPT;
+            }
+            ev = (int64_t *)exr_malloc(a, scratch_bytes);
+            od = (int64_t *)exr_malloc(a, scratch_bytes);
+        }
+        if (!temp || !col_low || !col_high ||
+            (use_simd && (!ev || !od))) {
+            exr_free(a, temp); exr_free(a, col_low);
+            exr_free(a, col_high); exr_free(a, ev); exr_free(a, od);
             return EXR_ERROR_OUT_OF_MEMORY;
         }
 
-        /* Column transform (vertical) */
-        for (x = 0; x < rw; ++x) {
-            for (y = 0; y < rh; ++y) col_low[y] = data[y * width + x];
-            rc = jph_forward_53_i32(col_low, rh, col_low, lh, col_high, hh);
-            if (rc != EXR_SUCCESS) goto done;
-            for (y = 0; y < lh; ++y) temp[y * rw + x] = col_low[y];
-            for (y = 0; y < hh; ++y) temp[(lh + y) * rw + x] = col_high[y];
-        }
-        /* Row transform (horizontal) */
+        /* Vertical (column) analysis, row-wise across all columns -- no gather/
+         * scatter. data's interleaved rows -> temp's lh low-rows / hh high-rows. */
+#if defined(EXR_X86)
+        if (use_simd)
+            rc = jph_forward_53_vert_i32_avx2(data, width, rw, lh, hh, temp);
+        else
+#endif
+            rc = jph_forward_53_vert_i32(data, width, rw, lh, hh, temp);
+        if (rc != EXR_SUCCESS) goto done_fwd32;
+        /* Horizontal (row) analysis: each temp row is contiguous. */
         for (y = 0; y < rh; ++y) {
-            rc = jph_forward_53_i32(temp + y * rw, rw,
-                                   col_low, lw, col_high, hw);
-            if (rc != EXR_SUCCESS) goto done;
-            for (x = 0; x < lw; ++x) data[y * width + x] = col_low[x];
-            for (x = 0; x < hw; ++x) data[y * width + lw + x] = col_high[x];
+            rc = jph_forward_53_1d_i32(temp + y * rw, rw, col_low, lw, col_high,
+                                       hw, use_simd, ev, od);
+            if (rc != EXR_SUCCESS) goto done_fwd32;
+            for (size_t x = 0; x < lw; ++x) data[y * width + x] = col_low[x];
+            for (size_t x = 0; x < hw; ++x) data[y * width + lw + x] = col_high[x];
         }
 
-done:
-        exr_free(a, temp); exr_free(a, col_low); exr_free(a, col_high);
+done_fwd32:
+        exr_free(a, temp); exr_free(a, col_low);
+        exr_free(a, col_high); exr_free(a, ev); exr_free(a, od);
         if (rc != EXR_SUCCESS) return rc;
     }
     return EXR_SUCCESS;
@@ -4488,9 +5237,15 @@ done:
 /* Forward RCT: R/G/B → Y/Cb/Cr (inverse of existing inverse_rct). */
 exr_result exr_jph_forward_rct_i32(int32_t *c0, int32_t *c1, int32_t *c2,
                                    size_t count) {
-    size_t i;
+    size_t i = 0;
     if ((!c0 || !c1 || !c2) && count) return EXR_ERROR_INVALID_ARGUMENT;
-    for (i = 0; i < count; ++i) {
+#if defined(EXR_X86)
+    if (exr_cpu_caps() & EXR_SIMD_AVX2)
+        i = jph_forward_rct_i32_avx2(c0, c1, c2, count);
+    else if (exr_cpu_caps() & EXR_SIMD_SSE2)
+        i = jph_forward_rct_i32_sse2(c0, c1, c2, count);
+#endif
+    for (; i < count; ++i) {
         int64_t r = c0[i], g = c1[i], b = c2[i];
         int64_t y  = jph_floor_div_pow2(r + b + 2 * g, 2);
         int64_t db = b - g;
@@ -4538,6 +5293,58 @@ exr_result exr_jph_forward_nlt_type3_i32(int32_t *data, size_t count,
         }
     }
     return EXR_SUCCESS;
+}
+
+/* Row-wise (column-parallel) forward reversible 5/3 vertical pass, int32. Source
+ * of truth for jph_forward_53_vert_i32_avx2 (must stay bit-identical). Reads the
+ * rh = lh+hh interleaved rows of `data` (stride `width`) -- even rows 2i, odd
+ * rows 2i+1 -- and writes the subband layout into `temp` (stride rw): lh low-rows
+ * [0..lh) then hh high-rows [lh..lh+hh). Per column this is exactly
+ * jph_forward_53_i32; doing it row-wise avoids the strided column gather/scatter
+ * (columns are the natural SIMD axis). `data` and `temp` are distinct buffers. */
+static exr_result jph_forward_53_vert_i32(const int32_t *data, size_t width,
+                                           size_t rw, size_t lh, size_t hh,
+                                           int32_t *temp) {
+    size_t i, c;
+    /* Phase 1: high rows -> temp[(lh+i)*rw] */
+    for (i = 0u; i < hh; ++i) {
+        const int32_t *e0 = data + (2u * i) * width;
+        const int32_t *e1 = data + (2u * (i + 1u < lh ? i + 1u : i)) * width;
+        const int32_t *od = data + (2u * i + 1u) * width;
+        int32_t *hd = temp + (lh + i) * rw;
+        for (c = 0u; c < rw; ++c)
+            hd[c] = (int32_t)((int64_t)od[c] -
+                              jph_floor_div_pow2((int64_t)e0[c] + (int64_t)e1[c], 1));
+    }
+    /* Phase 2: low rows -> temp[i*rw] */
+    for (i = 0u; i < lh; ++i) {
+        const int32_t *e0 = data + (2u * i) * width;
+        int32_t *ld = temp + i * rw;
+        if (hh == 0u) {
+            for (c = 0u; c < rw; ++c) ld[c] = e0[c];
+        } else {
+            const int32_t *hl = temp + (lh + (i > 0u ? i - 1u : 0u)) * rw;
+            const int32_t *hr = temp + (lh + (i < hh ? i : hh - 1u)) * rw;
+            for (c = 0u; c < rw; ++c)
+                ld[c] = (int32_t)((int64_t)e0[c] +
+                                  jph_floor_div_pow2((int64_t)hl[c] + (int64_t)hr[c] + 2, 2));
+        }
+    }
+    return EXR_SUCCESS;
+}
+
+/* Forward 1D 5/3 int32: AVX2 when available (bit-identical), else scalar. */
+static exr_result jph_forward_53_1d_i32(const int32_t *src, size_t n,
+                                        int32_t *low, size_t lc, int32_t *high,
+                                        size_t hc, int use_simd, int64_t *ev,
+                                        int64_t *od) {
+#if defined(EXR_X86)
+    if (use_simd)
+        return jph_forward_53_i32_avx2(src, n, low, lc, high, hc, ev, od);
+#else
+    (void)use_simd; (void)ev; (void)od;
+#endif
+    return jph_forward_53_i32(src, n, low, lc, high, hc);
 }
 
 /* ---- int64 forward variants (for >=32-bit-precision components) ----------
@@ -4591,6 +5398,7 @@ static exr_result jph_forward_53_1d_i64(const int64_t *src, size_t n,
  * [0..lh) then hh high-rows [lh..lh+hh). Per column this is exactly
  * jph_forward_53_i64; doing it row-wise avoids the strided column gather/scatter
  * (columns are the natural SIMD axis). `data` and `temp` are distinct buffers. */
+EXR_NO_SANITIZE_SIO
 exr_result jph_forward_53_vert_i64(const int64_t *data, size_t width,
                                    size_t rw, size_t lh, size_t hh,
                                    int64_t *temp) {
@@ -4871,57 +5679,106 @@ static void JPH_MAYBE_UNUSED jph_ensure_vlc_enc_tables(void) {
     }
 }
 
+void exr_jph_warmup_encode_tables(void) {
+    jph_ensure_uvlc_enc_tables();
+    jph_ensure_vlc_enc_tables();
+}
+
 /* ----------------------------------------------------------------------------
  * HT codeblock encoder (port of OpenJPH ojph_encode_codeblock32).
  * ------------------------------------------------------------------------- */
 
-/* Forward-growing MagSgn bit writer */
+/* Forward-growing MagSgn bit writer with a 64-bit accumulator and bulk byte
+ * flush. Bits accumulate LSB-first in `acc`; bytes are sliced off `max_bits`
+ * wide (8 normally, 7 right after a 0xFF byte — the JPEG2000 bit-stuffing that
+ * keeps the segment free of false marker codes). The byte-exact equivalent of
+ * the previous byte-at-a-time writer; the only change is that runs of
+ * non-0xFF bytes are emitted in one store via a SWAR 0xFF scan. */
 typedef struct {
     uint8_t *buf; uint32_t pos; uint32_t cap;
-    uint32_t tmp; int used_bits; int max_bits;
+    uint64_t acc;     /* pending bits, LSB-first (bits >= nbits are 0) */
+    int nbits;        /* valid bits in acc (< max_bits once flushed) */
+    int max_bits;     /* width of the next byte: 8, or 7 right after a 0xFF */
 } JphMsEnc;
 
-static void jph_ms_init(JphMsEnc *m, uint8_t *buf, uint32_t cap) {
+static inline void jph_ms_init(JphMsEnc *m, uint8_t *buf, uint32_t cap) {
     m->buf = buf; m->pos = 0; m->cap = cap;
-    m->tmp = 0; m->used_bits = 0; m->max_bits = 8;
+    m->acc = 0; m->nbits = 0; m->max_bits = 8;
 }
 
-static exr_result jph_ms_encode(JphMsEnc *m, uint32_t cwd, int cwd_len) {
-    while (cwd_len > 0) {
-        if (m->pos >= m->cap) return EXR_ERROR_CORRUPT;
-        int t = (m->max_bits - m->used_bits < cwd_len) ? m->max_bits - m->used_bits : cwd_len;
-        m->tmp |= (cwd & ((1U << t) - 1)) << m->used_bits;
-        m->used_bits += t;
-        cwd >>= t; cwd_len -= t;
-        if (m->used_bits >= m->max_bits) {
-            m->buf[m->pos++] = (uint8_t)m->tmp;
-            m->max_bits = (m->tmp == 0xFF) ? 7 : 8;
-            m->tmp = 0; m->used_bits = 0;
+/* Emit every complete byte currently in acc. When max_bits==8 (no pending
+ * stuffing) the low bytes of acc ARE the output bytes, so a run with no 0xFF is
+ * stored in bulk; the first 0xFF byte ends the run and forces the next byte to
+ * 7-bit (which can never be 0xFF, re-aligning the accumulator to 8-bit). */
+static inline exr_result jph_ms_flush(JphMsEnc *m) {
+    while (m->nbits >= m->max_bits) {
+        if (m->max_bits == 8) {
+            int avail = m->nbits >> 3;            /* complete bytes available */
+            uint64_t t = m->acc ^ ~UINT64_C(0);   /* 0xFF bytes -> 0x00 */
+            uint64_t hasff;
+            int run;
+            if (avail < 8)
+                t |= ~((UINT64_C(1) << (avail * 8)) - 1u); /* ignore high bytes */
+            hasff = (t - 0x0101010101010101ULL) & ~t & 0x8080808080808080ULL;
+            if (hasff == 0) {
+                run = avail;                       /* no 0xFF in the run */
+            } else {
+                run = 1;                           /* find first 0xFF byte */
+                while (((m->acc >> ((run - 1) * 8)) & 0xFFu) != 0xFFu) ++run;
+            }
+            if (m->pos + (uint32_t)run > m->cap) return EXR_ERROR_CORRUPT;
+            if (m->pos + 8u <= m->cap) {
+                uint64_t le = m->acc;              /* little-endian == stream order */
+                memcpy(m->buf + m->pos, &le, 8);   /* slack bytes get overwritten */
+            } else {
+                int i;
+                for (i = 0; i < run; ++i)
+                    m->buf[m->pos + i] = (uint8_t)(m->acc >> (i * 8));
+            }
+            m->pos += (uint32_t)run;
+            m->acc = (run >= 8) ? 0 : (m->acc >> (run * 8)); /* >>64 is UB */
+            m->nbits -= run * 8;
+            if (hasff != 0) m->max_bits = 7;       /* last emitted byte was 0xFF */
+        } else {
+            uint8_t byte;                          /* max_bits == 7 */
+            if (m->pos >= m->cap) return EXR_ERROR_CORRUPT;
+            byte = (uint8_t)(m->acc & 0x7Fu);
+            m->buf[m->pos++] = byte;
+            m->acc >>= 7; m->nbits -= 7;
+            m->max_bits = 8;                       /* a 7-bit byte is never 0xFF */
         }
     }
     return EXR_SUCCESS;
 }
 
-static exr_result jph_ms_encode64(JphMsEnc *m, uint64_t cwd, int cwd_len) {
+static inline exr_result jph_ms_encode64(JphMsEnc *m, uint64_t cwd, int cwd_len) {
     while (cwd_len > 0) {
-        int chunk = cwd_len > 31 ? 31 : cwd_len;
-        exr_result rc =
-            jph_ms_encode(m, (uint32_t)(cwd & ((UINT64_C(1) << chunk) - 1u)),
-                          chunk);
+        int take = 64 - m->nbits;
+        exr_result rc;
+        if (take > cwd_len) take = cwd_len;
+        m->acc |= (cwd & (take < 64 ? ((UINT64_C(1) << take) - 1u) : ~UINT64_C(0)))
+                  << m->nbits;
+        m->nbits += take;
+        cwd >>= take; cwd_len -= take;
+        rc = jph_ms_flush(m);
         if (rc != EXR_SUCCESS) return rc;
-        cwd >>= chunk;
-        cwd_len -= chunk;
     }
     return EXR_SUCCESS;
 }
 
-static exr_result jph_ms_terminate(JphMsEnc *m) {
-    if (m->used_bits) {
-        int t = m->max_bits - m->used_bits;
-        m->tmp |= (0xFF & ((1U << t) - 1)) << m->used_bits;
-        if (m->tmp != 0xFFu) {
+static inline exr_result jph_ms_encode(JphMsEnc *m, uint32_t cwd, int cwd_len) {
+    if (cwd_len <= 0) return EXR_SUCCESS;
+    return jph_ms_encode64(m, cwd, cwd_len);
+}
+
+static inline exr_result jph_ms_terminate(JphMsEnc *m) {
+    if (m->nbits) {
+        int t = m->max_bits - m->nbits;
+        uint32_t tmp = (uint32_t)(m->acc & 0xFFu);
+        tmp |= (0xFFu & ((1U << t) - 1u)) << m->nbits;
+        if (tmp != 0xFFu) {
             if (m->pos >= m->cap) return EXR_ERROR_CORRUPT;
-            m->buf[m->pos++] = (uint8_t)m->tmp;
+            m->buf[m->pos++] = (uint8_t)tmp;
         }
     } else if (m->max_bits == 7 && m->pos > 0u) {
         m->pos--;
@@ -4935,7 +5792,7 @@ typedef struct {
     int remaining_bits; int tmp; int run; int k; int threshold;
 } JphMelEnc;
 
-static void jph_mel_enc_init(JphMelEnc *m, uint8_t *buf, uint32_t cap) {
+static inline void jph_mel_enc_init(JphMelEnc *m, uint8_t *buf, uint32_t cap) {
     m->buf = buf; m->pos = 0; m->cap = cap;
     m->remaining_bits = 8; m->tmp = 0; m->run = 0; m->k = 0;
     m->threshold = 1;
@@ -4953,7 +5810,7 @@ static exr_result jph_mel_enc_emit_bit(JphMelEnc *m, int v) {
     return EXR_SUCCESS;
 }
 
-static exr_result jph_mel_enc_encode(JphMelEnc *m, int bit) {
+static inline exr_result jph_mel_enc_encode(JphMelEnc *m, int bit) {
     static const int mel_exp[13] = {0,0,0,1,1,1,2,2,2,3,3,4,5};
     exr_result rc;
     if (bit == 0) {
@@ -4984,39 +5841,52 @@ static exr_result jph_mel_enc_encode(JphMelEnc *m, int bit) {
 /* VLC encoder (backward-growing) */
 typedef struct {
     uint8_t *buf; uint32_t pos; uint32_t cap;
-    int used_bits; int tmp; int last_greater_than_8F;
+    int used_bits; uint64_t tmp; int last_greater_than_8F;
 } JphVlcEnc;
 
-static void jph_vlc_enc_init(JphVlcEnc *v, uint8_t *buf, uint32_t cap) {
+static inline void jph_vlc_enc_init(JphVlcEnc *v, uint8_t *buf, uint32_t cap) {
     v->buf = buf + cap - 1; v->pos = 1; v->cap = cap;
     v->buf[0] = 0xFF;
     v->used_bits = 4; v->tmp = 0xF;
     v->last_greater_than_8F = 1;
 }
 
-static exr_result jph_vlc_enc_encode(JphVlcEnc *v, int cwd, int cwd_len) {
-    while (cwd_len > 0) {
+static inline exr_result jph_vlc_enc_encode(JphVlcEnc *v, int cwd, int cwd_len) {
+    if (cwd_len <= 0) return EXR_SUCCESS;
+    v->tmp |= (uint64_t)(uint32_t)cwd << v->used_bits;
+    v->used_bits += cwd_len;
+    while (v->used_bits >= 8) {
+        uint8_t b;
         if (v->pos >= v->cap) return EXR_ERROR_CORRUPT;
-        int avail_bits = 8 - v->last_greater_than_8F - v->used_bits;
-        int t = (avail_bits < cwd_len) ? avail_bits : cwd_len;
-        v->tmp |= (cwd & ((1 << t) - 1)) << v->used_bits;
-        v->used_bits += t;
-        avail_bits -= t; cwd_len -= t; cwd >>= t;
-        if (avail_bits == 0) {
-            if (v->last_greater_than_8F && v->tmp != 0x7F) {
+        if (v->last_greater_than_8F) {
+            b = (uint8_t)(v->tmp & 0x7Fu);
+            if (b != 0x7Fu) {
+                b = (uint8_t)(v->tmp & 0xFFu);
+                *(v->buf - v->pos) = b;
+                v->pos++;
+                v->last_greater_than_8F = (b > 0x8Fu) ? 1 : 0;
+                v->tmp >>= 8;
+                v->used_bits -= 8;
+            } else {
+                *(v->buf - v->pos) = b;
+                v->pos++;
                 v->last_greater_than_8F = 0;
-                continue;
+                v->tmp >>= 7;
+                v->used_bits -= 7;
             }
-            *(v->buf - v->pos) = (uint8_t)v->tmp;
+        } else {
+            b = (uint8_t)(v->tmp & 0xFFu);
+            *(v->buf - v->pos) = b;
             v->pos++;
-            v->last_greater_than_8F = (v->tmp > 0x8F) ? 1 : 0;
-            v->tmp = 0; v->used_bits = 0;
+            v->last_greater_than_8F = (b > 0x8Fu) ? 1 : 0;
+            v->tmp >>= 8;
+            v->used_bits -= 8;
         }
     }
     return EXR_SUCCESS;
 }
 
-static exr_result jph_mel_vlc_terminate(JphMelEnc *m, JphVlcEnc *v) {
+static inline exr_result jph_mel_vlc_terminate(JphMelEnc *m, JphVlcEnc *v) {
     exr_result rc;
     if (m->run > 0) { rc = jph_mel_enc_emit_bit(m, 1); if (rc != EXR_SUCCESS) return rc; }
     m->tmp = m->tmp << m->remaining_bits;
@@ -5024,20 +5894,21 @@ static exr_result jph_mel_vlc_terminate(JphMelEnc *m, JphVlcEnc *v) {
     int vlc_mask = 0xFF >> (8 - v->used_bits);
     if ((mel_mask | vlc_mask) == 0) return EXR_SUCCESS;
     if (m->pos >= m->cap) return EXR_ERROR_CORRUPT;
-    int fuse = m->tmp | v->tmp;
-    if (((((fuse ^ m->tmp) & mel_mask) | ((fuse ^ v->tmp) & vlc_mask)) == 0)
+    int vtmp = (int)(v->tmp & 0xFFu);
+    int fuse = m->tmp | vtmp;
+    if (((((fuse ^ m->tmp) & mel_mask) | ((fuse ^ vtmp) & vlc_mask)) == 0)
         && (fuse != 0xFF) && v->pos > 1) {
         m->buf[m->pos++] = (uint8_t)fuse;
     } else {
         if (v->pos >= v->cap) return EXR_ERROR_CORRUPT;
         m->buf[m->pos++] = (uint8_t)m->tmp;
-        *(v->buf - v->pos) = (uint8_t)v->tmp;
+        *(v->buf - v->pos) = (uint8_t)vtmp;
         v->pos++;
     }
     return EXR_SUCCESS;
 }
 
-static int jph_clz64(uint64_t v) {
+static inline int jph_clz64(uint64_t v) {
     if (!v) return 64;
 #if defined(__GNUC__) || defined(__clang__)
     return __builtin_clzll(v); /* single lzcnt/bsr on x86; v != 0 guaranteed */
@@ -5055,34 +5926,56 @@ static int jph_clz64(uint64_t v) {
 #endif
 }
 
-/* abs() of a coefficient that may exceed int32 (32-bit-precision components). */
-static uint64_t jph_abs_i64_to_u64(int64_t v) {
-    if (v < 0) return (uint64_t)(-(v + 1)) + 1u; /* avoids -INT64_MIN UB */
-    return (uint64_t)v;
+static inline int jph_clz32(uint32_t v) {
+    if (!v) return 32;
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_clz(v);
+#else
+    {
+        int n = 0;
+        if (!(v & UINT32_C(0xFFFF0000))) { n += 16; v <<= 16; }
+        if (!(v & UINT32_C(0xFF000000))) { n += 8;  v <<= 8;  }
+        if (!(v & UINT32_C(0xF0000000))) { n += 4;  v <<= 4;  }
+        if (!(v & UINT32_C(0xC0000000))) { n += 2;  v <<= 2;  }
+        if (!(v & UINT32_C(0x80000000))) { n += 1;  }
+        return n;
+    }
+#endif
 }
 
-static uint64_t jph_encode_block_sample(const int64_t *plane_data,
+/* abs() of a coefficient that may exceed int32 (32-bit-precision components). */
+static inline uint64_t jph_abs_i64_to_u64(int64_t v) {
+    uint64_t mask = (uint64_t)(v >> 63); /* 0 for v>=0, ~0 for v<0 */
+    return ((uint64_t)v ^ mask) - mask;
+}
+
+static inline uint64_t jph_encode_block_sample(const int64_t *plane_data,
                                         uint32_t plane_stride,
                                         uint32_t cb_x0, uint32_t cb_y0,
                                         uint32_t x, uint32_t y,
                                         uint32_t shift) {
     int64_t sv = plane_data[(cb_y0 + y) * plane_stride + (cb_x0 + x)];
-    uint64_t sign = sv < 0 ? UINT64_C(0x8000000000000000) : 0u;
+    uint64_t sign = (uint64_t)(sv >> 63) & UINT64_C(0x8000000000000000);
     uint64_t mag = jph_abs_i64_to_u64(sv);
     return sign | (mag << shift);
 }
 
-static void jph_encode_block_prepare_sample(const int64_t *plane_data,
-                                            uint32_t plane_stride,
-                                            uint32_t cb_x0, uint32_t cb_y0,
-                                            uint32_t x, uint32_t y,
-                                            uint32_t shift, uint32_t p,
-                                            int *rho, int *e_qmax,
-                                            int *e_q, uint64_t *s,
-                                            int bit) {
+static inline void jph_encode_block_prepare_sample(const int64_t *plane_data,
+                                                    uint32_t plane_stride,
+                                                    uint32_t cb_x0,
+                                                    uint32_t cb_y0, uint32_t x,
+                                                    uint32_t y, uint32_t shift,
+                                                    uint32_t p, int *rho,
+                                                    int *e_qmax, int *e_q,
+                                                    uint64_t *s, int bit,
+                                                    uint64_t *max_val) {
     uint64_t t, val;
     t = jph_encode_block_sample(plane_data, plane_stride, cb_x0, cb_y0,
                                 x, y, shift);
+    if (max_val) {
+        uint64_t absv = (t << 1) >> (shift + 1u);
+        if (absv > *max_val) *max_val = absv;
+    }
     val = t + t;
     val >>= p;
     val &= ~UINT64_C(1);
@@ -5099,7 +5992,111 @@ static void jph_encode_block_prepare_sample(const int64_t *plane_data,
     }
 }
 
-static exr_result jph_encode_uvlc_pair(JphVlcEnc *vlc, int u_q0,
+static inline void jph_encode_block_prepare_sample32(const int64_t *plane_data,
+                                                      uint32_t plane_stride,
+                                                      uint32_t cb_x0,
+                                                      uint32_t cb_y0,
+                                                      uint32_t x, uint32_t y,
+                                                      uint32_t shift, uint32_t p,
+                                                      int *rho, int *e_qmax,
+                                                      int *e_q, uint64_t *s,
+                                                      int bit,
+                                                      uint64_t *max_val) {
+    int64_t sv = plane_data[(cb_y0 + y) * plane_stride + (cb_x0 + x)];
+    uint32_t mag = (uint32_t)jph_abs_i64_to_u64(sv);
+    if (max_val) {
+        uint64_t absv = (uint64_t)mag;
+        if (absv > *max_val) *max_val = absv;
+    }
+    uint32_t t = (sv < 0 ? UINT32_C(0x80000000) : 0u) | (mag << shift);
+    uint32_t val = t + t;
+    val >>= p;
+    val &= ~UINT32_C(1);
+    if (val) {
+        int eq;
+        *rho |= bit;
+        eq = 32 - jph_clz32(--val);
+        *e_q = eq;
+        if (eq > *e_qmax) *e_qmax = eq;
+        *s = (uint64_t)(--val + (t >> 31u));
+    } else {
+        *e_q = 0;
+        *s = 0;
+    }
+}
+
+/* int32-native variant of jph_encode_block_prepare_sample32: reads the sample
+ * straight from an int32 plane (all-HALF path) instead of an int64 plane. The
+ * arithmetic is identical to the int64 version's low-32-bit result, so the
+ * encoded output is byte-for-byte the same. */
+static inline void jph_encode_block_prepare_sample_from32(
+    const int32_t *plane_data, uint32_t plane_stride, uint32_t cb_x0,
+    uint32_t cb_y0, uint32_t x, uint32_t y, uint32_t shift, uint32_t p,
+    int *rho, int *e_qmax, int *e_q, uint64_t *s, int bit, uint64_t *max_val) {
+    int32_t sv = plane_data[(cb_y0 + y) * plane_stride + (cb_x0 + x)];
+    uint32_t mag = (uint32_t)jph_abs_i64_to_u64((int64_t)sv);
+    if (max_val) {
+        uint64_t absv = (uint64_t)mag;
+        if (absv > *max_val) *max_val = absv;
+    }
+    uint32_t t = (sv < 0 ? UINT32_C(0x80000000) : 0u) | (mag << shift);
+    uint32_t val = t + t;
+    val >>= p;
+    val &= ~UINT32_C(1);
+    if (val) {
+        int eq;
+        *rho |= bit;
+        eq = 32 - jph_clz32(--val);
+        *e_q = eq;
+        if (eq > *e_qmax) *e_qmax = eq;
+        *s = (uint64_t)(--val + (t >> 31u));
+    } else {
+        *e_q = 0;
+        *s = 0;
+    }
+}
+
+#if defined(EXR_X86)
+/* Dispatch the SSE2 quad prepare to the int32-native or int64 loader. */
+static inline void jph_encode_prepare_quad_dispatch(
+    const int64_t *plane_data, const int32_t *plane_data32, uint32_t stride,
+    uint32_t x0, uint32_t y0, uint32_t x, uint32_t y, uint32_t shift,
+    uint32_t p, int *rho, int *e_qmax, int e_q[4], uint64_t s[4],
+    uint64_t *max_val) {
+    if (plane_data32)
+        jph_encode_prepare_quad_from32_sse2(plane_data32, stride, x0, y0, x, y,
+                                            shift, p, rho, e_qmax, e_q, s,
+                                            max_val);
+    else
+        jph_encode_prepare_quad_i32_sse2(plane_data, stride, x0, y0, x, y,
+                                         shift, p, rho, e_qmax, e_q, s,
+                                         max_val);
+}
+#endif
+
+static inline void jph_encode_block_prepare_sample_fast(
+    const int64_t *plane_data, const int32_t *plane_data32,
+    uint32_t plane_stride, uint32_t cb_x0,
+    uint32_t cb_y0, uint32_t x, uint32_t y, uint32_t shift, uint32_t p,
+    int use_i32, int *rho, int *e_qmax, int *e_q, uint64_t *s, int bit,
+    uint64_t *max_val) {
+    if (plane_data32) {
+        jph_encode_block_prepare_sample_from32(plane_data32, plane_stride,
+                                               cb_x0, cb_y0, x, y, shift, p,
+                                               rho, e_qmax, e_q, s, bit,
+                                               max_val);
+    } else if (use_i32) {
+        jph_encode_block_prepare_sample32(plane_data, plane_stride, cb_x0,
+                                          cb_y0, x, y, shift, p, rho, e_qmax,
+                                          e_q, s, bit, max_val);
+    } else {
+        jph_encode_block_prepare_sample(plane_data, plane_stride, cb_x0, cb_y0,
+                                        x, y, shift, p, rho, e_qmax, e_q, s,
+                                        bit, max_val);
+    }
+}
+
+static inline exr_result jph_encode_uvlc_pair(JphVlcEnc *vlc, int u_q0,
                                        int u_q1, int initial_line) {
     exr_result rc;
     if (u_q0 < 0 || u_q1 < 0 || u_q0 >= 75 || u_q1 >= 75)
@@ -5157,17 +6154,315 @@ static exr_result jph_encode_uvlc_pair(JphVlcEnc *vlc, int u_q0,
                               g_uvlc_enc_tbl[u_q1].ext_len);
 }
 
-static exr_result jph_encode_mag_bits(JphMsEnc *ms, uint64_t s,
-                                      int rho, int bit, int Uq,
-                                      uint16_t tuple) {
-    int m = (rho & bit) ? Uq - ((tuple & bit) ? 1 : 0) : 0;
-    if (m <= 0) return EXR_SUCCESS;
-    if (m >= 64) return EXR_ERROR_CORRUPT;
-    return jph_ms_encode64(ms, s & jph_mask64((uint32_t)m), m);
+static inline exr_result jph_encode_mag_bits_pair(JphMsEnc *ms, uint64_t s0,
+                                                  uint64_t s1, int rho,
+                                                  int bit0, int bit1, int Uq,
+                                                  uint16_t tuple) {
+    int m0 = (rho & bit0) ? Uq - ((tuple & bit0) ? 1 : 0) : 0;
+    int m1 = (rho & bit1) ? Uq - ((tuple & bit1) ? 1 : 0) : 0;
+    uint64_t cwd;
+    int cwd_len;
+
+    if (m0 < 0 || m1 < 0 || m0 >= 64 || m1 >= 64) return EXR_ERROR_CORRUPT;
+    if ((m0 | m1) == 0) return EXR_SUCCESS;
+    if (m0 == 0) return jph_ms_encode64(ms, s1 & jph_mask64((uint32_t)m1), m1);
+    if (m1 == 0) return jph_ms_encode64(ms, s0 & jph_mask64((uint32_t)m0), m0);
+
+    cwd_len = m0 + m1;
+    if (cwd_len < 64) {
+        cwd = s0 & jph_mask64((uint32_t)m0);
+        cwd |= (s1 & jph_mask64((uint32_t)m1)) << (uint32_t)m0;
+        return jph_ms_encode64(ms, cwd, cwd_len);
+    }
+
+    {
+        exr_result rc =
+            jph_ms_encode64(ms, s0 & jph_mask64((uint32_t)m0), m0);
+        if (rc != EXR_SUCCESS) return rc;
+        return jph_ms_encode64(ms, s1 & jph_mask64((uint32_t)m1), m1);
+    }
 }
 
-/* Encode one HT codeblock. */
-static exr_result JPH_MAYBE_UNUSED jph_encode_block(const int64_t *plane_data,
+static inline exr_result jph_encode_mag_bits_quad(JphMsEnc *ms,
+                                                  const uint64_t *s, int rho,
+                                                  int Uq, uint16_t tuple) {
+    exr_result rc;
+    rc = jph_encode_mag_bits_pair(ms, s[0], s[1], rho, 1, 2, Uq, tuple);
+    if (rc != EXR_SUCCESS) return rc;
+    return jph_encode_mag_bits_pair(ms, s[2], s[3], rho, 4, 8, Uq, tuple);
+}
+
+#if defined(EXR_X86)
+/* Emit one quad's MagSgn bits from the Stage-C precomputed m_n / masked cwd_s
+ * (sample-major [k*8+q]); the pair assembly + bit-append match the scalar
+ * jph_encode_mag_bits_pair exactly but skip the now-vectorized m_n + masking. */
+static inline exr_result jph_emit_mag_quad_pre(JphMsEnc *ms, const int32_t *m_n,
+                                               const int32_t *cwd_s, int q) {
+    /* The MagSgn writer is a continuous bitstream, so emitting the quad's four
+     * samples [s0|s1|s2|s3] as one codeword produces the exact same bytes as the
+     * per-pair emit but with one ms_encode64 call instead of two. cwd_s is
+     * pre-masked to m_n bits, so zero-magnitude samples contribute nothing. */
+    int m0 = m_n[q], m1 = m_n[8 + q], m2 = m_n[16 + q], m3 = m_n[24 + q];
+    int L;
+    if ((unsigned)m0 >= 64u || (unsigned)m1 >= 64u ||
+        (unsigned)m2 >= 64u || (unsigned)m3 >= 64u)
+        return EXR_ERROR_CORRUPT;       /* also catches negative (wraps high) */
+    L = m0 + m1 + m2 + m3;
+    if (L == 0) return EXR_SUCCESS;
+    if (L < 64) {
+        uint64_t cwd = (uint32_t)cwd_s[q];
+        cwd |= (uint64_t)(uint32_t)cwd_s[8 + q] << m0;
+        cwd |= (uint64_t)(uint32_t)cwd_s[16 + q] << (m0 + m1);
+        cwd |= (uint64_t)(uint32_t)cwd_s[24 + q] << (m0 + m1 + m2);
+        return jph_ms_encode64(ms, cwd, L);
+    }
+    /* Rare L>=64: emit per pair (continuous-bitstream equivalent). */
+    {
+        int pr;
+        for (pr = 0; pr < 2; ++pr) {
+            int k0 = pr * 2;
+            int a0 = m_n[k0 * 8 + q], a1 = m_n[(k0 + 1) * 8 + q];
+            uint64_t d0 = (uint32_t)cwd_s[k0 * 8 + q];
+            uint64_t d1 = (uint32_t)cwd_s[(k0 + 1) * 8 + q];
+            exr_result rc;
+            if ((a0 | a1) == 0) continue;
+            if (a0 == 0) rc = jph_ms_encode64(ms, d1, a1);
+            else if (a1 == 0) rc = jph_ms_encode64(ms, d0, a0);
+            else if (a0 + a1 < 64)
+                rc = jph_ms_encode64(ms, d0 | (d1 << (uint32_t)a0), a0 + a1);
+            else {
+                rc = jph_ms_encode64(ms, d0, a0);
+                if (rc != EXR_SUCCESS) return rc;
+                rc = jph_ms_encode64(ms, d1, a1);
+            }
+            if (rc != EXR_SUCCESS) return rc;
+        }
+    }
+    return EXR_SUCCESS;
+}
+
+/* Build a zero-padded 16x2 int32 tile for the 8-quad AVX2 prepare kernel: tile
+ * columns [0,16) map to codeblock columns [xg, xg+16); out-of-range columns and
+ * (for odd height) the absent bottom row are zeroed, matching the scalar
+ * prepare's treatment of edge samples. tile[0..15]=row y, tile[16..31]=row y+1. */
+static inline void jph_enc_build_tile_i32(int32_t tile[32],
+                                          const int64_t *p64, const int32_t *p32,
+                                          uint32_t stride, uint32_t x0,
+                                          uint32_t y0, uint32_t xg, uint32_t y,
+                                          uint32_t width, uint32_t height) {
+    uint32_t cmax = width - xg;          /* real columns in this group (>=1) */
+    int has_row1 = (y + 1u < height);
+    uint32_t c;
+    if (cmax > 16u) cmax = 16u;
+    memset(tile, 0, 32 * sizeof(int32_t));
+    if (p32) {
+        const int32_t *r0 = p32 + (size_t)(y0 + y) * stride + (x0 + xg);
+        memcpy(tile, r0, cmax * sizeof(int32_t));
+        if (has_row1)
+            memcpy(tile + 16,
+                   p32 + (size_t)(y0 + y + 1u) * stride + (x0 + xg),
+                   cmax * sizeof(int32_t));
+    } else {
+        const int64_t *r0 = p64 + (size_t)(y0 + y) * stride + (x0 + xg);
+        const int64_t *r1 = has_row1
+            ? p64 + (size_t)(y0 + y + 1u) * stride + (x0 + xg) : NULL;
+        for (c = 0; c < cmax; ++c) {
+            tile[c] = (int32_t)r0[c];
+            if (has_row1) tile[16 + c] = (int32_t)r1[c];
+        }
+    }
+}
+
+/* AVX2 i32 codeblock encoder (kmax<=30). Functionally identical to the scalar
+ * jph_encode_block below but processes the cleanup pass in 8-quad (16-column)
+ * batches: one jph_enc_proc_pixel_8q_avx2 call prepares e_q/s/rho/e_qmax for 8
+ * quads, then tinyexr's exact scalar bookkeeping + MEL/VLC/MagSgn emit run per
+ * quad-pair (byte-identical output). The remaining per-quad bookkeeping is the
+ * vectorization target of later stages; here it stays scalar. */
+static exr_result jph_encode_block_i32_avx2(
+    const int64_t *plane64, const int32_t *plane32, uint32_t plane_stride,
+    uint32_t cb_x0, uint32_t cb_y0, uint32_t cb_w, uint32_t cb_h, uint32_t kmax,
+    uint32_t *out_missing_msbs, uint32_t out_lengths[2], uint8_t *out_buf,
+    size_t out_cap, size_t *out_size) {
+    uint8_t ms_buf[65536u];
+    uint8_t mel_vlc_buf[3072];
+    uint8_t *mel_buf = mel_vlc_buf;
+    uint8_t *vlc_buf = mel_vlc_buf + 192;
+    uint32_t ms_cap = (uint32_t)sizeof(ms_buf), mel_cap = 192;
+    uint32_t vlc_cap = 3072u - 192u;
+    uint32_t shift, p, width = cb_w, height = cb_h;
+    uint32_t n_vec = (width + 15u) / 16u;
+    uint64_t max_val = 0;
+    exr_result rc;
+    int32_t geq[32], gsa[32], grho[8], gem[8], tile[32];
+    int32_t cq8[8], eps8[8], uq8[8], Uq8[8];
+    int32_t tuple8[8], m_n[32], cwd_s[32];
+    /* Flat E/CX line-state indexed by quad position; the slack covers the
+     * unaligned neighbour reads (max_e, proc_cq2) one+ vectors past the end.
+     * A 128-wide codeblock yields n_vec<=8 (<=64 quad positions). */
+    int32_t e_line[528] = {0};
+    int32_t cx_line[528] = {0};
+    int prev_cq, prev_e, prev_cx;
+    uint32_t xv, xi, y;
+
+    *out_missing_msbs = kmax - 1u;
+    p = 31u - kmax;          /* use_i32 path (kmax<=30) guaranteed by caller */
+    shift = p;
+
+    JphMelEnc mel; jph_mel_enc_init(&mel, mel_buf, mel_cap);
+    JphVlcEnc vlc; jph_vlc_enc_init(&vlc, vlc_buf, vlc_cap);
+    JphMsEnc ms; jph_ms_init(&ms, ms_buf, ms_cap);
+
+    /* Initial row pair (y=0): tbl0, kappa==1, the min(u_q)>2 MEL, uvlc initial.
+     * The context kernel computes c_q/eps/u_q/U_q + line-state for all 8 quads;
+     * the serial emit then drives MEL/VLC/MagSgn per quad-pair in scalar order. */
+    prev_cq = 0; prev_e = 0; prev_cx = 0;
+    for (xv = 0u; xv < n_vec; ++xv) {
+        uint32_t xg = xv * 16u;
+        jph_enc_build_tile_i32(tile, plane64, plane32, plane_stride, cb_x0,
+                               cb_y0, xg, 0u, width, height);
+        jph_enc_proc_pixel_8q_avx2(tile, shift, p, geq, gsa, grho, gem,
+                                   &max_val);
+        jph_enc_context_8q_avx2(1, geq, grho, gem, e_line, cx_line, xv,
+                                &prev_cq, &prev_e, &prev_cx, cq8, eps8, uq8, Uq8);
+        for (int q = 0; q < 8; ++q)
+            tuple8[q] = g_vlc_enc_tbl0[(cq8[q] << 8) + (grho[q] << 4) + eps8[q]];
+        jph_enc_ms_prep_8q_avx2(grho, Uq8, tuple8, gsa, m_n, cwd_s);
+        for (xi = 0u; xi < 16u && xg + xi < width; xi += 4u) {
+            uint32_t x = xg + xi;
+            int q0 = (int)(xi >> 1), q1 = q0 + 1;
+            int uq0 = uq8[q0], uq1 = 0;
+            uint16_t tuple0 = (uint16_t)tuple8[q0];
+
+            rc = jph_vlc_enc_encode(&vlc, tuple0 >> 8, (tuple0 >> 4) & 7);
+            if (rc != EXR_SUCCESS) return rc;
+            if (cq8[q0] == 0) {
+                rc = jph_mel_enc_encode(&mel, grho[q0] != 0);
+                if (rc != EXR_SUCCESS) return rc;
+            }
+            rc = jph_emit_mag_quad_pre(&ms, m_n, cwd_s, q0);
+            if (rc != EXR_SUCCESS) return rc;
+
+            if (x + 2u < width) {
+                uint16_t tuple1 = (uint16_t)tuple8[q1];
+                uq1 = uq8[q1];
+                rc = jph_vlc_enc_encode(&vlc, tuple1 >> 8, (tuple1 >> 4) & 7);
+                if (rc != EXR_SUCCESS) return rc;
+                if (cq8[q1] == 0) {
+                    rc = jph_mel_enc_encode(&mel, grho[q1] != 0);
+                    if (rc != EXR_SUCCESS) return rc;
+                }
+                rc = jph_emit_mag_quad_pre(&ms, m_n, cwd_s, q1);
+                if (rc != EXR_SUCCESS) return rc;
+            }
+
+            if (uq0 > 0 && uq1 > 0) {
+                int min_uq = uq0 < uq1 ? uq0 : uq1;
+                rc = jph_mel_enc_encode(&mel, min_uq > 2);
+                if (rc != EXR_SUCCESS) return rc;
+            }
+            rc = jph_encode_uvlc_pair(&vlc, uq0, uq1, 1);
+            if (rc != EXR_SUCCESS) return rc;
+        }
+    }
+    /* Emulate the absent xv=n_vec vector's lane-0 line-state write (the carry-out
+     * of the last quad): the last real quad's max_e / proc_cq2 reads position
+     * n_vec*8, which the scalar encoder fills via its final lep[0]=e_q3 /
+     * lcxp[0]=(rho&8)>>3 store after the last lep/lcxp++. */
+    e_line[n_vec * 8] = prev_e;
+    cx_line[n_vec * 8] = (prev_cx & 8) >> 3;
+
+    for (y = 2u; y < height; y += 2u) {
+        /* Reseed c_q for this row from the previous row's first-vector CX
+         * line-state (matches the scalar row-start c_q0 = lcxp[0]+(lcxp[1]<<2));
+         * the E/CX line-state itself carries (not reset) as the previous row. */
+        prev_cq = cx_line[0] + (cx_line[1] << 2);
+        prev_e = 0; prev_cx = 0;
+        for (xv = 0u; xv < n_vec; ++xv) {
+            uint32_t xg = xv * 16u;
+            jph_enc_build_tile_i32(tile, plane64, plane32, plane_stride, cb_x0,
+                                   cb_y0, xg, y, width, height);
+            jph_enc_proc_pixel_8q_avx2(tile, shift, p, geq, gsa, grho, gem,
+                                       &max_val);
+            jph_enc_context_8q_avx2(0, geq, grho, gem, e_line, cx_line, xv,
+                                    &prev_cq, &prev_e, &prev_cx, cq8, eps8, uq8,
+                                    Uq8);
+            for (int q = 0; q < 8; ++q)
+                tuple8[q] = g_vlc_enc_tbl1[(cq8[q] << 8) + (grho[q] << 4) +
+                                          eps8[q]];
+            jph_enc_ms_prep_8q_avx2(grho, Uq8, tuple8, gsa, m_n, cwd_s);
+            for (xi = 0u; xi < 16u && xg + xi < width; xi += 4u) {
+                uint32_t x = xg + xi;
+                int q0 = (int)(xi >> 1), q1 = q0 + 1;
+                int uq0 = uq8[q0], uq1 = 0;
+                uint16_t tuple0 = (uint16_t)tuple8[q0];
+
+                rc = jph_vlc_enc_encode(&vlc, tuple0 >> 8, (tuple0 >> 4) & 7);
+                if (rc != EXR_SUCCESS) return rc;
+                if (cq8[q0] == 0) {
+                    rc = jph_mel_enc_encode(&mel, grho[q0] != 0);
+                    if (rc != EXR_SUCCESS) return rc;
+                }
+                rc = jph_emit_mag_quad_pre(&ms, m_n, cwd_s, q0);
+                if (rc != EXR_SUCCESS) return rc;
+
+                if (x + 2u < width) {
+                    uint16_t tuple1 = (uint16_t)tuple8[q1];
+                    uq1 = uq8[q1];
+                    rc = jph_vlc_enc_encode(&vlc, tuple1 >> 8, (tuple1 >> 4) & 7);
+                    if (rc != EXR_SUCCESS) return rc;
+                    if (cq8[q1] == 0) {
+                        rc = jph_mel_enc_encode(&mel, grho[q1] != 0);
+                        if (rc != EXR_SUCCESS) return rc;
+                    }
+                    rc = jph_emit_mag_quad_pre(&ms, m_n, cwd_s, q1);
+                    if (rc != EXR_SUCCESS) return rc;
+                }
+
+                rc = jph_encode_uvlc_pair(&vlc, uq0, uq1, 0);
+                if (rc != EXR_SUCCESS) return rc;
+            }
+        }
+        e_line[n_vec * 8] = prev_e;          /* carry-out (see initial row) */
+        cx_line[n_vec * 8] = (prev_cx & 8) >> 3;
+    }
+
+    if (max_val == 0) {
+        *out_missing_msbs = kmax;
+        out_lengths[0] = 0u; out_lengths[1] = 0u; *out_size = 0u;
+        return EXR_SUCCESS;
+    }
+    if (max_val >= (UINT64_C(1) << kmax)) return EXR_ERROR_CORRUPT;
+
+    rc = jph_ms_terminate(&ms);
+    if (rc != EXR_SUCCESS) return rc;
+    rc = jph_mel_vlc_terminate(&mel, &vlc);
+    if (rc != EXR_SUCCESS) return rc;
+
+    {
+        int lcup = (int)ms.pos + (int)mel.pos + (int)vlc.pos;
+        int scup = (int)mel.pos + (int)vlc.pos;
+        if (lcup < 2) { lcup = 2; scup = 2; }
+        if (lcup > (int)out_cap) return EXR_ERROR_CORRUPT;
+        if (ms.pos) memcpy(out_buf, ms_buf, ms.pos);
+        if (mel.pos) memcpy(out_buf + ms.pos, mel_buf, mel.pos);
+        if (vlc.pos)
+            memcpy(out_buf + ms.pos + mel.pos, vlc_buf + vlc.cap - vlc.pos,
+                   vlc.pos);
+        out_buf[lcup - 2] = (uint8_t)((out_buf[lcup - 2] & 0xF0) | (scup & 0x0F));
+        out_buf[lcup - 1] = (uint8_t)((scup >> 4) & 0xFF);
+        out_lengths[0] = (uint32_t)lcup;
+        out_lengths[1] = 0;
+        *out_size = (size_t)lcup;
+    }
+    return EXR_SUCCESS;
+}
+#endif /* EXR_X86 */
+
+/* Encode one HT codeblock. When plane32 is non-NULL, read samples from the
+ * int32 plane (widening to int64 on the fly via a local per-codeblock buffer). */
+static exr_result JPH_MAYBE_UNUSED jph_encode_block(const int64_t *plane64,
+                                    const int32_t *plane32,
                                     uint32_t plane_stride,
                                     uint32_t cb_x0, uint32_t cb_y0,
                                     uint32_t cb_w, uint32_t cb_h,
@@ -5185,35 +6480,38 @@ static exr_result JPH_MAYBE_UNUSED jph_encode_block(const int64_t *plane_data,
     uint32_t ms_cap = (uint32_t)sizeof(ms_buf), mel_cap = 192;
     uint32_t vlc_cap = 3072u - 192u;
     uint32_t shift, p;
+    int use_i32;
+    uint64_t max_val = 0;
     exr_result rc;
 
     if (cb_w == 0 || cb_h == 0) { *out_size = 0; return EXR_SUCCESS; }
-    if (!plane_data || !out_missing_msbs || !out_lengths || !out_buf ||
-        !out_size || kmax == 0u || kmax > 36u)
+    if ((!plane64 && !plane32) || !out_missing_msbs || !out_lengths ||
+        !out_buf || !out_size || kmax == 0u || kmax > 36u)
         return EXR_ERROR_INVALID_ARGUMENT;
 
-    /* OpenJPH encodes reversible blocks as sign/magnitude values shifted so
-     * the most significant possible coefficient bit is at the high word bit.
-     * Non-empty HT cleanup-only blocks use missing_msbs = Kmax - 1. */
-    uint64_t max_val = 0;
-    for (uint32_t y = 0; y < cb_h; ++y) {
-        for (uint32_t x = 0; x < cb_w; ++x) {
-            int64_t v = plane_data[(cb_y0 + y) * plane_stride + (cb_x0 + x)];
-            uint64_t absv = jph_abs_i64_to_u64(v);
-            if (absv > max_val) max_val = absv;
-        }
-    }
-    if (max_val == 0) {
-        *out_missing_msbs = kmax;
-        out_lengths[0] = 0u;
-        out_lengths[1] = 0u;
-        *out_size = 0u;
-        return EXR_SUCCESS;
-    }
-    if (max_val >= (UINT64_C(1) << kmax)) return EXR_ERROR_CORRUPT;
+    /* int32 codeblock data is read natively (no int32->int64 widening) when
+     * plane32 is provided; otherwise the int64 plane is the source. */
+    const int64_t *plane_data = plane64;
+    const int32_t *plane_data32 = plane32;
+
+    /* Missing MSBs, shift and precision are directly computed from Kmax.
+     * The max-value scan is folded into the main encode loop below. */
     *out_missing_msbs = kmax - 1u;
-    p = 63u - kmax;
-    shift = 63u - kmax;
+    use_i32 = kmax <= 30u;
+    p = (use_i32 ? 31u : 63u) - kmax;
+    shift = p;
+#if defined(EXR_X86)
+    /* AVX2 i32 fast path: 8-quad-batched cleanup pass, byte-identical output. */
+    if (use_i32 && (exr_cpu_caps() & EXR_SIMD_AVX2))
+        return jph_encode_block_i32_avx2(plane64, plane32, plane_stride, cb_x0,
+                                         cb_y0, cb_w, cb_h, kmax,
+                                         out_missing_msbs, out_lengths, out_buf,
+                                         out_cap, out_size);
+    int use_sse2 = use_i32 && (exr_cpu_caps() & EXR_SIMD_SSE2);
+#else
+    int use_sse2 = 0;
+#endif
+    (void)use_sse2;
 
     /* Initialize encoders */
     JphMelEnc mel; jph_mel_enc_init(&mel, mel_buf, mel_cap);
@@ -5238,30 +6536,40 @@ static exr_result JPH_MAYBE_UNUSED jph_encode_block(const int64_t *plane_data,
             int Uq0, Uq1 = 1, u_q0, u_q1 = 0, eps0 = 0, eps1 = 0;
             int c_q1;
             uint16_t tuple0, tuple1 = 0;
-            memset(e_q, 0, sizeof(e_q));
-            memset(s, 0, sizeof(s));
             rho[0] = rho[1] = 0;
             e_qmax[0] = e_qmax[1] = 0;
 
-            jph_encode_block_prepare_sample(plane_data, plane_stride, cb_x0,
-                                            cb_y0, x, 0u, shift, p, &rho[0],
-                                            &e_qmax[0], &e_q[0], &s[0], 1);
+#if defined(EXR_X86)
+            if (use_sse2 && height > 1u && x + 1u < width) {
+                jph_encode_prepare_quad_dispatch(plane_data, plane_data32, plane_stride,
+                                                  cb_x0, cb_y0, x, 0u,
+                                                  shift, p, &rho[0],
+                                                  &e_qmax[0], e_q, s,
+                                                  &max_val);
+            } else
+#endif
+            {
+            jph_encode_block_prepare_sample_fast(plane_data, plane_data32, plane_stride,
+                                                  cb_x0, cb_y0, x, 0u, shift,
+                                                  p, use_i32, &rho[0],
+                                                  &e_qmax[0], &e_q[0], &s[0],
+                                                   1, &max_val);
             if (height > 1u)
-                jph_encode_block_prepare_sample(plane_data, plane_stride,
-                                                cb_x0, cb_y0, x, 1u, shift,
-                                                p, &rho[0], &e_qmax[0],
-                                                &e_q[1], &s[1], 2);
+                jph_encode_block_prepare_sample_fast(
+                    plane_data, plane_data32, plane_stride, cb_x0, cb_y0, x, 1u, shift, p,
+                    use_i32, &rho[0], &e_qmax[0], &e_q[1], &s[1], 2, &max_val);
+            else { e_q[1] = 0; s[1] = 0; }
             if (x + 1u < width) {
-                jph_encode_block_prepare_sample(plane_data, plane_stride,
-                                                cb_x0, cb_y0, x + 1u, 0u,
-                                                shift, p, &rho[0],
-                                                &e_qmax[0], &e_q[2], &s[2], 4);
+                jph_encode_block_prepare_sample_fast(
+                    plane_data, plane_data32, plane_stride, cb_x0, cb_y0, x + 1u, 0u, shift,
+                    p, use_i32, &rho[0], &e_qmax[0], &e_q[2], &s[2], 4, &max_val);
                 if (height > 1u)
-                    jph_encode_block_prepare_sample(plane_data, plane_stride,
-                                                    cb_x0, cb_y0, x + 1u, 1u,
-                                                    shift, p, &rho[0],
-                                                    &e_qmax[0], &e_q[3],
-                                                    &s[3], 8);
+                    jph_encode_block_prepare_sample_fast(
+                        plane_data, plane_data32, plane_stride, cb_x0, cb_y0, x + 1u, 1u,
+                        shift, p, use_i32, &rho[0], &e_qmax[0], &e_q[3],
+                        &s[3], 8, &max_val);
+                else { e_q[3] = 0; s[3] = 0; }
+            } else { e_q[2] = 0; s[2] = 0; e_q[3] = 0; s[3] = 0; }
             }
 
             Uq0 = e_qmax[0] > 1 ? e_qmax[0] : 1;
@@ -5286,39 +6594,41 @@ static exr_result JPH_MAYBE_UNUSED jph_encode_block(const int64_t *plane_data,
                 rc = jph_mel_enc_encode(&mel, rho[0] != 0);
                 if (rc != EXR_SUCCESS) return rc;
             }
-            rc = jph_encode_mag_bits(&ms, s[0], rho[0], 1, Uq0, tuple0);
-            if (rc != EXR_SUCCESS) return rc;
-            rc = jph_encode_mag_bits(&ms, s[1], rho[0], 2, Uq0, tuple0);
-            if (rc != EXR_SUCCESS) return rc;
-            rc = jph_encode_mag_bits(&ms, s[2], rho[0], 4, Uq0, tuple0);
-            if (rc != EXR_SUCCESS) return rc;
-            rc = jph_encode_mag_bits(&ms, s[3], rho[0], 8, Uq0, tuple0);
+            rc = jph_encode_mag_bits_quad(&ms, &s[0], rho[0], Uq0, tuple0);
             if (rc != EXR_SUCCESS) return rc;
 
             if (x + 2u < width) {
-                jph_encode_block_prepare_sample(plane_data, plane_stride,
-                                                cb_x0, cb_y0, x + 2u, 0u,
-                                                shift, p, &rho[1],
-                                                &e_qmax[1], &e_q[4], &s[4], 1);
+#if defined(EXR_X86)
+                if (use_sse2 && height > 1u && x + 3u < width) {
+                    jph_encode_prepare_quad_dispatch(plane_data, plane_data32, plane_stride,
+                                                      cb_x0, cb_y0, x + 2u, 0u,
+                                                      shift, p, &rho[1],
+                                                      &e_qmax[1], e_q + 4, s + 4,
+                                                      &max_val);
+                } else
+#endif
+                {
+                jph_encode_block_prepare_sample_fast(
+                    plane_data, plane_data32, plane_stride, cb_x0, cb_y0, x + 2u, 0u, shift,
+                    p, use_i32, &rho[1], &e_qmax[1], &e_q[4], &s[4], 1, &max_val);
                 if (height > 1u)
-                    jph_encode_block_prepare_sample(plane_data, plane_stride,
-                                                    cb_x0, cb_y0, x + 2u, 1u,
-                                                    shift, p, &rho[1],
-                                                    &e_qmax[1], &e_q[5],
-                                                    &s[5], 2);
+                    jph_encode_block_prepare_sample_fast(
+                        plane_data, plane_data32, plane_stride, cb_x0, cb_y0, x + 2u, 1u,
+                        shift, p, use_i32, &rho[1], &e_qmax[1], &e_q[5],
+                        &s[5], 2, &max_val);
+                else { e_q[5] = 0; s[5] = 0; }
                 if (x + 3u < width) {
-                    jph_encode_block_prepare_sample(plane_data, plane_stride,
-                                                    cb_x0, cb_y0, x + 3u, 0u,
-                                                    shift, p, &rho[1],
-                                                    &e_qmax[1], &e_q[6],
-                                                    &s[6], 4);
+                    jph_encode_block_prepare_sample_fast(
+                        plane_data, plane_data32, plane_stride, cb_x0, cb_y0, x + 3u, 0u,
+                        shift, p, use_i32, &rho[1], &e_qmax[1], &e_q[6],
+                        &s[6], 4, &max_val);
                     if (height > 1u)
-                        jph_encode_block_prepare_sample(plane_data,
-                                                        plane_stride, cb_x0,
-                                                        cb_y0, x + 3u, 1u,
-                                                        shift, p, &rho[1],
-                                                        &e_qmax[1], &e_q[7],
-                                                        &s[7], 8);
+                        jph_encode_block_prepare_sample_fast(
+                            plane_data, plane_data32, plane_stride, cb_x0, cb_y0, x + 3u,
+                            1u, shift, p, use_i32, &rho[1], &e_qmax[1],
+                            &e_q[7], &s[7], 8, &max_val);
+                    else { e_q[7] = 0; s[7] = 0; }
+                } else { e_q[6] = 0; s[6] = 0; e_q[7] = 0; s[7] = 0; }
                 }
 
                 c_q1 = (rho[0] >> 1) | (rho[0] & 1);
@@ -5346,13 +6656,7 @@ static exr_result JPH_MAYBE_UNUSED jph_encode_block(const int64_t *plane_data,
                     rc = jph_mel_enc_encode(&mel, rho[1] != 0);
                     if (rc != EXR_SUCCESS) return rc;
                 }
-                rc = jph_encode_mag_bits(&ms, s[4], rho[1], 1, Uq1, tuple1);
-                if (rc != EXR_SUCCESS) return rc;
-                rc = jph_encode_mag_bits(&ms, s[5], rho[1], 2, Uq1, tuple1);
-                if (rc != EXR_SUCCESS) return rc;
-                rc = jph_encode_mag_bits(&ms, s[6], rho[1], 4, Uq1, tuple1);
-                if (rc != EXR_SUCCESS) return rc;
-                rc = jph_encode_mag_bits(&ms, s[7], rho[1], 8, Uq1, tuple1);
+                rc = jph_encode_mag_bits_quad(&ms, &s[4], rho[1], Uq1, tuple1);
                 if (rc != EXR_SUCCESS) return rc;
             }
 
@@ -5387,25 +6691,37 @@ static exr_result JPH_MAYBE_UNUSED jph_encode_block(const int64_t *plane_data,
             int eps0 = 0, eps1 = 0, c_q1;
             uint16_t tuple0, tuple1 = 0;
 
-            jph_encode_block_prepare_sample(plane_data, plane_stride, cb_x0,
-                                            cb_y0, x, y, shift, p, &rho[0],
-                                            &e_qmax[0], &e_q[0], &s[0], 1);
+#if defined(EXR_X86)
+            if (use_sse2 && y + 1u < height && x + 1u < width) {
+                jph_encode_prepare_quad_dispatch(plane_data, plane_data32, plane_stride,
+                                                  cb_x0, cb_y0, x, y,
+                                                  shift, p, &rho[0],
+                                                  &e_qmax[0], e_q, s,
+                                                  &max_val);
+            } else
+#endif
+            {
+            jph_encode_block_prepare_sample_fast(plane_data, plane_data32, plane_stride,
+                                                  cb_x0, cb_y0, x, y, shift, p,
+                                                  use_i32, &rho[0],
+                                                  &e_qmax[0], &e_q[0], &s[0],
+                                                   1, &max_val);
             if (y + 1u < height)
-                jph_encode_block_prepare_sample(plane_data, plane_stride,
-                                                cb_x0, cb_y0, x, y + 1u,
-                                                shift, p, &rho[0],
-                                                &e_qmax[0], &e_q[1], &s[1], 2);
+                jph_encode_block_prepare_sample_fast(
+                    plane_data, plane_data32, plane_stride, cb_x0, cb_y0, x, y + 1u, shift,
+                    p, use_i32, &rho[0], &e_qmax[0], &e_q[1], &s[1], 2, &max_val);
+            else { e_q[1] = 0; s[1] = 0; }
             if (x + 1u < width) {
-                jph_encode_block_prepare_sample(plane_data, plane_stride,
-                                                cb_x0, cb_y0, x + 1u, y,
-                                                shift, p, &rho[0],
-                                                &e_qmax[0], &e_q[2], &s[2], 4);
+                jph_encode_block_prepare_sample_fast(
+                    plane_data, plane_data32, plane_stride, cb_x0, cb_y0, x + 1u, y, shift,
+                    p, use_i32, &rho[0], &e_qmax[0], &e_q[2], &s[2], 4, &max_val);
                 if (y + 1u < height)
-                    jph_encode_block_prepare_sample(plane_data, plane_stride,
-                                                    cb_x0, cb_y0, x + 1u,
-                                                    y + 1u, shift, p,
-                                                    &rho[0], &e_qmax[0],
-                                                    &e_q[3], &s[3], 8);
+                    jph_encode_block_prepare_sample_fast(
+                        plane_data, plane_data32, plane_stride, cb_x0, cb_y0, x + 1u,
+                        y + 1u, shift, p, use_i32, &rho[0], &e_qmax[0],
+                        &e_q[3], &s[3], 8, &max_val);
+                else { e_q[3] = 0; s[3] = 0; }
+            } else { e_q[2] = 0; s[2] = 0; e_q[3] = 0; s[3] = 0; }
             }
 
             kappa = (rho[0] & (rho[0] - 1)) ? (max_e > 1 ? max_e : 1) : 1;
@@ -5433,39 +6749,41 @@ static exr_result JPH_MAYBE_UNUSED jph_encode_block(const int64_t *plane_data,
                 rc = jph_mel_enc_encode(&mel, rho[0] != 0);
                 if (rc != EXR_SUCCESS) return rc;
             }
-            rc = jph_encode_mag_bits(&ms, s[0], rho[0], 1, Uq0, tuple0);
-            if (rc != EXR_SUCCESS) return rc;
-            rc = jph_encode_mag_bits(&ms, s[1], rho[0], 2, Uq0, tuple0);
-            if (rc != EXR_SUCCESS) return rc;
-            rc = jph_encode_mag_bits(&ms, s[2], rho[0], 4, Uq0, tuple0);
-            if (rc != EXR_SUCCESS) return rc;
-            rc = jph_encode_mag_bits(&ms, s[3], rho[0], 8, Uq0, tuple0);
+            rc = jph_encode_mag_bits_quad(&ms, &s[0], rho[0], Uq0, tuple0);
             if (rc != EXR_SUCCESS) return rc;
 
             if (x + 2u < width) {
-                jph_encode_block_prepare_sample(plane_data, plane_stride,
-                                                cb_x0, cb_y0, x + 2u, y,
-                                                shift, p, &rho[1],
-                                                &e_qmax[1], &e_q[4], &s[4], 1);
+#if defined(EXR_X86)
+                if (use_sse2 && y + 1u < height && x + 3u < width) {
+                    jph_encode_prepare_quad_dispatch(plane_data, plane_data32, plane_stride,
+                                                      cb_x0, cb_y0, x + 2u, y,
+                                                      shift, p, &rho[1],
+                                                      &e_qmax[1], e_q + 4,
+                                                      s + 4, &max_val);
+                } else
+#endif
+                {
+                jph_encode_block_prepare_sample_fast(
+                    plane_data, plane_data32, plane_stride, cb_x0, cb_y0, x + 2u, y, shift,
+                    p, use_i32, &rho[1], &e_qmax[1], &e_q[4], &s[4], 1, &max_val);
                 if (y + 1u < height)
-                    jph_encode_block_prepare_sample(plane_data, plane_stride,
-                                                    cb_x0, cb_y0, x + 2u,
-                                                    y + 1u, shift, p,
-                                                    &rho[1], &e_qmax[1],
-                                                    &e_q[5], &s[5], 2);
+                    jph_encode_block_prepare_sample_fast(
+                        plane_data, plane_data32, plane_stride, cb_x0, cb_y0, x + 2u,
+                        y + 1u, shift, p, use_i32, &rho[1], &e_qmax[1],
+                        &e_q[5], &s[5], 2, &max_val);
+                else { e_q[5] = 0; s[5] = 0; }
                 if (x + 3u < width) {
-                    jph_encode_block_prepare_sample(plane_data, plane_stride,
-                                                    cb_x0, cb_y0, x + 3u, y,
-                                                    shift, p, &rho[1],
-                                                    &e_qmax[1], &e_q[6],
-                                                    &s[6], 4);
+                    jph_encode_block_prepare_sample_fast(
+                        plane_data, plane_data32, plane_stride, cb_x0, cb_y0, x + 3u, y,
+                        shift, p, use_i32, &rho[1], &e_qmax[1], &e_q[6],
+                        &s[6], 4, &max_val);
                     if (y + 1u < height)
-                        jph_encode_block_prepare_sample(plane_data,
-                                                        plane_stride, cb_x0,
-                                                        cb_y0, x + 3u, y + 1u,
-                                                        shift, p, &rho[1],
-                                                        &e_qmax[1], &e_q[7],
-                                                        &s[7], 8);
+                        jph_encode_block_prepare_sample_fast(
+                            plane_data, plane_data32, plane_stride, cb_x0, cb_y0, x + 3u,
+                            y + 1u, shift, p, use_i32, &rho[1], &e_qmax[1],
+                            &e_q[7], &s[7], 8, &max_val);
+                    else { e_q[7] = 0; s[7] = 0; }
+                } else { e_q[6] = 0; s[6] = 0; e_q[7] = 0; s[7] = 0; }
                 }
 
                 kappa = (rho[1] & (rho[1] - 1)) ? (max_e > 1 ? max_e : 1) : 1;
@@ -5496,13 +6814,7 @@ static exr_result JPH_MAYBE_UNUSED jph_encode_block(const int64_t *plane_data,
                     rc = jph_mel_enc_encode(&mel, rho[1] != 0);
                     if (rc != EXR_SUCCESS) return rc;
                 }
-                rc = jph_encode_mag_bits(&ms, s[4], rho[1], 1, Uq1, tuple1);
-                if (rc != EXR_SUCCESS) return rc;
-                rc = jph_encode_mag_bits(&ms, s[5], rho[1], 2, Uq1, tuple1);
-                if (rc != EXR_SUCCESS) return rc;
-                rc = jph_encode_mag_bits(&ms, s[6], rho[1], 4, Uq1, tuple1);
-                if (rc != EXR_SUCCESS) return rc;
-                rc = jph_encode_mag_bits(&ms, s[7], rho[1], 8, Uq1, tuple1);
+                rc = jph_encode_mag_bits_quad(&ms, &s[4], rho[1], Uq1, tuple1);
                 if (rc != EXR_SUCCESS) return rc;
             }
 
@@ -5511,6 +6823,16 @@ static exr_result JPH_MAYBE_UNUSED jph_encode_block(const int64_t *plane_data,
             c_q0 |= ((rho[1] & 4) >> 1) | ((rho[1] & 8) >> 2);
         }
     }
+
+    /* After tracking max_val during the main loop, handle all-zero/corrupt */
+    if (max_val == 0) {
+        *out_missing_msbs = kmax;
+        out_lengths[0] = 0u;
+        out_lengths[1] = 0u;
+        *out_size = 0u;
+        return EXR_SUCCESS;
+    }
+    if (max_val >= (UINT64_C(1) << kmax)) return EXR_ERROR_CORRUPT;
 
     /* Terminate encoders and assemble cleanup pass */
     rc = jph_ms_terminate(&ms);
@@ -5525,13 +6847,11 @@ static exr_result JPH_MAYBE_UNUSED jph_encode_block(const int64_t *plane_data,
     if (lcup > (int)out_cap) return EXR_ERROR_CORRUPT;
 
     /* Copy MagSgn bytes */
-    for (uint32_t i = 0; i < ms.pos; ++i) out_buf[i] = ms_buf[i];
+    if (ms.pos) memcpy(out_buf, ms_buf, ms.pos);
     /* Copy MEL bytes */
-    for (uint32_t i = 0; i < mel.pos; ++i) out_buf[ms.pos + i] = mel_buf[i];
+    if (mel.pos) memcpy(out_buf + ms.pos, mel_buf, mel.pos);
     /* Copy VLC bytes (already in reverse position) */
-    for (uint32_t i = 0; i < vlc.pos; ++i) {
-        out_buf[ms.pos + mel.pos + i] = vlc_buf[vlc.cap - vlc.pos + i];
-    }
+    if (vlc.pos) memcpy(out_buf + ms.pos + mel.pos, vlc_buf + vlc.cap - vlc.pos, vlc.pos);
     /* Write Scup footer */
     out_buf[lcup - 2] = (uint8_t)((out_buf[lcup - 2] & 0xF0) | (scup & 0x0F));
     out_buf[lcup - 1] = (uint8_t)((scup >> 4) & 0xFF);
@@ -5572,9 +6892,99 @@ static exr_result jph_write_eoc(uint8_t **p, uint8_t *end) {
     *(*p)++ = (uint8_t)((uint16_t)(v) & 0xFF);                             \
 } while(0)
 
+/* Case-insensitive equality of two NUL-terminated strings. */
+static int jph_ci_streq(const char *a, const char *b) {
+    size_t i = 0;
+    for (;;) {
+        unsigned char ca = (unsigned char)a[i], cb = (unsigned char)b[i];
+        if (ca >= 'A' && ca <= 'Z') ca = (unsigned char)(ca - 'A' + 'a');
+        if (cb >= 'A' && cb <= 'Z') cb = (unsigned char)(cb - 'A' + 'a');
+        if (ca != cb) return 0;
+        if (ca == 0) return 1;
+        ++i;
+    }
+}
+
+typedef struct {
+    const char *rs, *gs, *bs;
+    int ri, gi, bi;
+    const char *prefix;
+    size_t prefix_len;
+} JphRgbParam;
+
+/* Build the codestream->file channel map. Returns 1 and fills cs2f with
+ * [R, G, B, <remaining file channels in file order>] when an RGB triplet is
+ * detected (so the reversible color transform can decorrelate them and shrink
+ * the payload), else returns 0 and fills cs2f with the identity. Mirrors
+ * OpenEXR's make_channel_map heuristic (case-insensitive r/g/b or red/green/blue
+ * suffix after an optional common "prefix." with matching type and sampling) so
+ * the RCT grouping and the chunk channel-map header match OpenEXR/OpenJPH. */
+static int jph_make_channel_map(const exr_codec_ctx *ctx, uint16_t *cs2f) {
+    int nch = ctx->num_channels;
+    JphRgbParam params[2];
+    int pj, i, found = -1, avail;
+    int r_index = -1, g_index = -1, b_index = -1;
+
+    params[0].rs = "r";   params[0].gs = "g";     params[0].bs = "b";
+    params[1].rs = "red"; params[1].gs = "green"; params[1].bs = "blue";
+    for (pj = 0; pj < 2; ++pj) {
+        params[pj].ri = params[pj].gi = params[pj].bi = -1;
+        params[pj].prefix = NULL; params[pj].prefix_len = 0;
+    }
+
+    for (i = 0; i < nch; ++i) {
+        const char *name = ctx->channels[i].name;
+        const char *suffix = name, *prefix = name;
+        size_t prefix_len = 0, k;
+        for (k = 0; name[k]; ++k)
+            if (name[k] == '.') { suffix = name + k + 1; prefix_len = k; }
+        for (pj = 0; pj < 2; ++pj) {
+            JphRgbParam *pp = &params[pj];
+            int match = 0;
+            if (pp->prefix != NULL &&
+                (pp->prefix_len != prefix_len ||
+                 memcmp(pp->prefix, prefix, prefix_len) != 0))
+                continue;
+            if (jph_ci_streq(suffix, pp->rs) && pp->ri < 0) { pp->ri = i; match = 1; }
+            else if (jph_ci_streq(suffix, pp->gs) && pp->gi < 0) { pp->gi = i; match = 1; }
+            else if (jph_ci_streq(suffix, pp->bs) && pp->bi < 0) { pp->bi = i; match = 1; }
+            if (match) { pp->prefix = prefix; pp->prefix_len = prefix_len; break; }
+        }
+    }
+
+    for (pj = 0; pj < 2 && found < 0; ++pj) {
+        JphRgbParam *pp = &params[pj];
+        if (pp->ri >= 0 && pp->gi >= 0 && pp->bi >= 0) {
+            const exr_channel *r = &ctx->channels[pp->ri];
+            const exr_channel *g = &ctx->channels[pp->gi];
+            const exr_channel *b = &ctx->channels[pp->bi];
+            if (r->pixel_type == g->pixel_type && r->pixel_type == b->pixel_type &&
+                r->x_sampling == g->x_sampling && r->x_sampling == b->x_sampling &&
+                r->y_sampling == g->y_sampling && r->y_sampling == b->y_sampling) {
+                r_index = pp->ri; g_index = pp->gi; b_index = pp->bi; found = pj;
+            }
+        }
+    }
+
+    if (found < 0) {
+        for (i = 0; i < nch; ++i) cs2f[i] = (uint16_t)i;
+        return 0;
+    }
+    cs2f[0] = (uint16_t)r_index;
+    cs2f[1] = (uint16_t)g_index;
+    cs2f[2] = (uint16_t)b_index;
+    avail = 3;
+    for (i = 0; i < nch; ++i) {
+        if (i == r_index || i == g_index || i == b_index) continue;
+        cs2f[avail++] = (uint16_t)i;
+    }
+    return 1;
+}
+
 static exr_result jph_write_siz(uint8_t **p, uint8_t *end,
                                 uint32_t w, uint32_t h, uint16_t nch,
-                                const exr_codec_ctx *ctx) {
+                                const exr_codec_ctx *ctx,
+                                const uint16_t *cs2f) {
     size_t sz = 38u + (size_t)nch * 3u;
     uint16_t i;
     if (*p + 2 + 2 + sz > end) return EXR_ERROR_CORRUPT;
@@ -5591,7 +7001,7 @@ static exr_result jph_write_siz(uint8_t **p, uint8_t *end,
     PUT_BE32(0);   /* ytosiz */
     PUT_BE16(nch);
     for (i = 0; i < nch; ++i) {
-        const exr_channel *ch = &ctx->channels[i];
+        const exr_channel *ch = &ctx->channels[cs2f[i]];
         int is_signed = (ch->pixel_type != EXR_PIXEL_UINT) ? 1 : 0;
         int bit_depth = (ch->pixel_type == EXR_PIXEL_HALF) ? 16 : 32;
         uint8_t ssiz = (uint8_t)((is_signed << 7) | ((bit_depth - 1) & 0x7F));
@@ -5678,14 +7088,15 @@ static exr_result jph_write_sot_sod(uint8_t **p, uint8_t *end,
 static exr_result jph_write_codestream(uint8_t **p, uint8_t *end,
                                         const exr_codec_ctx *ctx,
                                         int mc_trans, uint32_t kmax,
-                                        uint8_t **out_psot) {
+                                        uint8_t **out_psot,
+                                        const uint16_t *cs2f) {
     exr_result rc;
     int i;
     rc = jph_write_soc(p, end);
     if (rc != EXR_SUCCESS) return rc;
     rc = jph_write_siz(p, end, (uint32_t)ctx->width,
                        (uint32_t)ctx->num_lines,
-                       (uint16_t)ctx->num_channels, ctx);
+                       (uint16_t)ctx->num_channels, ctx, cs2f);
     if (rc != EXR_SUCCESS) return rc;
     rc = jph_write_cap(p, end);
     if (rc != EXR_SUCCESS) return rc;
@@ -5694,7 +7105,7 @@ static exr_result jph_write_codestream(uint8_t **p, uint8_t *end,
     rc = jph_write_qcd(p, end, kmax);
     if (rc != EXR_SUCCESS) return rc;
     for (i = 0; i < ctx->num_channels; ++i) {
-        const exr_channel *ch = &ctx->channels[i];
+        const exr_channel *ch = &ctx->channels[cs2f[i]];
         int bit_depth = (ch->pixel_type == EXR_PIXEL_HALF) ? 16 : 32;
         int is_signed = (ch->pixel_type != EXR_PIXEL_UINT) ? 1 : 0;
         uint8_t nlt_type = is_signed ? 3u : 0u;
@@ -5708,7 +7119,8 @@ static exr_result jph_write_codestream(uint8_t **p, uint8_t *end,
 }
 
 static exr_result jph_write_ht_header(uint8_t **p, uint8_t *end,
-                                       const exr_codec_ctx *ctx) {
+                                       const exr_codec_ctx *ctx,
+                                       const uint16_t *cs2f) {
     uint16_t i;
     size_t payload_size = 2u + (size_t)ctx->num_channels * 2u;
     if (*p + 8 + payload_size > end) return EXR_ERROR_CORRUPT;
@@ -5716,10 +7128,10 @@ static exr_result jph_write_ht_header(uint8_t **p, uint8_t *end,
     *(*p)++ = 0x48; *(*p)++ = 0x54;
     /* payload length (big endian) */
     PUT_BE32((uint32_t)payload_size);
-    /* channel map */
+    /* channel map: codestream component i -> file channel cs2f[i] */
     PUT_BE16((uint16_t)ctx->num_channels);
     for (i = 0; i < ctx->num_channels; ++i) {
-        PUT_BE16(i);  /* identity map */
+        PUT_BE16(cs2f[i]);
     }
     return EXR_SUCCESS;
 }
@@ -5993,6 +7405,113 @@ static void jph_encoded_cb_free_all(const exr_allocator *a,
     exr_free(a, items);
 }
 
+/* ---- GPU encode seam: collect code-block coefficient tiles -------------- */
+typedef struct {
+    const exr_allocator *a;
+    exr_jph_enc_record *records;
+    size_t count, cap;
+    int32_t *coeffs;
+    size_t coeff_count, coeff_cap;
+    int err;
+    /* When gpu_enc_fn is set, jph_compress_impl collects the plan, encodes all
+     * blocks on the GPU, then assembles the codestream from those outputs. */
+    exr_jph_gpu_block_encode_fn gpu_enc_fn;
+    void *gpu_enc_user;
+} JphEncCollect;
+
+/* Precomputed per-code-block GPU encode outputs, consumed in code-block order
+ * (res->comp->band->y->x) by jph_write_packet_for_component_res. */
+typedef struct {
+    const uint8_t *bytes;
+    uint32_t out_stride;
+    const uint32_t *missing;
+    const uint32_t *len0;
+    const uint32_t *size;
+    size_t cursor;
+} JphGpuEncOutputs;
+
+static int jph_enc_collect_block(JphEncCollect *ec, const JphPlane64 *pl,
+                                 uint32_t cb_x0, uint32_t cb_y0,
+                                 uint32_t cb_w, uint32_t cb_h, uint32_t kmax) {
+    exr_jph_enc_record *rec;
+    size_t tile = (size_t)cb_w * cb_h, y, x;
+    if (ec->count == ec->cap) {
+        size_t ncap = ec->cap ? ec->cap * 2u : 256u;
+        exr_jph_enc_record *nr =
+            (exr_jph_enc_record *)exr_malloc(ec->a, ncap * sizeof(*nr));
+        if (!nr) { ec->err = 1; return 0; }
+        if (ec->records) {
+            memcpy(nr, ec->records, ec->count * sizeof(*nr));
+            exr_free(ec->a, ec->records);
+        }
+        ec->records = nr;
+        ec->cap = ncap;
+    }
+    if (ec->coeff_count + tile > ec->coeff_cap) {
+        size_t ncap = ec->coeff_cap ? ec->coeff_cap * 2u : 65536u;
+        int32_t *nc;
+        while (ncap < ec->coeff_count + tile) ncap *= 2u;
+        nc = (int32_t *)exr_malloc(ec->a, ncap * sizeof(*nc));
+        if (!nc) { ec->err = 1; return 0; }
+        if (ec->coeffs) {
+            memcpy(nc, ec->coeffs, ec->coeff_count * sizeof(*nc));
+            exr_free(ec->a, ec->coeffs);
+        }
+        ec->coeffs = nc;
+        ec->coeff_cap = ncap;
+    }
+    rec = &ec->records[ec->count++];
+    rec->width = cb_w;
+    rec->height = cb_h;
+    rec->kmax = kmax;
+    rec->plane_is_i32 = pl->data32 ? 1 : 0;
+    rec->coeff_offset = ec->coeff_count;
+    /* Copy the tile (stride cb_w). The GPU path handles only i32 planes; for
+     * int64 planes record a narrowed copy (used only as a CPU-side fallback). */
+    for (y = 0; y < cb_h; ++y) {
+        for (x = 0; x < cb_w; ++x) {
+            int64_t v = pl->data32
+                ? (int64_t)pl->data32[(size_t)(cb_y0 + y) * pl->w + (cb_x0 + x)]
+                : pl->data[(size_t)(cb_y0 + y) * pl->w + (cb_x0 + x)];
+            ec->coeffs[ec->coeff_count + y * cb_w + x] = (int32_t)v;
+        }
+    }
+    ec->coeff_count += tile;
+    return 1;
+}
+
+static exr_result jph_collect_packet_blocks(const JphPlane64 *pl,
+                                            JphSize comp_size, uint32_t res,
+                                            uint32_t num_decomps, uint32_t kmax,
+                                            JphEncCollect *ec) {
+    JphBandGeom bands[4];
+    int first_band, last_band, b;
+    jph_build_band_geoms_from_size(comp_size, num_decomps, res, bands, NULL);
+    first_band = (res == 0u) ? 0 : 1;
+    last_band = (res == 0u) ? 0 : 3;
+    for (b = first_band; b <= last_band; ++b) {
+        uint32_t cbw, cbh, row_off = 0u, col_off = 0u, y, x;
+        if (!bands[b].exists) continue;
+        cbw = jph_divceil_u32(bands[b].w, 128u);
+        cbh = jph_divceil_u32(bands[b].h, 32u);
+        if (cbw == 0u || cbh == 0u) continue;
+        jph_band_offsets(comp_size, num_decomps, res, (uint32_t)b, &row_off,
+                         &col_off);
+        for (y = 0u; y < cbh; ++y) {
+            for (x = 0u; x < cbw; ++x) {
+                uint32_t bx0 = x * 128u, by0 = y * 32u;
+                uint32_t bwid = bands[b].w - bx0, bhgt = bands[b].h - by0;
+                if (bwid > 128u) bwid = 128u;
+                if (bhgt > 32u) bhgt = 32u;
+                if (!jph_enc_collect_block(ec, pl, col_off + bx0, row_off + by0,
+                                           bwid, bhgt, kmax))
+                    return EXR_ERROR_OUT_OF_MEMORY;
+            }
+        }
+    }
+    return EXR_SUCCESS;
+}
+
 static exr_result jph_write_packet_for_component_res(const exr_allocator *a,
                                                      uint8_t **p,
                                                      uint8_t *end,
@@ -6000,7 +7519,8 @@ static exr_result jph_write_packet_for_component_res(const exr_allocator *a,
                                                      JphSize comp_size,
                                                      uint32_t res,
                                                      uint32_t num_decomps,
-                                                     uint32_t kmax) {
+                                                     uint32_t kmax,
+                                                     JphGpuEncOutputs *gpu_out) {
     JphPacketWriter bw;
     JphEncodedCb *body = NULL;
     size_t body_count = 0u, body_cap = 0u;
@@ -6009,7 +7529,8 @@ static exr_result jph_write_packet_for_component_res(const exr_allocator *a,
     exr_result rc = EXR_SUCCESS;
 
     if (!a) a = exr_default_allocator();
-    if (!p || !*p || !pl || !pl->data) return EXR_ERROR_INVALID_ARGUMENT;
+    if (!p || !*p || !pl || (!pl->data && !pl->data32))
+        return EXR_ERROR_INVALID_ARGUMENT;
     jph_packet_writer_init(&bw, *p, end);
 
     {
@@ -6072,10 +7593,25 @@ static exr_result jph_write_packet_for_component_res(const exr_allocator *a,
                         rc = EXR_ERROR_OUT_OF_MEMORY;
                         goto band_done;
                     }
-                    rc = jph_encode_block(pl->data, pl->w, col_off + bx0,
-                                          row_off + by0, bwid, bhgt, kmax,
-                                          &missing, lengths, coded,
-                                          coded_cap, &out_sz);
+                    if (gpu_out) {
+                        /* Consume the next precomputed GPU block output (same
+                         * code-block enumeration order as collection). */
+                        size_t cur = gpu_out->cursor++;
+                        out_sz = gpu_out->size[cur];
+                        missing = gpu_out->missing[cur];
+                        lengths[0] = gpu_out->len0[cur];
+                        lengths[1] = 0u;
+                        if (out_sz > coded_cap) { exr_free(a, coded); rc = EXR_ERROR_CORRUPT; goto band_done; }
+                        if (out_sz)
+                            memcpy(coded, gpu_out->bytes + cur * gpu_out->out_stride, out_sz);
+                        rc = EXR_SUCCESS;
+                    } else {
+                        rc = jph_encode_block(pl->data32 ? NULL : pl->data,
+                                              pl->data32, pl->w, col_off + bx0,
+                                              row_off + by0, bwid, bhgt, kmax,
+                                              &missing, lengths, coded,
+                                              coded_cap, &out_sz);
+                    }
                     if (rc != EXR_SUCCESS) {
                         exr_free(a, coded);
                         goto band_done;
@@ -6196,8 +7732,10 @@ done:
  * exr_jph_compress - main entry point.
  * ------------------------------------------------------------------------- */
 
-exr_result exr_jph_compress(const exr_codec_ctx *ctx, const uint8_t *block,
-                            size_t n, uint8_t **out_data, size_t *out_size) {
+static exr_result jph_compress_impl(const exr_codec_ctx *ctx,
+                                    const uint8_t *block, size_t n,
+                                    uint8_t **out_data, size_t *out_size,
+                                    JphEncCollect *collect) {
     const exr_allocator *a = ctx->alloc ? ctx->alloc : exr_default_allocator();
     JphPlane64 *planes = NULL;
     uint8_t *buf = NULL;
@@ -6206,11 +7744,17 @@ exr_result exr_jph_compress(const exr_codec_ctx *ctx, const uint8_t *block,
     exr_result rc;
     int mc_trans = 0;
     uint32_t kmax = 20u;
+    uint16_t *cs2f = NULL;
+    int is_rgb = 0;
+    JphGpuEncOutputs gpu_out_storage;
+    JphGpuEncOutputs *gpu_out_ptr = NULL;
+    uint8_t *gpu_enc_bytes = NULL;
+    uint32_t *gpu_enc_missing = NULL, *gpu_enc_len0 = NULL, *gpu_enc_size = NULL;
 
     if (out_data) *out_data = NULL;
     if (out_size) *out_size = 0;
-    if (!ctx || !block || !out_data || !out_size)
-        return EXR_ERROR_INVALID_ARGUMENT;
+    if (!ctx || !block) return EXR_ERROR_INVALID_ARGUMENT;
+    if (!collect && (!out_data || !out_size)) return EXR_ERROR_INVALID_ARGUMENT;
 
     for (c = 0; c < (uint32_t)ctx->num_channels; ++c) {
         const exr_channel *ch = &ctx->channels[c];
@@ -6234,15 +7778,23 @@ exr_result exr_jph_compress(const exr_codec_ctx *ctx, const uint8_t *block,
         }
     }
 
+    /* Detect an RGB triplet and build the codestream->file channel map so the
+     * reversible color transform decorrelates R/G/B (codestream comps 0,1,2)
+     * even when other channels (e.g. alpha) are present. */
+    cs2f = (uint16_t *)exr_malloc(a, (size_t)ctx->num_channels * sizeof(uint16_t));
+    if (!cs2f) return EXR_ERROR_OUT_OF_MEMORY;
+    is_rgb = jph_make_channel_map(ctx, cs2f);
+    mc_trans = is_rgb;
+
     jph_ensure_uvlc_enc_tables();
     jph_ensure_vlc_enc_tables();
 
     /* Allocate component planes */
     {
         uint16_t nch = (uint16_t)ctx->num_channels;
-        if (nch == 0) return EXR_ERROR_INVALID_ARGUMENT;
+        if (nch == 0) { rc = EXR_ERROR_INVALID_ARGUMENT; goto done; }
         planes = (JphPlane64 *)exr_calloc(a, nch, sizeof(*planes));
-        if (!planes) return EXR_ERROR_OUT_OF_MEMORY;
+        if (!planes) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
         for (c = 0; c < nch; ++c) {
             const exr_channel *ch = &ctx->channels[c];
             int xs = ch->x_sampling > 0 ? ch->x_sampling : 1;
@@ -6254,56 +7806,226 @@ exr_result exr_jph_compress(const exr_codec_ctx *ctx, const uint8_t *block,
             planes[c].h = (uint32_t)ph;
             if (exr_mul_ovf(pw, ph, &pw)) { rc = EXR_ERROR_CORRUPT; goto done; }
             if (exr_mul_ovf(pw, sizeof(int64_t), &pw)) { rc = EXR_ERROR_CORRUPT; goto done; }
-            planes[c].data = (int64_t *)exr_calloc(a, pw ? pw : 1u, 1);
-            if (!planes[c].data) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
+            /* The all-HALF path (kmax==20) carries coefficients in int32 planes
+             * (i32_planes) and never touches this int64 buffer, so allocating it
+             * here is pure waste (a large calloc+free per chunk). Only the int64
+             * path (FLOAT/UINT, kmax>20) needs planes[c].data. */
+            if (kmax != 20u) {
+                planes[c].data = (int64_t *)exr_calloc(a, pw ? pw : 1u, 1);
+                if (!planes[c].data) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
+            }
         }
     }
 
-    rc = jph_deinterleave_block(ctx, block, n, planes);
-    if (rc != EXR_SUCCESS) goto done;
+    /* For all-HALF parts, use the int32 pipeline (faster wavelet, less memory
+     * bandwidth), then widen back to int64 for the codeblock encoder. */
+    if (kmax == 20u) {
+        uint16_t nch = (uint16_t)ctx->num_channels;
+        int32_t **i32_planes = NULL;
 
-    for (c = 0; c < (uint32_t)ctx->num_channels; ++c) {
-        size_t count = (size_t)planes[c].w * planes[c].h;
-        const exr_channel *ch = &ctx->channels[c];
-        /* UINT channels use NLT type 0 (no transform) in the codestream, so
-         * don't apply NLT type 3 (sign-magnitude) here either. UINT data is
-         * zero-extended to int64 by jph_deinterleave_block and stays
-         * non-negative, so the wavelet operates on a clean unsigned sample. */
-        if (ch->pixel_type != EXR_PIXEL_UINT) {
-            uint32_t bit_depth = ch->pixel_type == EXR_PIXEL_HALF ? 16u : 32u;
-            rc = jph_forward_nlt_type3_i64(planes[c].data, count, bit_depth);
-            if (rc != EXR_SUCCESS) goto done;
+        i32_planes = (int32_t **)exr_calloc(a, nch, sizeof(*i32_planes));
+        if (!i32_planes) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
+
+        for (c = 0; c < nch; ++c) {
+            size_t count = (size_t)planes[c].w * planes[c].h;
+            size_t alloc_bytes;
+            if (exr_mul_ovf(count, sizeof(int32_t), &alloc_bytes)) {
+                for (uint32_t j = 0; j < c; ++j) exr_free(a, i32_planes[j]);
+                exr_free(a, i32_planes); rc = EXR_ERROR_CORRUPT; goto done;
+            }
+            i32_planes[c] = (int32_t *)exr_malloc(a, alloc_bytes ? alloc_bytes : 1u);
+            if (!i32_planes[c]) {
+                for (uint32_t j = 0; j < c; ++j) exr_free(a, i32_planes[j]);
+                exr_free(a, i32_planes); rc = EXR_ERROR_OUT_OF_MEMORY; goto done;
+            }
         }
-    }
 
-    /* Apply forward RCT on the NLT-transformed first 3 channels for
-     * exactly 3-channel parts (RGB). The decode pipeline is:
-     *   inverse wavelet → inverse RCT → inverse NLT
-     * so the encode pipeline that must be:
-     *   NLT → RCT → wavelet
-     * The RCT decorrelates the colour planes so the wavelet + HT codec
-     * can exploit the reduced entropy. Only enabled for exactly 3-channel
-     * parts because the RCT is defined on the first 3 components. */
-    if (ctx->num_channels == 3) {
-        const exr_channel *ch0 = &ctx->channels[0];
-        const exr_channel *ch1 = &ctx->channels[1];
-        const exr_channel *ch2 = &ctx->channels[2];
-        size_t count0 = (size_t)planes[0].w * planes[0].h;
-        size_t count1 = (size_t)planes[1].w * planes[1].h;
-        size_t count2 = (size_t)planes[2].w * planes[2].h;
-        if (ch0->pixel_type == ch1->pixel_type &&
-            ch0->pixel_type == ch2->pixel_type &&
-            count0 == count1 && count0 == count2) {
-            rc = jph_forward_rct_i64(planes[0].data, planes[1].data,
-                                     planes[2].data, count0);
-            if (rc != EXR_SUCCESS) goto done;
-            mc_trans = 1;
+        /* Deinterleave to int32 (HALF pixels: 2 bytes -> sign-extend to int32) */
+        {
+            size_t off = 0;
+#if defined(EXR_X86)
+            int use_avx2 = (exr_cpu_caps() & EXR_SIMD_AVX2) != 0;
+#endif
+            for (uint32_t y = 0; y < (uint32_t)ctx->num_lines; ++y) {
+                int32_t yy = ctx->y + (int32_t)y;
+                for (c = 0; c < nch; ++c) {
+                    const exr_channel *ch = &ctx->channels[c];
+                    int32_t xs = ch->x_sampling > 0 ? ch->x_sampling : 1;
+                    int32_t ys = ch->y_sampling > 0 ? ch->y_sampling : 1;
+                    int32_t nx, row_i;
+                    if ((yy % ys) != 0) continue;
+                    nx = exr_num_samples(ctx->x, ctx->x + ctx->width - 1, xs);
+                    if (nx < 0) nx = 0;
+                    row_i = exr_num_samples(ctx->y, yy, ys) - 1;
+                    if (row_i < 0) { rc = EXR_ERROR_CORRUPT; goto done; }
+                    {
+                        size_t needed = (size_t)nx * 2u;
+                        size_t dst_off = (size_t)row_i * planes[c].w;
+                        if (off + needed > n) { rc = EXR_ERROR_CORRUPT; goto done; }
+#if defined(EXR_X86)
+                        {
+                            size_t processed;
+                            if (use_avx2)
+                                processed = jph_deinterleave_half_avx2(
+                                    block + off, i32_planes[c] + dst_off,
+                                    (size_t)nx);
+                            else
+                                processed = jph_deinterleave_half_sse2(
+                                    block + off, i32_planes[c] + dst_off,
+                                    (size_t)nx);
+                            off += processed * 2u;
+                            (void)processed;
+                        }
+#else
+                        {
+                            for (uint32_t x = 0; x < (uint32_t)nx; ++x) {
+                                size_t idx = dst_off + x;
+                                int16_t v = (int16_t)(block[off] |
+                                            ((uint16_t)block[off+1] << 8));
+                                i32_planes[c][idx] = (int32_t)v;
+                                off += 2;
+                            }
+                        }
+#endif
+                        /* Fused forward NLT type-3 on the row just written, while
+                         * it is still hot in cache (avoids a separate cold full-
+                         * plane pass). NLT type-3 is an involution, so forward ==
+                         * the vectorized inverse apply (~v-biasm1 == -v-bias for
+                         * 16-bit input). Byte-identical to the prior per-plane
+                         * pass. */
+                        rc = exr_jph_apply_nlt_type3_i32(i32_planes[c] + dst_off,
+                                                         (size_t)nx, 16u);
+                        if (rc != EXR_SUCCESS) {
+                            for (uint32_t j = 0; j < nch; ++j) exr_free(a, i32_planes[j]);
+                            exr_free(a, i32_planes); goto done;
+                        }
+                    }
+                }
+            }
+            if (off != n) { rc = EXR_ERROR_CORRUPT; goto done; }
         }
-    }
 
-    for (c = 0; c < (uint32_t)ctx->num_channels; ++c) {
-        rc = jph_forward_53_2d_i64(a, planes[c].data, planes[c].w, planes[c].h, 5);
+        /* Forward RCT int32 on the detected R/G/B planes (codestream comps
+         * 0,1,2 = file channels cs2f[0..2]). */
+        if (is_rgb) {
+            uint16_t ri = cs2f[0], gi = cs2f[1], bi = cs2f[2];
+            size_t cr = (size_t)planes[ri].w * planes[ri].h;
+            rc = exr_jph_forward_rct_i32(i32_planes[ri], i32_planes[gi],
+                                         i32_planes[bi], cr);
+            if (rc != EXR_SUCCESS) {
+                for (uint32_t j = 0; j < nch; ++j) exr_free(a, i32_planes[j]);
+                exr_free(a, i32_planes); goto done;
+            }
+        }
+
+        /* Forward 5/3 wavelet int32 */
+        for (c = 0; c < nch; ++c) {
+            rc = exr_jph_forward_53_2d_i32(a, i32_planes[c],
+                                           planes[c].w, planes[c].h, 5);
+            if (rc != EXR_SUCCESS) {
+                for (uint32_t j = 0; j < nch; ++j) exr_free(a, i32_planes[j]);
+                exr_free(a, i32_planes); goto done;
+            }
+        }
+
+        /* Hand the int32 coefficient planes to the codeblock encoder directly
+         * (no int32->int64 widening): the all-HALF reversible-5/3 coefficients
+         * fit int32 and the encoder reads them natively. The now-unused int64
+         * plane is released; ownership of each i32 plane transfers to data32. */
+        for (c = 0; c < nch; ++c) {
+            exr_free(a, planes[c].data);
+            planes[c].data = NULL;
+            planes[c].data32 = i32_planes[c];
+        }
+        exr_free(a, i32_planes);
+    } else {
+        /* Original int64 path for components with >16-bit precision */
+        rc = jph_deinterleave_block(ctx, block, n, planes);
         if (rc != EXR_SUCCESS) goto done;
+
+        for (c = 0; c < (uint32_t)ctx->num_channels; ++c) {
+            size_t count = (size_t)planes[c].w * planes[c].h;
+            const exr_channel *ch = &ctx->channels[c];
+            if (ch->pixel_type != EXR_PIXEL_UINT) {
+                uint32_t bit_depth = ch->pixel_type == EXR_PIXEL_HALF ? 16u : 32u;
+                rc = jph_forward_nlt_type3_i64(planes[c].data, count, bit_depth);
+                if (rc != EXR_SUCCESS) goto done;
+            }
+        }
+
+        /* Forward RCT int64 on the detected R/G/B planes (codestream comps
+         * 0,1,2 = file channels cs2f[0..2]); matching type/sampling is
+         * guaranteed by the RGB detection. */
+        if (is_rgb) {
+            uint16_t ri = cs2f[0], gi = cs2f[1], bi = cs2f[2];
+            size_t count0 = (size_t)planes[ri].w * planes[ri].h;
+            rc = jph_forward_rct_i64(planes[ri].data, planes[gi].data,
+                                     planes[bi].data, count0);
+            if (rc != EXR_SUCCESS) goto done;
+        }
+
+        for (c = 0; c < (uint32_t)ctx->num_channels; ++c) {
+            rc = jph_forward_53_2d_i64(a, planes[c].data, planes[c].w,
+                                       planes[c].h, 5);
+            if (rc != EXR_SUCCESS) goto done;
+        }
+    }
+
+    /* GPU encode seam: collect each code-block's coefficient tile + dims (in
+     * res->comp->band->y->x order, matching the packet writer). */
+    if (collect) {
+        for (uint32_t res = 0u; res <= 5u; ++res) {
+            for (c = 0; c < (uint32_t)ctx->num_channels; ++c) {
+                JphPlane64 *pl = &planes[cs2f[c]];
+                JphSize cs;
+                cs.w = pl->w;
+                cs.h = pl->h;
+                rc = jph_collect_packet_blocks(pl, cs, res, 5u, kmax, collect);
+                if (rc != EXR_SUCCESS) goto done;
+            }
+        }
+        if (collect->err) { rc = EXR_ERROR_OUT_OF_MEMORY; goto done; }
+        if (!collect->gpu_enc_fn) { rc = EXR_SUCCESS; goto done; } /* pure collect */
+
+        /* Whole-image GPU encode: encode all blocks on the device, then fall
+         * through to assemble the codestream from those outputs. Fall back to
+         * the CPU codec if any block is not i32-eligible. */
+        {
+            const uint32_t ENC_STRIDE = 20480u;
+            size_t i, nrec = collect->count;
+            exr_jph_enc_plan plan;
+            for (i = 0; i < nrec; ++i)
+                if (!collect->records[i].plane_is_i32 ||
+                    collect->records[i].kmax < 1u ||
+                    collect->records[i].kmax > 30u) {
+                    rc = EXR_ERROR_UNSUPPORTED;
+                    goto done;
+                }
+            gpu_enc_bytes = (uint8_t *)exr_malloc(a, (nrec ? nrec : 1u) * ENC_STRIDE);
+            gpu_enc_missing = (uint32_t *)exr_malloc(a, (nrec ? nrec : 1u) * sizeof(uint32_t));
+            gpu_enc_len0 = (uint32_t *)exr_malloc(a, (nrec ? nrec : 1u) * sizeof(uint32_t));
+            gpu_enc_size = (uint32_t *)exr_malloc(a, (nrec ? nrec : 1u) * sizeof(uint32_t));
+            if (!gpu_enc_bytes || !gpu_enc_missing || !gpu_enc_len0 || !gpu_enc_size) {
+                rc = EXR_ERROR_OUT_OF_MEMORY;
+                goto done;
+            }
+            memset(&plan, 0, sizeof(plan));
+            plan.records = collect->records;
+            plan.num_records = nrec;
+            plan.coeffs = collect->coeffs;
+            plan.coeff_count = collect->coeff_count;
+            rc = collect->gpu_enc_fn(collect->gpu_enc_user, &plan, gpu_enc_bytes,
+                                     ENC_STRIDE, gpu_enc_missing, gpu_enc_len0,
+                                     gpu_enc_size);
+            if (rc != EXR_SUCCESS) goto done;
+            gpu_out_storage.bytes = gpu_enc_bytes;
+            gpu_out_storage.out_stride = ENC_STRIDE;
+            gpu_out_storage.missing = gpu_enc_missing;
+            gpu_out_storage.len0 = gpu_enc_len0;
+            gpu_out_storage.size = gpu_enc_size;
+            gpu_out_storage.cursor = 0;
+            gpu_out_ptr = &gpu_out_storage;
+        }
     }
 
     /* Estimate output buffer size */
@@ -6319,20 +8041,21 @@ exr_result exr_jph_compress(const exr_codec_ctx *ctx, const uint8_t *block,
         uint8_t *p = buf, *end = buf + buf_cap;
         uint8_t *psot_ptr = NULL;
 
-        rc = jph_write_ht_header(&p, end, ctx);
+        rc = jph_write_ht_header(&p, end, ctx, cs2f);
         if (rc != EXR_SUCCESS) goto done;
 
-        rc = jph_write_codestream(&p, end, ctx, mc_trans, kmax, &psot_ptr);
+        rc = jph_write_codestream(&p, end, ctx, mc_trans, kmax, &psot_ptr, cs2f);
         if (rc != EXR_SUCCESS) goto done;
 
         for (uint32_t res = 0u; res <= 5u; ++res) {
             for (c = 0; c < (uint32_t)ctx->num_channels; ++c) {
-                JphPlane64 *pl = &planes[c];
+                JphPlane64 *pl = &planes[cs2f[c]];
                 JphSize cs;
                 cs.w = pl->w;
                 cs.h = pl->h;
                 rc = jph_write_packet_for_component_res(a, &p, end, pl, cs,
-                                                        res, 5u, kmax);
+                                                        res, 5u, kmax,
+                                                        gpu_out_ptr);
                 if (rc != EXR_SUCCESS) goto done;
             }
         }
@@ -6363,17 +8086,117 @@ exr_result exr_jph_compress(const exr_codec_ctx *ctx, const uint8_t *block,
     }
 
 done:
-    if (rc != EXR_SUCCESS) {
+    if (rc != EXR_SUCCESS && out_data) {
         exr_free(a, *out_data);
         *out_data = NULL;
-        *out_size = 0;
+        if (out_size) *out_size = 0;
     }
     exr_free(a, buf);
+    exr_free(a, cs2f);
+    exr_free(a, gpu_enc_bytes);
+    exr_free(a, gpu_enc_missing);
+    exr_free(a, gpu_enc_len0);
+    exr_free(a, gpu_enc_size);
     if (planes) {
-        for (c = 0; c < (uint32_t)ctx->num_channels; ++c)
+        for (c = 0; c < (uint32_t)ctx->num_channels; ++c) {
             exr_free(a, planes[c].data);
+            exr_free(a, planes[c].data32);
+        }
         exr_free(a, planes);
     }
-    if (rc != EXR_SUCCESS) { *out_data = NULL; *out_size = 0; }
+    if (rc != EXR_SUCCESS && out_data) { *out_data = NULL; if (out_size) *out_size = 0; }
+    return rc;
+}
+
+exr_result exr_jph_compress(const exr_codec_ctx *ctx, const uint8_t *block,
+                            size_t n, uint8_t **out_data, size_t *out_size) {
+    return jph_compress_impl(ctx, block, n, out_data, out_size, NULL);
+}
+
+exr_result exr_jph_compress_gpu(const exr_codec_ctx *ctx, const uint8_t *block,
+                                size_t n, uint8_t **out_data, size_t *out_size,
+                                exr_jph_gpu_block_encode_fn fn, void *user) {
+    JphEncCollect ec;
+    exr_result rc;
+    if (!ctx || !block || !out_data || !out_size || !fn)
+        return EXR_ERROR_INVALID_ARGUMENT;
+    memset(&ec, 0, sizeof(ec));
+    ec.a = ctx->alloc ? ctx->alloc : exr_default_allocator();
+    ec.gpu_enc_fn = fn;
+    ec.gpu_enc_user = user;
+    rc = jph_compress_impl(ctx, block, n, out_data, out_size, &ec);
+    exr_free(ec.a, ec.records);
+    exr_free(ec.a, ec.coeffs);
+    return rc;
+}
+
+/* ---- GPU encode seam: public-internal entry points ---------------------- */
+exr_result exr_jph_collect_encode_blocks(const exr_codec_ctx *ctx,
+                                         const uint8_t *block, size_t n,
+                                         exr_jph_enc_plan *out) {
+    JphEncCollect ec;
+    exr_result rc;
+    if (!ctx || !block || !out) return EXR_ERROR_INVALID_ARGUMENT;
+    memset(out, 0, sizeof(*out));
+    memset(&ec, 0, sizeof(ec));
+    ec.a = ctx->alloc ? ctx->alloc : exr_default_allocator();
+    rc = jph_compress_impl(ctx, block, n, NULL, NULL, &ec);
+    if (rc != EXR_SUCCESS || ec.err) {
+        exr_free(ec.a, ec.records);
+        exr_free(ec.a, ec.coeffs);
+        return ec.err ? EXR_ERROR_OUT_OF_MEMORY : rc;
+    }
+    out->records = ec.records;
+    out->num_records = ec.count;
+    out->coeffs = ec.coeffs;
+    out->coeff_count = ec.coeff_count;
+    return EXR_SUCCESS;
+}
+
+void exr_jph_enc_plan_free(const exr_allocator *a, exr_jph_enc_plan *plan) {
+    if (!plan) return;
+    if (!a) a = exr_default_allocator();
+    exr_free(a, plan->records);
+    exr_free(a, plan->coeffs);
+    memset(plan, 0, sizeof(*plan));
+}
+
+exr_result exr_jph_ht_enc_tables(const uint16_t **vlc0, const uint16_t **vlc1,
+                                 const uint8_t **uvlc_packed) {
+    static uint8_t packed[75 * 6];
+    static int packed_ready = 0;
+    int i;
+    exr_jph_warmup_encode_tables();
+    if (!packed_ready) {
+        for (i = 0; i < 75; ++i) {
+            packed[i * 6 + 0] = g_uvlc_enc_tbl[i].pre;
+            packed[i * 6 + 1] = g_uvlc_enc_tbl[i].pre_len;
+            packed[i * 6 + 2] = g_uvlc_enc_tbl[i].suf;
+            packed[i * 6 + 3] = g_uvlc_enc_tbl[i].suf_len;
+            packed[i * 6 + 4] = g_uvlc_enc_tbl[i].ext;
+            packed[i * 6 + 5] = g_uvlc_enc_tbl[i].ext_len;
+        }
+        packed_ready = 1;
+    }
+    if (vlc0) *vlc0 = g_vlc_enc_tbl0;
+    if (vlc1) *vlc1 = g_vlc_enc_tbl1;
+    if (uvlc_packed) *uvlc_packed = packed;
+    return EXR_SUCCESS;
+}
+
+exr_result exr_jph_encode_one_block_i32(const exr_jph_enc_record *rec,
+                                        const int32_t *coeffs, uint8_t *out,
+                                        size_t out_cap, uint32_t *out_missing,
+                                        uint32_t *out_len0, size_t *out_size) {
+    uint32_t lengths[2] = {0u, 0u};
+    uint32_t missing = rec ? rec->kmax : 0u;
+    exr_result rc;
+    if (!rec || !coeffs || !out || !out_size) return EXR_ERROR_INVALID_ARGUMENT;
+    exr_jph_warmup_encode_tables();
+    rc = jph_encode_block(NULL, coeffs, rec->width, 0u, 0u, rec->width,
+                          rec->height, rec->kmax, &missing, lengths, out,
+                          out_cap, out_size);
+    if (out_missing) *out_missing = missing;
+    if (out_len0) *out_len0 = lengths[0];
     return rc;
 }

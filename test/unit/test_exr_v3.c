@@ -2069,6 +2069,42 @@ static void stream_memory_bound_check(const char *path, exr_compression comp,
     free(buf);
 }
 
+/* Scalar floor-division by 2^s, mirroring jph_floor_div_pow2 exactly (truncating
+ * divide with a floor correction for negatives) — independent of the platform's
+ * signed-shift behaviour, so it is a faithful reference for the RCT kernels. */
+static int64_t rct_fdp2(int64_t v, unsigned s) {
+    int64_t d = (int64_t)1 << s;
+    return v >= 0 ? v / d : -(((-v) + d - 1) / d);
+}
+/* Pure-scalar inverse RCT (Y/Cb/Cr -> R/G/B) mirroring exr_jph_inverse_rct_i32's
+ * tail: transform the in-range prefix, then stop on the first int32 overflow
+ * (leaving the remaining elements untouched) and report failure. */
+static int rct_inv_scalar(int32_t *c0, int32_t *c1, int32_t *c2, size_t n) {
+    size_t i;
+    for (i = 0; i < n; ++i) {
+        int64_t g = (int64_t)c0[i] - rct_fdp2((int64_t)c1[i] + c2[i], 2);
+        int64_t r = (int64_t)c2[i] + g, b = (int64_t)c1[i] + g;
+        if (r < INT32_MIN || r > INT32_MAX || g < INT32_MIN || g > INT32_MAX ||
+            b < INT32_MIN || b > INT32_MAX)
+            return 0;
+        c0[i] = (int32_t)r; c1[i] = (int32_t)g; c2[i] = (int32_t)b;
+    }
+    return 1;
+}
+/* Pure-scalar forward RCT (R/G/B -> Y/Cb/Cr) mirroring exr_jph_forward_rct_i32. */
+static int rct_fwd_scalar(int32_t *c0, int32_t *c1, int32_t *c2, size_t n) {
+    size_t i;
+    for (i = 0; i < n; ++i) {
+        int64_t y = rct_fdp2((int64_t)c0[i] + c2[i] + 2 * (int64_t)c1[i], 2);
+        int64_t db = (int64_t)c2[i] - c1[i], dr = (int64_t)c0[i] - c1[i];
+        if (y < INT32_MIN || y > INT32_MAX || db < INT32_MIN || db > INT32_MAX ||
+            dr < INT32_MIN || dr > INT32_MAX)
+            return 0;
+        c0[i] = (int32_t)y; c1[i] = (int32_t)db; c2[i] = (int32_t)dr;
+    }
+    return 1;
+}
+
 /* JPH SIMD kernels must be bit-identical to their scalar reference. */
 static void jph_simd_check(void) {
 #if defined(EXR_X86)
@@ -2174,6 +2210,158 @@ static void jph_simd_check(void) {
             if (nok) printf("  ok: JPH NLT type3 i32 SIMD == scalar\n");
         }
         free(ref); free(got); free(src);
+    }
+
+    /* HT encode quad prepare: the SSE2 int64- and int32-plane kernels must
+     * compute rho / e_q / e_qmax / s / max_val identically to the scalar
+     * reference for every quad (full int32 range, incl. zero/insignificant
+     * lanes and the float-CLZ boundaries). This guards the prepare against the
+     * horizontal-max and sample-order regressions found during development. */
+    {
+        uint32_t rng = 0x5eed1234u;
+        int qok = 1;
+        long it;
+        for (it = 0; it < 100000 && qok; ++it) {
+            int32_t q[4]; /* [s0,s1,s2,s3] = (x,y),(x,y+1),(x+1,y),(x+1,y+1) */
+            int kk;
+            uint32_t shift, p;
+            int rrho = 0, reqmax = 0, req[4] = {0,0,0,0};
+            uint64_t rs[4] = {0,0,0,0}, rmax = 0;
+            for (kk = 0; kk < 4; ++kk) {
+                int32_t v;
+                rng = rng * 1664525u + 1013904223u;
+                v = (int32_t)((rng >> 9) & 0x3ffffu); /* HALF coeff range */
+                rng = rng * 1664525u + 1013904223u;
+                if (rng & 0x10000u) v = -v;
+                if ((rng & 0xe0000u) == 0u) v = 0; /* exercise insignificant */
+                q[kk] = v;
+            }
+            shift = 11u; p = 11u; /* kmax=20 (all-HALF) */
+            /* scalar reference (mirrors jph_encode_block_prepare_sample32) */
+            for (kk = 0; kk < 4; ++kk) {
+                int bit = 1 << kk;
+                int32_t sv = q[kk];
+                uint32_t mag = (uint32_t)(sv < 0 ? -(int64_t)sv : sv);
+                uint32_t t, val;
+                if ((uint64_t)mag > rmax) rmax = mag;
+                t = (sv < 0 ? 0x80000000u : 0u) | (mag << shift);
+                val = t + t; val >>= p; val &= ~1u;
+                if (val) {
+                    int eq = 32 - (val - 1 ? __builtin_clz(val - 1) : 32);
+                    rrho |= bit; req[kk] = eq;
+                    if (eq > reqmax) reqmax = eq;
+                    rs[kk] = (uint64_t)((val - 2) + (t >> 31));
+                } else { req[kk] = 0; rs[kk] = 0; }
+            }
+            /* int32-plane (from32) kernel: plane[y*2+x] = (0,0)=s0,(1,0)=s2,
+             * (0,1)=s1,(1,1)=s3. */
+            if (caps & EXR_SIMD_SSE2) {
+                int32_t pl32[4] = { q[0], q[2], q[1], q[3] };
+                int64_t pl64[4] = { q[0], q[2], q[1], q[3] };
+                int e0 = 0, em0 = 0, eq0[4] = {0,0,0,0};
+                uint64_t s0[4] = {0,0,0,0}, mx0 = 0;
+                int e1 = 0, em1 = 0, eq1[4] = {0,0,0,0};
+                uint64_t s1[4] = {0,0,0,0}, mx1 = 0;
+                jph_encode_prepare_quad_from32_sse2(pl32, 2,0,0,0,0, shift, p,
+                                                    &e0, &em0, eq0, s0, &mx0);
+                jph_encode_prepare_quad_i32_sse2(pl64, 2,0,0,0,0, shift, p,
+                                                 &e1, &em1, eq1, s1, &mx1);
+                if (e0 != rrho || em0 != reqmax || mx0 != rmax) qok = 0;
+                if (e1 != rrho || em1 != reqmax) qok = 0;
+                for (kk = 0; kk < 4; ++kk) {
+                    if (eq0[kk] != req[kk] || s0[kk] != rs[kk]) qok = 0;
+                    if (eq1[kk] != req[kk] || s1[kk] != rs[kk]) qok = 0;
+                }
+            }
+        }
+        CHECK(qok, "JPH HT encode prepare quad SIMD == scalar");
+        if (qok) printf("  ok: JPH HT encode prepare quad SIMD == scalar\n");
+    }
+
+    /* inverse + forward RCT: the SSE2/AVX2 kernels transform a bounded in-range
+     * prefix and the scalar tail finishes the rest; the full path (kernel prefix
+     * + scalar tail, mirroring the production wiring) must be byte-identical to a
+     * pure-scalar run AND agree on success/failure — including the out-of-range
+     * fallback boundary, where a sparse huge spike forces a mid-array kernel stop
+     * and the tail then hits (or clears) the real int32 overflow. */
+    {
+        const size_t rn = 1031; /* not a multiple of 8 -> exercises SIMD tail */
+        int32_t *src0 = (int32_t *)malloc(rn * sizeof(int32_t));
+        int32_t *src1 = (int32_t *)malloc(rn * sizeof(int32_t));
+        int32_t *src2 = (int32_t *)malloc(rn * sizeof(int32_t));
+        int32_t *e0 = (int32_t *)malloc(rn * sizeof(int32_t)); /* reference */
+        int32_t *e1 = (int32_t *)malloc(rn * sizeof(int32_t));
+        int32_t *e2 = (int32_t *)malloc(rn * sizeof(int32_t));
+        int32_t *g0 = (int32_t *)malloc(rn * sizeof(int32_t)); /* one tier's path */
+        int32_t *g1 = (int32_t *)malloc(rn * sizeof(int32_t));
+        int32_t *g2 = (int32_t *)malloc(rn * sizeof(int32_t));
+        int rok = 1;
+        uint32_t rng = 0x09c7e5a1u;
+        if (src0 && src1 && src2 && e0 && e1 && e2 && g0 && g1 && g2) {
+            long it;
+            for (it = 0; it < 2000 && rok; ++it) {
+                int huge = (it % 7) == 0; /* sometimes inject overflow spikes */
+                int dir, tier;
+                size_t i;
+                for (i = 0; i < rn; ++i) {
+                    int32_t v;
+                    rng = rng * 1664525u + 1013904223u;
+                    v = (int32_t)rng >> (int)(12 + (rng % 14u)); src0[i] = v;
+                    rng = rng * 1664525u + 1013904223u;
+                    v = (int32_t)rng >> (int)(12 + (rng % 14u)); src1[i] = v;
+                    rng = rng * 1664525u + 1013904223u;
+                    v = (int32_t)rng >> (int)(12 + (rng % 14u)); src2[i] = v;
+                    if (huge) { /* ~1/64 full-range spike -> mid-array fallback */
+                        rng = rng * 1664525u + 1013904223u;
+                        if ((rng % 64u) == 0u) {
+                            src0[i] = (int32_t)rng;
+                            rng = rng * 1664525u + 1013904223u;
+                            src1[i] = (int32_t)rng;
+                            rng = rng * 1664525u + 1013904223u;
+                            src2[i] = (int32_t)rng;
+                        }
+                    }
+                }
+                for (dir = 0; dir < 2 && rok; ++dir) {
+                    int rref;
+                    memcpy(e0, src0, rn * sizeof(int32_t));
+                    memcpy(e1, src1, rn * sizeof(int32_t));
+                    memcpy(e2, src2, rn * sizeof(int32_t));
+                    rref = dir ? rct_fwd_scalar(e0, e1, e2, rn)
+                               : rct_inv_scalar(e0, e1, e2, rn);
+                    for (tier = 1; tier <= 2 && rok; ++tier) {
+                        size_t m = 0;
+                        int rgot;
+                        if (tier == 1 && !(caps & EXR_SIMD_SSE2)) continue;
+                        if (tier == 2 && !(caps & EXR_SIMD_AVX2)) continue;
+                        memcpy(g0, src0, rn * sizeof(int32_t));
+                        memcpy(g1, src1, rn * sizeof(int32_t));
+                        memcpy(g2, src2, rn * sizeof(int32_t));
+                        if (dir == 0)
+                            m = (tier == 2)
+                                    ? jph_inverse_rct_i32_avx2(g0, g1, g2, rn)
+                                    : jph_inverse_rct_i32_sse2(g0, g1, g2, rn);
+                        else
+                            m = (tier == 2)
+                                    ? jph_forward_rct_i32_avx2(g0, g1, g2, rn)
+                                    : jph_forward_rct_i32_sse2(g0, g1, g2, rn);
+                        /* scalar tail over [m, rn) mirrors the production wiring */
+                        rgot = dir ? rct_fwd_scalar(g0 + m, g1 + m, g2 + m, rn - m)
+                                   : rct_inv_scalar(g0 + m, g1 + m, g2 + m, rn - m);
+                        if (rgot != rref) rok = 0;
+                        if (memcmp(e0, g0, rn * sizeof(int32_t)) ||
+                            memcmp(e1, g1, rn * sizeof(int32_t)) ||
+                            memcmp(e2, g2, rn * sizeof(int32_t)))
+                            rok = 0;
+                    }
+                }
+            }
+            CHECK(rok, "JPH inverse/forward RCT SIMD == scalar");
+            if (rok) printf("  ok: JPH inverse/forward RCT SIMD == scalar\n");
+        }
+        free(src0); free(src1); free(src2);
+        free(e0); free(e1); free(e2);
+        free(g0); free(g1); free(g2);
     }
 
     /* inverse 5/3 1D wavelet: AVX2 must match scalar (output AND return code,
@@ -2295,9 +2483,11 @@ static void jph_simd_check(void) {
         uint32_t *src = (uint32_t *)malloc(en * sizeof(uint32_t));
         int64_t *r0 = (int64_t *)malloc(en * sizeof(int64_t));
         int64_t *r1 = (int64_t *)malloc(en * sizeof(int64_t));
+        int32_t *r2 = (int32_t *)malloc(en * sizeof(int32_t));
+        int32_t *r3 = (int32_t *)malloc(en * sizeof(int32_t));
         int eok = 1;
         uint32_t rng = 0x2468aceu;
-        if (src && r0 && r1) {
+        if (src && r0 && r1 && r2 && r3) {
             unsigned shift;
             for (shift = 0u; shift <= 30u && eok; ++shift) {
                 size_t i;
@@ -2309,15 +2499,19 @@ static void jph_simd_check(void) {
                     uint32_t v = src[i];
                     int32_t mag = (int32_t)((v & 0x7fffffffu) >> shift);
                     r0[i] = (v & 0x80000000u) ? -mag : mag;
+                    r2[i] = (int32_t)r0[i];
                 }
                 memset(r1, 0x5a, en * sizeof(int64_t));
+                memset(r3, 0x5a, en * sizeof(int32_t));
                 jph_extract_signmag_i32_to_i64_avx2(r1, src, en, shift);
+                jph_extract_signmag_i32_to_i32_avx2(r3, src, en, shift);
                 if (memcmp(r0, r1, en * sizeof(int64_t)) != 0) eok = 0;
+                if (memcmp(r2, r3, en * sizeof(int32_t)) != 0) eok = 0;
             }
             CHECK(eok, "JPH sign-mag extract AVX2 == scalar");
             if (eok) printf("  ok: JPH sign-mag extract AVX2 == scalar\n");
         }
-        free(src); free(r0); free(r1);
+        free(src); free(r0); free(r1); free(r2); free(r3);
     }
 
     /* vertical (column) forward 5/3 (int64, encode): AVX2 must match the scalar
@@ -3077,6 +3271,166 @@ static void util_simd_parity_tests(void) {
     exr_simd_force(2);
 }
 
+/* The ZIP/ZIPS byte predictor (delta prefix-sum) and even/odd interleave run on
+ * every DEFLATE block decode and have scalar / SSE2 / AVX2 (and NEON) variants.
+ * Verify every available tier is bit-identical to the scalar reference, across
+ * sizes that exercise the vector tails (non-multiples of 16/32). */
+static void simd_zip_kernel_parity_tests(void) {
+    static const size_t sizes[] = {0, 1, 2, 3, 7, 8, 15, 16, 17, 31, 32, 33,
+                                   63, 64, 65, 255, 256, 1000, 4096, 4097};
+    const size_t maxn = 4097;
+    uint8_t *seed = (uint8_t *)malloc(maxn);
+    uint8_t *ref = (uint8_t *)malloc(maxn);
+    uint8_t *got = (uint8_t *)malloc(maxn);
+    uint8_t *dref = (uint8_t *)malloc(maxn);
+    uint8_t *dgot = (uint8_t *)malloc(maxn);
+    uint32_t rng = 0xC0FFEEu;
+    int pred_ok = 1, intl_ok = 1, max_tier, tier;
+    size_t si, i;
+
+    for (i = 0; i < maxn; ++i) {
+        rng = rng * 1664525u + 1013904223u;
+        seed[i] = (uint8_t)(rng >> 17);
+    }
+    /* Highest forceable tier on this build/host: 2 (AVX2) on x86, 1 on NEON. */
+#if defined(EXR_X86)
+    max_tier = 2;
+#elif defined(EXR_NEON)
+    max_tier = 1;
+#else
+    max_tier = 0;
+#endif
+
+    for (si = 0; si < sizeof(sizes) / sizeof(sizes[0]); ++si) {
+        size_t n = sizes[si];
+        exr_simd_force(0);
+        memcpy(ref, seed, n);
+        exr_simd.predictor_decode(ref, n);
+        exr_simd.interleave(seed, dref, n);
+        for (tier = 1; tier <= max_tier; ++tier) {
+            exr_simd_force(tier);
+            memcpy(got, seed, n);
+            exr_simd.predictor_decode(got, n);
+            if (memcmp(ref, got, n) != 0) pred_ok = 0;
+            memset(dgot, 0xAB, n);
+            exr_simd.interleave(seed, dgot, n);
+            if (memcmp(dref, dgot, n) != 0) intl_ok = 0;
+        }
+    }
+    exr_simd_force(max_tier);
+    CHECK(pred_ok, "SIMD ZIP predictor_decode matches scalar (all tiers/tails)");
+    CHECK(intl_ok, "SIMD ZIP interleave matches scalar (all tiers/tails)");
+    free(seed); free(ref); free(got); free(dref); free(dgot);
+}
+
+/* The in-tree and libdeflate zlib backends must be losslessly interchangeable:
+ * every available backend reproduces the original ZIP-encoded pixels exactly,
+ * and a stream written by one backend decodes correctly under the other. When
+ * libdeflate is not compiled in, exr_zlib_set_backend(LIBDEFLATE) reports
+ * UNSUPPORTED and only the in-tree round-trip runs. */
+static void zlib_backend_parity_tests(void) {
+    enum { W = 96, H = 64, NC = 2, NPX = W * H };
+    static uint16_t px[NC][NPX];
+    exr_image img;
+    exr_part part;
+    exr_channel ch[NC];
+    void *images[NC];
+    uint32_t rng = 0x2468ACEu;
+    int c, i, ok = 1, ran = 0;
+    void *bufA = NULL, *bufB = NULL;
+    size_t szA = 0, szB = 0;
+    exr_result rc;
+    int have_ld;
+
+    for (c = 0; c < NC; c++)
+        for (i = 0; i < NPX; i++) {
+            rng = rng * 1664525u + 1013904223u;
+            px[c][i] = (uint16_t)((rng >> 13) & 0x3fffu); /* mildly compressible */
+        }
+    memset(&img, 0, sizeof(img));
+    memset(&part, 0, sizeof(part));
+    memset(ch, 0, sizeof(ch));
+    img.num_parts = 1;
+    img.parts = &part;
+    part.header.num_channels = NC;
+    part.header.channels = ch;
+    ch[0] = (exr_channel){"A", EXR_PIXEL_HALF, 1, 1, 0};
+    ch[1] = (exr_channel){"B", EXR_PIXEL_HALF, 1, 1, 0};
+    part.header.data_window.max_x = W - 1;
+    part.header.data_window.max_y = H - 1;
+    part.header.display_window = part.header.data_window;
+    part.width = W;
+    part.height = H;
+    part.images = images;
+    images[0] = px[0];
+    images[1] = px[1];
+
+    have_ld = (exr_zlib_set_backend(EXR_ZLIB_LIBDEFLATE) == EXR_SUCCESS);
+    exr_zlib_set_backend(EXR_ZLIB_AUTO);
+
+    /* Each available backend must encode+decode ZIP losslessly. */
+    {
+        const exr_zlib_backend tiers[2] = {EXR_ZLIB_INTREE, EXR_ZLIB_LIBDEFLATE};
+        int t;
+        for (t = 0; t < 2; t++) {
+            void *buf = NULL;
+            size_t sz = 0;
+            exr_image dec;
+            if (exr_zlib_set_backend(tiers[t]) != EXR_SUCCESS) continue;
+            if (!EXR_OK(exr_save_to_memory(&buf, &sz, NULL, &img,
+                                           EXR_COMPRESSION_ZIP))) { ok = 0; continue; }
+            memset(&dec, 0, sizeof(dec));
+            if (!EXR_OK(exr_load_from_memory(buf, sz, NULL, &dec))) {
+                ok = 0; free(buf); continue;
+            }
+            if (dec.num_parts != 1 ||
+                memcmp(dec.parts[0].images[0], px[0], sizeof(px[0])) != 0 ||
+                memcmp(dec.parts[0].images[1], px[1], sizeof(px[1])) != 0)
+                ok = 0;
+            ran++;
+            exr_image_free(&dec);
+            free(buf);
+        }
+    }
+
+    /* Cross-backend: a stream written by one backend decodes under the other,
+     * reproducing every channel. Free the decoded image unconditionally so a
+     * detected mismatch does not leak under LSan. */
+    if (have_ld) {
+        exr_image dec;
+        int match;
+        exr_zlib_set_backend(EXR_ZLIB_INTREE);
+        rc = exr_save_to_memory(&bufA, &szA, NULL, &img, EXR_COMPRESSION_ZIP);
+        exr_zlib_set_backend(EXR_ZLIB_LIBDEFLATE);
+        memset(&dec, 0, sizeof(dec));
+        match = EXR_OK(rc) && EXR_OK(exr_load_from_memory(bufA, szA, NULL, &dec));
+        if (match) {
+            match = memcmp(dec.parts[0].images[0], px[0], sizeof(px[0])) == 0 &&
+                    memcmp(dec.parts[0].images[1], px[1], sizeof(px[1])) == 0;
+            exr_image_free(&dec);
+        }
+        if (!match) ok = 0;
+
+        rc = exr_save_to_memory(&bufB, &szB, NULL, &img, EXR_COMPRESSION_ZIP);
+        exr_zlib_set_backend(EXR_ZLIB_INTREE);
+        memset(&dec, 0, sizeof(dec));
+        match = EXR_OK(rc) && EXR_OK(exr_load_from_memory(bufB, szB, NULL, &dec));
+        if (match) {
+            match = memcmp(dec.parts[0].images[0], px[0], sizeof(px[0])) == 0 &&
+                    memcmp(dec.parts[0].images[1], px[1], sizeof(px[1])) == 0;
+            exr_image_free(&dec);
+        }
+        if (!match) ok = 0;
+        free(bufA);
+        free(bufB);
+    }
+
+    exr_zlib_set_backend(EXR_ZLIB_AUTO);
+    CHECK(ok && ran >= 1, "zlib backends round-trip ZIP losslessly + interop");
+    printf("  ok: zlib backend = %s (libdeflate %s)\n", exr_zlib_backend_name(),
+           have_ld ? "compiled in" : "not compiled");
+}
+
 static void util_resize_tests(void) {
     const exr_allocator *a = NULL;
     int w = 8, h = 6, i;
@@ -3301,6 +3655,8 @@ static void util_tests(void) {
     util_convert_tests();
     printf("== util: SIMD parity ==\n");
     util_simd_parity_tests();
+    simd_zip_kernel_parity_tests();
+    zlib_backend_parity_tests();
     printf("== util: resize ==\n");
     util_resize_tests();
     printf("== util: tonemap ==\n");
@@ -3311,6 +3667,183 @@ static void util_tests(void) {
     util_transfer_tests();
     printf("== util: 3D LUT ==\n");
     util_lut_tests();
+}
+
+/* ---- Luminance-chroma (Y/RY/BY) reconstruction ----------------------------
+ *
+ * Builds a synthetic Y/RY/BY part with 2x2-subsampled chroma and checks that
+ * exr_part_yc_to_rgba_float() reconstructs the original RGB. Using a
+ * constant-chroma intensity gradient (fixed R:G:B ratio, varying brightness)
+ * makes RY/BY spatially constant, so subsampling + upsampling are lossless and
+ * the reconstruction is exact to float precision — isolating the conversion
+ * math and luminance weighting. A second varying-chroma image checks that the
+ * even (stored) chroma sites reconstruct exactly and interpolation stays bounded.
+ */
+static void luminance_chroma_tests(void) {
+    float yw[3];
+
+    printf("== luminance-chroma (Y/RY/BY) ==\n");
+
+    /* Weights: default == Rec.709; Rec.2020 primaries differ as expected. */
+    exr_luminance_weights(NULL, 0, yw);
+    CHECK(fabsf(yw[0] - 0.2126f) < 1e-4f && fabsf(yw[1] - 0.7152f) < 1e-4f &&
+              fabsf(yw[2] - 0.0722f) < 1e-4f,
+          "default luminance weights are Rec.709");
+    {
+        /* Rec.709 primaries + D65 white -> the same weights as the default. */
+        const float rec709[8] = {0.6400f, 0.3300f, 0.3000f, 0.6000f,
+                                 0.1500f, 0.0600f, 0.3127f, 0.3290f};
+        float w709[3];
+        exr_luminance_weights(rec709, 1, w709);
+        CHECK(fabsf(w709[0] - yw[0]) < 2e-3f && fabsf(w709[1] - yw[1]) < 2e-3f &&
+                  fabsf(w709[2] - yw[2]) < 2e-3f,
+              "Rec.709 chromaticities reproduce Rec.709 weights");
+    }
+    {
+        /* Rec.2020 primaries -> weights ~ (0.2627, 0.6780, 0.0593). */
+        const float rec2020[8] = {0.7080f, 0.2920f, 0.1700f, 0.7970f,
+                                  0.1310f, 0.0460f, 0.3127f, 0.3290f};
+        float w2020[3];
+        exr_luminance_weights(rec2020, 1, w2020);
+        CHECK(fabsf(w2020[0] - 0.2627f) < 3e-3f &&
+                  fabsf(w2020[1] - 0.6780f) < 3e-3f &&
+                  fabsf(w2020[2] - 0.0593f) < 3e-3f,
+              "Rec.2020 chromaticities give Rec.2020 weights");
+    }
+
+    /* Build a 16x16 constant-chroma intensity gradient and reconstruct it. */
+    {
+        const int w = 16, h = 16;
+        const int cw = exr_num_samples(0, w - 1, 2);
+        const int chh = exr_num_samples(0, h - 1, 2);
+        const float kr = 0.80f, kg = 0.50f, kb = 0.20f; /* fixed R:G:B ratio */
+        exr_channel chans[4];
+        void *planes[4];
+        float *yp, *ryp, *byp, *ap;
+        float *rgba = NULL;
+        exr_part part;
+        int x, y, ow = 0, oh = 0, ci, ok = 1;
+        exr_result rc;
+
+        yp = (float *)malloc((size_t)w * h * sizeof(float));
+        ryp = (float *)malloc((size_t)cw * chh * sizeof(float));
+        byp = (float *)malloc((size_t)cw * chh * sizeof(float));
+        ap = (float *)malloc((size_t)w * h * sizeof(float));
+        if (!yp || !ryp || !byp || !ap) {
+            CHECK(0, "YC test allocation");
+            free(yp); free(ryp); free(byp); free(ap);
+            return;
+        }
+
+        /* Y (full res) + A ramp. Intensity t in [0.25, 1.0]. */
+        for (y = 0; y < h; ++y)
+            for (x = 0; x < w; ++x) {
+                float t = 0.25f + 0.75f * ((float)(x + y) / (float)(w + h - 2));
+                float r = kr * t, g = kg * t, b = kb * t;
+                yp[y * w + x] = r * yw[0] + g * yw[1] + b * yw[2];
+                ap[y * w + x] = 0.5f;
+            }
+        /* RY/BY sampled at the even (stored) chroma sites: (cx*2, cy*2). */
+        for (y = 0; y < chh; ++y)
+            for (x = 0; x < cw; ++x) {
+                int px = x * 2, py = y * 2;
+                float t = 0.25f + 0.75f * ((float)(px + py) / (float)(w + h - 2));
+                float r = kr * t, b = kb * t;
+                float Y = (kr * yw[0] + kg * yw[1] + kb * yw[2]) * t;
+                ryp[y * cw + x] = (r - Y) / Y;
+                byp[y * cw + x] = (b - Y) / Y;
+            }
+
+        memset(chans, 0, sizeof(chans));
+        memcpy(chans[0].name, "Y", 2);
+        memcpy(chans[1].name, "RY", 3);
+        memcpy(chans[2].name, "BY", 3);
+        memcpy(chans[3].name, "A", 2);
+        for (ci = 0; ci < 4; ++ci) chans[ci].pixel_type = EXR_PIXEL_FLOAT;
+        chans[0].x_sampling = chans[0].y_sampling = 1;
+        chans[1].x_sampling = chans[1].y_sampling = 2;
+        chans[2].x_sampling = chans[2].y_sampling = 2;
+        chans[3].x_sampling = chans[3].y_sampling = 1;
+        planes[0] = yp; planes[1] = ryp; planes[2] = byp; planes[3] = ap;
+
+        memset(&part, 0, sizeof(part));
+        part.width = w;
+        part.height = h;
+        part.header.num_channels = 4;
+        part.header.channels = chans;
+        part.images = planes;
+
+        CHECK(exr_part_is_luminance_chroma(&part) == 1,
+              "Y/RY/BY part detected as luminance-chroma");
+
+        rc = exr_part_yc_to_rgba_float(NULL, &part, &rgba, &ow, &oh);
+        CHECK(EXR_OK(rc) && rgba && ow == w && oh == h,
+              "exr_part_yc_to_rgba_float succeeds");
+        if (EXR_OK(rc) && rgba) {
+            for (y = 0; y < h && ok; ++y)
+                for (x = 0; x < w; ++x) {
+                    float t =
+                        0.25f + 0.75f * ((float)(x + y) / (float)(w + h - 2));
+                    size_t p = ((size_t)y * w + x) * 4;
+                    if (fabsf(rgba[p + 0] - kr * t) > 1e-3f ||
+                        fabsf(rgba[p + 1] - kg * t) > 1e-3f ||
+                        fabsf(rgba[p + 2] - kb * t) > 1e-3f ||
+                        fabsf(rgba[p + 3] - 0.5f) > 1e-6f) {
+                        ok = 0;
+                        break;
+                    }
+                }
+            CHECK(ok, "constant-chroma gradient reconstructs to original RGBA");
+        }
+        free(rgba);
+        free(yp); free(ryp); free(byp); free(ap);
+    }
+
+    /* Detection negative: a plain RGB part is not luminance-chroma. */
+    {
+        exr_image img;
+        memset(&img, 0, sizeof(img));
+        if (EXR_OK(exr_load_from_file("test/unit/regression/2by2.exr", NULL,
+                                      &img))) {
+            CHECK(exr_part_is_luminance_chroma(&img.parts[0]) == 0,
+                  "plain RGBA part is not luminance-chroma");
+            exr_image_free(&img);
+        }
+    }
+
+    /* Opportunistic: a real luminance-chroma file must decode to actual color
+     * (some pixel with R != G != B), not grayscale. Skipped if absent. */
+    {
+        exr_image img;
+        memset(&img, 0, sizeof(img));
+        if (EXR_OK(exr_load_from_file(
+                "openexr-images/Chromaticities/CrissyField.exr", NULL, &img))) {
+            if (img.num_parts > 0 &&
+                exr_part_is_luminance_chroma(&img.parts[0])) {
+                float *rgba = NULL;
+                int ow = 0, oh = 0, colored = 0;
+                if (EXR_OK(exr_part_yc_to_rgba_float(NULL, &img.parts[0], &rgba,
+                                                     &ow, &oh)) &&
+                    rgba) {
+                    size_t i, n = (size_t)ow * (size_t)oh;
+                    for (i = 0; i < n; ++i) {
+                        float r = rgba[i * 4], g = rgba[i * 4 + 1],
+                              b = rgba[i * 4 + 2];
+                        if (fabsf(r - g) > 1e-3f || fabsf(g - b) > 1e-3f) {
+                            colored = 1;
+                            break;
+                        }
+                    }
+                    free(rgba);
+                }
+                CHECK(colored, "CrissyField.exr reconstructs to color");
+            }
+            exr_image_free(&img);
+        } else {
+            printf("  (skip: openexr-images/Chromaticities/CrissyField.exr "
+                   "not present)\n");
+        }
+    }
 }
 
 int main(void) {
@@ -3561,6 +4094,8 @@ int main(void) {
 
     printf("== util module ==\n");
     util_tests();
+
+    luminance_chroma_tests();
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

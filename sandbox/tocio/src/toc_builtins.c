@@ -263,6 +263,49 @@ static const toc_cspace *cspace_lookup(const char *name, size_t len) {
     return NULL;
 }
 
+/* von Kries chromatic adaptation ws(xy)->wd(xy) with cone-response matrix C. */
+static void vk_cat(const float C[9], float wsx, float wsy, float wdx, float wdy,
+                   float M[9]) {
+    float Cinv[9], Ws[3], Wd[3], cs[3], cd[3], D[9], t[9];
+    int i;
+    mat3_inv(C, Cinv);
+    xy_to_xyz(wsx, wsy, Ws);
+    xy_to_xyz(wdx, wdy, Wd);
+    mat3_vec(C, Ws, cs);
+    mat3_vec(C, Wd, cd);
+    for (i = 0; i < 9; ++i) D[i] = 0.0f;
+    D[0] = cd[0] / cs[0];
+    D[4] = cd[1] / cs[1];
+    D[8] = cd[2] / cs[2];
+    mat3_mul(D, C, t);
+    mat3_mul(Cinv, t, M); /* Cinv * D * C */
+}
+
+/* Camera-gamut RGB -> ACES AP0 matrix (row-major), adapting the camera white to
+ * AP0's D60 with CAT02 (cat02=1) or Bradford (cat02=0), matching OCIO's
+ * build_conversion_matrix(camera, AP0, ADAPTATION_*). */
+static int cam_to_ap0(const float cam[8], int cat02, float M[9]) {
+    static const float BRAD[9] = {0.8951f,  0.2664f,  -0.1614f,
+                                  -0.7502f, 1.7135f,  0.0367f,
+                                  0.0389f,  -0.0685f, 1.0296f};
+    static const float CAT02[9] = {0.7328f,  0.4296f, -0.1624f,
+                                   -0.7036f, 1.6975f, 0.0061f,
+                                   0.0030f,  0.0136f, 0.9834f};
+    toc_cspace c;
+    const toc_cspace *ap0 = cspace_lookup("Linear-AP0", 10);
+    float Mc[9], Map0[9], Mai[9], cat[9], a[9];
+    if (!ap0) return 0;
+    c.rx = cam[0]; c.ry = cam[1]; c.gx = cam[2]; c.gy = cam[3];
+    c.bx = cam[4]; c.by = cam[5]; c.wx = cam[6]; c.wy = cam[7];
+    c.is_xyz = 0;
+    if (!cspace_npm(&c, Mc) || !cspace_npm(ap0, Map0) || !mat3_inv(Map0, Mai))
+        return 0;
+    vk_cat(cat02 ? CAT02 : BRAD, c.wx, c.wy, ap0->wx, ap0->wy, cat);
+    mat3_mul(cat, Mc, a);  /* adapt camera XYZ to AP0 white */
+    mat3_mul(Mai, a, M);   /* XYZ(AP0 white) -> AP0 RGB */
+    return 1;
+}
+
 /* Try "<A>_to_<B>" as a linear color-space conversion; push a matrix op. Returns
  * 1 if handled (matrix pushed or OOM via *rc), 0 if the names are unknown. */
 static const char *find_to(const char *s) { /* locate "_to_" (no libc strstr) */
@@ -297,30 +340,42 @@ static int push_cspace_convert(toc_op_list *list, const char *style,
 }
 
 /* ---- display transfer functions (linear <-> display-encoded) ------------- */
-/* sRGB / Display-P3 piecewise curve as an ExponentWithLinear (the forward op is
- * the EOTF: encoded->linear; encode=1 emits the inverse, linear->encoded). */
-static toc_op *push_srgb_curve(toc_op_list *list, int encode) {
+/* OCIO MonCurve (GammaOpData MONCURVE) from (gamma, offset): forward op is the
+ * EOTF (encoded->linear); encode=1 emits the inverse (linear->encoded). Matches
+ * sRGB / Display-P3 display encodings (gamma 2.4, offset 0.055). */
+static toc_op *push_moncurve(toc_op_list *list, float gamma, float offset,
+                             int encode, int mirror) {
     toc_op *op = toc_op_list_push(list, TOC_OP_EXP_LINEAR);
+    double G = gamma < 1.000001f ? 1.000001 : (double)gamma;
+    double O = offset < 1e-6f ? 1e-6 : (double)offset;
+    double a = (G - 1.0) / O;
+    double b = O * G / ((G - 1.0) * (1.0 + O));
+    float scale = (float)(1.0 / (1.0 + O));
+    float off = (float)(O / (1.0 + O));
+    float brk = (float)(O / (G - 1.0));
+    float slope = (float)(a * toc_powf((float)b, (float)G));
     int i;
     if (!op) return NULL;
     for (i = 0; i < 4; ++i) {
-        op->u.exp_linear.scale[i] = 1.0f / 1.055f;
-        op->u.exp_linear.offset[i] = 0.055f / 1.055f;
-        op->u.exp_linear.gamma[i] = 2.4f;
-        op->u.exp_linear.breakpoint[i] = 0.04045f;
-        op->u.exp_linear.slope[i] = 1.0f / 12.92f;
+        op->u.exp_linear.scale[i] = scale;
+        op->u.exp_linear.offset[i] = off;
+        op->u.exp_linear.gamma[i] = (float)G;
+        op->u.exp_linear.breakpoint[i] = brk;
+        op->u.exp_linear.slope[i] = slope;
     }
     op->u.exp_linear.inverse = encode ? 1 : 0;
+    op->u.exp_linear.mirror = mirror;
     return op;
 }
 /* Pure-power EOTF (gamma): forward op = display->linear (pow(x,g)); encode emits
  * linear->display (pow(x,1/g)). Alpha unchanged. */
-static toc_op *push_gamma(toc_op_list *list, float g, int encode) {
+static toc_op *push_gamma(toc_op_list *list, float g, int encode, int mirror) {
     toc_op *op = toc_op_list_push(list, TOC_OP_EXPONENT);
     int i;
     float e = encode ? 1.0f / g : g;
     if (!op) return NULL;
     for (i = 0; i < 4; ++i) op->u.exponent.e[i] = (i < 3) ? e : 1.0f;
+    op->u.exponent.mirror = mirror;
     return op;
 }
 static toc_op *push_ff_style(toc_op_list *list, int style) {
@@ -331,26 +386,419 @@ static toc_op *push_ff_style(toc_op_list *list, int style) {
     return op;
 }
 
-/* Try a composed "CIE-XYZ-D65_to_<display>" output transform: a primaries matrix
- * followed by the display's transfer-function encode. Returns 1 if handled. */
+/* True if `s` ends with `suf`. */
+static int ends_with(const char *s, const char *suf) {
+    size_t ls = strlen(s), lf = strlen(suf);
+    return ls >= lf && memcmp(s + ls - lf, suf, lf) == 0;
+}
+
+static toc_op *push_scale3(toc_op_list *list, float s); /* defined below */
+
+/* Try a composed display output transform. Accepts the OCIO v2 builtin names
+ * ("DISPLAY - CIE-XYZ-D65_to_<display>[ - MIRROR NEGS]") and the bare
+ * "CIE-XYZ-D65_to_<display>" form: a primaries matrix then the display transfer
+ * function encode (MonCurve / pure gamma / PQ / HLG). Returns 1 if handled.
+ * kind: 0=MonCurve(g,off), 1=pure gamma(g), 2=PQ, 3=HLG. */
 static int push_display_xform(toc_op_list *list, const char *style,
                               toc_result *rc) {
-    struct { const char *name, *prim; int kind; float g; } d[] = {
-        {"CIE-XYZ-D65_to_sRGB",             "Linear-sRGB",       0, 0.0f},
-        {"CIE-XYZ-D65_to_Display-P3",       "Linear-Display-P3", 0, 0.0f},
-        {"CIE-XYZ-D65_to_DCI-P3",           "Linear-DCI-P3",     1, 2.6f},
-        {"CIE-XYZ-D65_to_Rec.1886-Rec.709", "Linear-Rec709",     1, 2.4f},
-        {"CIE-XYZ-D65_to_Rec.2100-PQ",      "Linear-Rec2020",    2, 0.0f},
-        {"CIE-XYZ-D65_to_Rec.2100-HLG",     "Linear-Rec2020",    3, 0.0f},
+    /* amir=1: OCIO encodes this display with MONCURVE_MIRROR even without the
+     * "- MIRROR NEGS" suffix (Display-P3). kind 4 = scale(48/52.37)+gamma 2.6 over
+     * XYZ (DCDM); kind 5 = PQ over XYZ (ST2084-DCDM); both keep XYZ (identity). */
+    static const struct {
+        const char *name, *prim; int kind; float g, off; int amir;
+    } d[] = {
+        {"CIE-XYZ-D65_to_sRGB",              "Linear-sRGB",       0, 2.4f, 0.055f, 0},
+        {"CIE-XYZ-D65_to_DisplayP3",         "Linear-Display-P3", 0, 2.4f, 0.055f, 1},
+        {"CIE-XYZ-D65_to_Display-P3",        "Linear-Display-P3", 0, 2.4f, 0.055f, 1},
+        {"CIE-XYZ-D65_to_DisplayP3-HDR",     "Linear-Display-P3", 0, 2.4f, 0.055f, 1},
+        {"CIE-XYZ-D65_to_G2.2-REC.709",      "Linear-Rec709",     1, 2.2f, 0.0f, 0},
+        {"CIE-XYZ-D65_to_G2.6-P3-D65",       "Linear-P3-D65",     1, 2.6f, 0.0f, 0},
+        {"CIE-XYZ-D65_to_DCI-P3",            "Linear-DCI-P3",     1, 2.6f, 0.0f, 0},
+        {"CIE-XYZ-D65_to_REC.1886-REC.709",  "Linear-Rec709",     1, 2.4f, 0.0f, 0},
+        {"CIE-XYZ-D65_to_Rec.1886-Rec.709",  "Linear-Rec709",     1, 2.4f, 0.0f, 0},
+        {"CIE-XYZ-D65_to_REC.1886-REC.2020", "Linear-Rec2020",    1, 2.4f, 0.0f, 0},
+        {"CIE-XYZ-D65_to_REC.2100-PQ",       "Linear-Rec2020",    2, 0.0f, 0.0f, 0},
+        {"CIE-XYZ-D65_to_Rec.2100-PQ",       "Linear-Rec2020",    2, 0.0f, 0.0f, 0},
+        {"CIE-XYZ-D65_to_ST2084-P3-D65",     "Linear-P3-D65",     2, 0.0f, 0.0f, 0},
+        {"CIE-XYZ-D65_to_Rec.2100-HLG",      "Linear-Rec2020",    3, 0.0f, 0.0f, 0},
+        {"CIE-XYZ-D65_to_DCDM-D65",          "CIE-XYZ-D65",       4, 2.6f, 0.0f, 0},
+        {"CIE-XYZ-D65_to_ST2084-DCDM-D65",   "CIE-XYZ-D65",       5, 0.0f, 0.0f, 0},
+    };
+    char buf[128];
+    const char *inner = style;
+    size_t i, n;
+    int mir = 0; /* "- MIRROR NEGS": odd-extend the encode for negatives */
+    /* strip optional "DISPLAY - " prefix and " - MIRROR NEGS" suffix */
+    if (strlen(style) >= 10 && memcmp(style, "DISPLAY - ", 10) == 0)
+        inner = style + 10;
+    n = strlen(inner);
+    if (n < sizeof(buf)) {
+        memcpy(buf, inner, n + 1);
+        if (ends_with(buf, " - MIRROR NEGS")) { buf[n - 14] = '\0'; mir = 1; }
+        inner = buf;
+    }
+    for (i = 0; i < sizeof(d) / sizeof(d[0]); ++i) {
+        int m;
+        if (strcmp(inner, d[i].name) != 0) continue;
+        m = mir || d[i].amir;
+        if (!push_cspace_named(list, "CIE-XYZ-D65", d[i].prim, rc)) return 1;
+        if (d[i].kind == 0 && !push_moncurve(list, d[i].g, d[i].off, 1, m))
+            *rc = TOC_ERROR_OUT_OF_MEMORY;
+        else if (d[i].kind == 1 && !push_gamma(list, d[i].g, 1, m))
+            *rc = TOC_ERROR_OUT_OF_MEMORY;
+        else if (d[i].kind == 2 && !push_ff_style(list, TOC_FF_LIN_TO_PQ))
+            *rc = TOC_ERROR_OUT_OF_MEMORY;
+        else if (d[i].kind == 3 && !push_ff_style(list, TOC_FF_LIN_TO_HLG))
+            *rc = TOC_ERROR_OUT_OF_MEMORY;
+        else if (d[i].kind == 4) { /* DCDM: scale(48/52.37) + gamma 2.6 over XYZ */
+            if (!push_scale3(list, 48.0f / 52.37f) ||
+                !push_gamma(list, d[i].g, 1, 0))
+                *rc = TOC_ERROR_OUT_OF_MEMORY;
+        } else if (d[i].kind == 5 && !push_ff_style(list, TOC_FF_LIN_TO_PQ)) {
+            *rc = TOC_ERROR_OUT_OF_MEMORY; /* ST2084-DCDM: PQ over XYZ */
+        }
+        return 1;
+    }
+    return 0;
+}
+
+/* ---- ACES 2.0 output transform expansion -------------------------------- */
+/* {rx,ry, gx,gy, bx,by, wx,wy}. The D60 variants share the D65 versions'
+ * primaries but adopt the ACES D60 white (0.32168, 0.33767) for "simulating D60
+ * white" output transforms. CIE-XYZ illuminant E (identity primaries, white E)
+ * is an encoding target for the DCDM/XYZ-E outputs. */
+static const float ACES2_REC709[8]      = {0.640f, 0.330f, 0.300f, 0.600f,
+                                           0.150f, 0.060f, 0.3127f, 0.3290f};
+static const float ACES2_P3D65[8]       = {0.680f, 0.320f, 0.265f, 0.690f,
+                                           0.150f, 0.060f, 0.3127f, 0.3290f};
+static const float ACES2_REC2020[8]     = {0.708f, 0.292f, 0.170f, 0.797f,
+                                           0.131f, 0.046f, 0.3127f, 0.3290f};
+static const float ACES2_REC709_D60[8]  = {0.640f, 0.330f, 0.300f, 0.600f,
+                                           0.150f, 0.060f, 0.32168f, 0.33767f};
+static const float ACES2_P3_D60[8]      = {0.680f, 0.320f, 0.265f, 0.690f,
+                                           0.150f, 0.060f, 0.32168f, 0.33767f};
+static const float ACES2_REC2020_D60[8] = {0.708f, 0.292f, 0.170f, 0.797f,
+                                           0.131f, 0.046f, 0.32168f, 0.33767f};
+static const float ACES2_XYZ_E[8]       = {1.0f, 0.0f, 0.0f, 1.0f,
+                                           0.0f, 0.0f, 1.0f/3.0f, 1.0f/3.0f};
+
+/* RGB->XYZ matrix (row-major) for primaries `p`, white = the space's own (no
+ * chromatic adaptation) -- i.e. OCIO build_conversion_matrix_to_XYZ_D65 with
+ * ADAPTATION_NONE. Mirrors OCIO's rgb2xyz_from_xy: each column carries the
+ * primary chromaticity (x, y, z=1-x-y) and per-primary gains are solved from
+ * the white point, so it stays well-conditioned even when a primary has y==0
+ * (CIE-XYZ illuminant-E's blue). */
+static int aces2_rgb2xyz(const float p[8], float M[9]) {
+    float C[9], Cinv[9], W[3], g[3];
+    int i, j;
+    for (i = 0; i < 3; ++i) {
+        C[0 + i] = p[i * 2];                          /* x  (column = primary) */
+        C[3 + i] = p[i * 2 + 1];                      /* y */
+        C[6 + i] = 1.0f - p[i * 2] - p[i * 2 + 1];    /* z = 1 - x - y */
+    }
+    if (!mat3_inv(C, Cinv)) return 0;
+    W[0] = p[6] / p[7];
+    W[1] = 1.0f;
+    W[2] = (1.0f - p[6] - p[7]) / p[7];
+    for (i = 0; i < 3; ++i)
+        g[i] = Cinv[i * 3 + 0] * W[0] + Cinv[i * 3 + 1] * W[1] +
+               Cinv[i * 3 + 2] * W[2];
+    for (j = 0; j < 3; ++j)
+        for (i = 0; i < 3; ++i) M[j * 3 + i] = g[i] * C[j * 3 + i];
+    return 1;
+}
+
+static toc_op *push_range_clamp(toc_op_list *list, float lo, float hi) {
+    toc_op *op = toc_op_list_push(list, TOC_OP_RANGE);
+    int c;
+    if (!op) return NULL;
+    for (c = 0; c < 4; ++c) {
+        op->u.range.scale[c] = 1.0f;
+        op->u.range.offset[c] = 0.0f;
+        op->u.range.min[c] = lo;
+        op->u.range.max[c] = hi;
+    }
+    op->u.range.clamp_lo = op->u.range.clamp_hi = 1;
+    return op;
+}
+static toc_op *push_scale3(toc_op_list *list, float s) {
+    toc_op *op = toc_op_list_push(list, TOC_OP_RANGE);
+    int c;
+    if (!op) return NULL;
+    for (c = 0; c < 4; ++c) {
+        op->u.range.scale[c] = (c < 3) ? s : 1.0f;
+        op->u.range.offset[c] = 0.0f;
+        op->u.range.min[c] = 0.0f;
+        op->u.range.max[c] = 1.0f;
+    }
+    op->u.range.clamp_lo = op->u.range.clamp_hi = 0; /* no clamp */
+    return op;
+}
+
+/* "White point simulation" scale for the D60-sim outputs: OCIO scales RGB by
+ * 1/max(channel) of the limiting white (1,1,1) carried through the limiting->
+ * encoding primaries matrix (no adaptation), so the simulated white lands at or
+ * below the encoding peak. Returns 1 on success (or *rc set on OOM). */
+static int push_scale_white(toc_op_list *list, const float lim[8],
+                            const float enc[8], toc_result *rc) {
+    float Mlim[9], Menc[9], Mencinv[9], wxyz[3], wrgb[3];
+    static const float ones[3] = {1.0f, 1.0f, 1.0f};
+    float mx;
+    if (!aces2_rgb2xyz(lim, Mlim) || !aces2_rgb2xyz(enc, Menc) ||
+        !mat3_inv(Menc, Mencinv)) {
+        *rc = TOC_ERROR_UNSUPPORTED;
+        return 0;
+    }
+    mat3_vec(Mlim, ones, wxyz);   /* limiting white in XYZ */
+    mat3_vec(Mencinv, wxyz, wrgb); /* ... expressed in encoding RGB */
+    mx = wrgb[0] > wrgb[1] ? wrgb[0] : wrgb[1];
+    if (wrgb[2] > mx) mx = wrgb[2];
+    if (!push_scale3(list, 1.0f / mx)) { *rc = TOC_ERROR_OUT_OF_MEMORY; return 0; }
+    return 1;
+}
+
+/* Build the OCIO ACES 2.0 output-transform op chain (ACES2065-1 -> CIE-XYZ-D65)
+ * for a known builtin variant. Returns 1 if `style` named a supported variant
+ * (op chain built, or *rc set on inverse/OOM), 0 if not an ACES-OUTPUT style. */
+static int push_aces_output(toc_op_list *list, const char *style, int invert,
+                            toc_result *rc) {
+    /* lim: limiting primaries (drive both the tonescale/gamut fixed function and
+     * the final RGB->XYZ matrix). enc: encoding primaries used by the D60 white-
+     * point simulation scale, or NULL when there is no white-point scale. */
+    static const struct {
+        const char *name;
+        float peak;
+        const float *lim;
+        const float *enc;
+        float lscale;
+    } V[] = {
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - SDR-100nit-REC709_2.0",
+         100.0f, ACES2_REC709, NULL, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - SDR-100nit-P3-D65_2.0",
+         100.0f, ACES2_P3D65, NULL, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-500nit-P3-D65_2.0",
+         500.0f, ACES2_P3D65, NULL, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-1000nit-P3-D65_2.0",
+         1000.0f, ACES2_P3D65, NULL, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-1000nit-REC2020_2.0",
+         1000.0f, ACES2_REC2020, NULL, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-108nit-P3-D65_2.0",
+         225.0f, ACES2_P3D65, NULL, 0.48f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-300nit-P3-D65_2.0",
+         625.0f, ACES2_P3D65, NULL, 0.48f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-2000nit-P3-D65_2.0",
+         2000.0f, ACES2_P3D65, NULL, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-4000nit-P3-D65_2.0",
+         4000.0f, ACES2_P3D65, NULL, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-500nit-REC2020_2.0",
+         500.0f, ACES2_REC2020, NULL, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-2000nit-REC2020_2.0",
+         2000.0f, ACES2_REC2020, NULL, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-4000nit-REC2020_2.0",
+         4000.0f, ACES2_REC2020, NULL, 1.0f},
+        /* D60 white-point simulation: limiting primaries adopt the D60 white and
+         * the simulated white is scaled into the encoding gamut (scale_white). */
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - SDR-100nit-REC709-D60-in-REC709-D65_2.0",
+         100.0f, ACES2_REC709_D60, ACES2_REC709, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - SDR-100nit-REC709-D60-in-P3-D65_2.0",
+         100.0f, ACES2_REC709_D60, ACES2_P3D65, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - SDR-100nit-REC709-D60-in-REC2020-D65_2.0",
+         100.0f, ACES2_REC709_D60, ACES2_REC2020, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - SDR-100nit-P3-D60-in-P3-D65_2.0",
+         100.0f, ACES2_P3_D60, ACES2_P3D65, 1.0f},
+        /* XYZ-E encoding: no white-point scale for the 100 nit SDR variant. */
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - SDR-100nit-P3-D60-in-XYZ-E_2.0",
+         100.0f, ACES2_P3_D60, NULL, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-108nit-P3-D60-in-P3-D65_2.0",
+         225.0f, ACES2_P3_D60, ACES2_P3D65, 0.48f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-300nit-P3-D60-in-XYZ-E_2.0",
+         625.0f, ACES2_P3_D60, ACES2_XYZ_E, 0.48f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-500nit-P3-D60-in-P3-D65_2.0",
+         500.0f, ACES2_P3_D60, ACES2_P3D65, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-1000nit-P3-D60-in-P3-D65_2.0",
+         1000.0f, ACES2_P3_D60, ACES2_P3D65, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-2000nit-P3-D60-in-P3-D65_2.0",
+         2000.0f, ACES2_P3_D60, ACES2_P3D65, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-4000nit-P3-D60-in-P3-D65_2.0",
+         4000.0f, ACES2_P3_D60, ACES2_P3D65, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-500nit-P3-D60-in-REC2020-D65_2.0",
+         500.0f, ACES2_P3_D60, ACES2_REC2020, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-1000nit-P3-D60-in-REC2020-D65_2.0",
+         1000.0f, ACES2_P3_D60, ACES2_REC2020, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-2000nit-P3-D60-in-REC2020-D65_2.0",
+         2000.0f, ACES2_P3_D60, ACES2_REC2020, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-4000nit-P3-D60-in-REC2020-D65_2.0",
+         4000.0f, ACES2_P3_D60, ACES2_REC2020, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-500nit-REC2020-D60-in-REC2020-D65_2.0",
+         500.0f, ACES2_REC2020_D60, ACES2_REC2020, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-1000nit-REC2020-D60-in-REC2020-D65_2.0",
+         1000.0f, ACES2_REC2020_D60, ACES2_REC2020, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-2000nit-REC2020-D60-in-REC2020-D65_2.0",
+         2000.0f, ACES2_REC2020_D60, ACES2_REC2020, 1.0f},
+        {"ACES-OUTPUT - ACES2065-1_to_CIE-XYZ-D65 - HDR-4000nit-REC2020-D60-in-REC2020-D65_2.0",
+         4000.0f, ACES2_REC2020_D60, ACES2_REC2020, 1.0f},
     };
     size_t i;
-    for (i = 0; i < sizeof(d) / sizeof(d[0]); ++i) {
-        if (strcmp(style, d[i].name) != 0) continue;
-        if (!push_cspace_named(list, "CIE-XYZ-D65", d[i].prim, rc)) return 1;
-        if (d[i].kind == 0 && !push_srgb_curve(list, 1)) *rc = TOC_ERROR_OUT_OF_MEMORY;
-        else if (d[i].kind == 1 && !push_gamma(list, d[i].g, 1)) *rc = TOC_ERROR_OUT_OF_MEMORY;
-        else if (d[i].kind == 2 && !push_ff_style(list, TOC_FF_LIN_TO_PQ)) *rc = TOC_ERROR_OUT_OF_MEMORY;
-        else if (d[i].kind == 3 && !push_ff_style(list, TOC_FF_LIN_TO_HLG)) *rc = TOC_ERROR_OUT_OF_MEMORY;
+    for (i = 0; i < sizeof(V) / sizeof(V[0]); ++i) {
+        float U;
+        toc_aces2 *blob;
+        toc_op *op;
+        if (strcmp(style, V[i].name) != 0) continue;
+        if (invert) { *rc = TOC_ERROR_UNSUPPORTED; return 1; }
+        /* upperBound = 8*(128 + 768*log(peak/100)/log(100)) */
+        U = 8.0f * (128.0f + 768.0f *
+                    (toc_log2f(V[i].peak / 100.0f) / toc_log2f(100.0f)));
+        if (!push_mat3(list, AP0_TO_AP1) || !push_range_clamp(list, 0.0f, U) ||
+            !push_mat3(list, AP1_TO_AP0)) {
+            *rc = TOC_ERROR_OUT_OF_MEMORY;
+            return 1;
+        }
+        blob = toc_aces2_init(&list->alloc, V[i].peak, V[i].lim);
+        if (!blob || !toc_op_list_own(list, (float *)blob)) {
+            if (blob) toc_free(&list->alloc, blob);
+            *rc = TOC_ERROR_OUT_OF_MEMORY;
+            return 1;
+        }
+        op = toc_op_list_push(list, TOC_OP_ACES_OUTPUT);
+        if (!op) { *rc = TOC_ERROR_OUT_OF_MEMORY; return 1; }
+        op->u.aces.t = blob;
+        op->u.aces.inverse = 0;
+        if (!push_range_clamp(list, 0.0f, V[i].peak / 100.0f)) {
+            *rc = TOC_ERROR_OUT_OF_MEMORY;
+            return 1;
+        }
+        if (V[i].enc && !push_scale_white(list, V[i].lim, V[i].enc, rc))
+            return 1;
+        if (V[i].lscale != 1.0f && !push_scale3(list, V[i].lscale)) {
+            *rc = TOC_ERROR_OUT_OF_MEMORY;
+            return 1;
+        }
+        /* matrixToXYZ = limiting primaries -> CIE-XYZ-D65 with no adaptation
+         * (so a D60-sim's limiting white stays unadapted -- the simulation). */
+        {
+            float M[9];
+            if (!aces2_rgb2xyz(V[i].lim, M) || !push_mat3(list, M))
+                *rc = TOC_ERROR_OUT_OF_MEMORY;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+/* ACEScc is a pure affine log2 (no linear toe; the 2^-16 toe only affects
+ * lin < 2^-15, treated as extended-domain). Same slope/offset as ACEScct but
+ * with no linear-segment break, so a plain LOG op suffices and inverts by flag.
+ * log_to_lin=1: ACEScc->linear (decode); 0: linear->ACEScc (encode). */
+static toc_op *push_acescc_log(toc_op_list *list, int log_to_lin) {
+    toc_op *op = toc_op_list_push(list, TOC_OP_LOG);
+    int i;
+    if (!op) return NULL;
+    op->u.log.base = 2.0f;
+    for (i = 0; i < 3; ++i) {
+        op->u.log.log_slope[i] = 1.0f / 17.52f;
+        op->u.log.log_offset[i] = 9.72f / 17.52f;
+        op->u.log.lin_slope[i] = 1.0f;
+        op->u.log.lin_offset[i] = 0.0f;
+    }
+    op->u.log.inverse = log_to_lin ? 1 : 0;
+    return op;
+}
+
+/* Push a camera LogCamera curve as log->lin (decode), computing the linear
+ * segment for C0 continuity exactly like toc_lower_transform's LogCamera path. */
+static toc_op *push_camera_logcam(toc_op_list *list, float base, float ls,
+                                  float lo, float ns, float no, float brk,
+                                  int has_lslope, float lslope) {
+    toc_op *op = toc_op_list_push(list, TOC_OP_LOG_CAMERA);
+    float lnb = toc_log2f(base) * 0.6931471805599453f; /* ln(base) */
+    float xb = ns * brk + no;
+    float yb = ls * (toc_log2f(xb > 0.0f ? xb : 1e-30f) / toc_log2f(base)) + lo;
+    float lsl = has_lslope ? lslope
+                           : (ls * ns / ((xb != 0.0f ? xb : 1e-30f) * lnb));
+    int i;
+    if (!op) return NULL;
+    op->u.logcam.base = base;
+    for (i = 0; i < 3; ++i) {
+        op->u.logcam.log_slope[i] = ls;
+        op->u.logcam.log_offset[i] = lo;
+        op->u.logcam.lin_slope[i] = ns;
+        op->u.logcam.lin_offset[i] = no;
+        op->u.logcam.lin_break[i] = brk;
+        op->u.logcam.linear_slope[i] = lsl;
+        op->u.logcam.linear_offset[i] = yb - lsl * brk;
+    }
+    op->u.logcam.inverse = 1; /* log -> lin */
+    return op;
+}
+
+/* Camera "<X>_to_ACES2065-1" builtins: LogCamera decode + gamut->AP0 matrix.
+ * (Canon/Apple use baked LUTs upstream and are not covered here.) Returns 1 if
+ * `style` named a supported camera builtin, 0 otherwise. */
+static int push_camera(toc_op_list *list, const char *style, toc_result *rc) {
+    /* Sony Venice gamuts use OCIO's explicit camera->AP0 matrices (row-major). */
+    static const float SVEN[9] = {
+        0.7933297411f, 0.0890786256f, 0.1175916333f,
+        0.0155810585f, 1.0327123069f, -0.0482933654f,
+        -0.0188647478f, 0.0127694121f, 1.0060953358f};
+    static const float SVENC[9] = {
+        0.6742570921f, 0.2205717359f, 0.1051711720f,
+        -0.0093136061f, 1.1059588614f, -0.0966452553f,
+        -0.0382090673f, -0.0179383766f, 1.0561474439f};
+    static const struct {
+        const char *name;
+        float prim[8];
+        const float *mat; /* explicit matrix, or NULL to derive from prim */
+        int cat02;        /* when deriving: 1 = CAT02, 0 = Bradford */
+        float base, ls, lo, ns, no, brk;
+        int has_lslope;
+        float lslope;
+    } C[] = {
+        {"ARRI_ALEXA-LOGC-EI800-AWG_to_ACES2065-1",
+         {0.684f, 0.313f, 0.221f, 0.848f, 0.0861f, -0.102f, 0.3127f, 0.329f},
+         NULL, 1, 10.0f, 0.2471896383f, 0.3855369987f, 1.0f / 0.18f,
+         0.0522722750f, 0.0105909905f, 0, 0.0f},
+        {"ARRI_LOGC4_to_ACES2065-1",
+         {0.7347f, 0.2653f, 0.1424f, 0.8576f, 0.0991f, -0.0308f, 0.3127f, 0.329f},
+         NULL, 1, 2.0f, 0.0647954196341293f, -0.295908392682586f,
+         2231.82630906769f, 64.0f, -0.0180569961199113f, 0, 0.0f},
+        {"SONY_SLOG3-SGAMUT3_to_ACES2065-1",
+         {0.730f, 0.280f, 0.140f, 0.855f, 0.100f, -0.050f, 0.3127f, 0.329f},
+         NULL, 1, 10.0f, 261.5f / 1023.0f, 420.0f / 1023.0f, 1.0f / 0.19f,
+         0.01f / 0.19f, 0.01125f, 1, 6.62292117f},
+        {"SONY_SLOG3-SGAMUT3.CINE_to_ACES2065-1",
+         {0.766f, 0.275f, 0.225f, 0.800f, 0.089f, -0.087f, 0.3127f, 0.329f},
+         NULL, 1, 10.0f, 261.5f / 1023.0f, 420.0f / 1023.0f, 1.0f / 0.19f,
+         0.01f / 0.19f, 0.01125f, 1, 6.62292117f},
+        {"SONY_SLOG3-SGAMUT3-VENICE_to_ACES2065-1",
+         {0}, SVEN, 0, 10.0f, 261.5f / 1023.0f, 420.0f / 1023.0f, 1.0f / 0.19f,
+         0.01f / 0.19f, 0.01125f, 1, 6.62292117f},
+        {"SONY_SLOG3-SGAMUT3.CINE-VENICE_to_ACES2065-1",
+         {0}, SVENC, 0, 10.0f, 261.5f / 1023.0f, 420.0f / 1023.0f, 1.0f / 0.19f,
+         0.01f / 0.19f, 0.01125f, 1, 6.62292117f},
+        {"RED_LOG3G10-RWG_to_ACES2065-1",
+         {0.780308f, 0.304253f, 0.121595f, 1.493994f, 0.095612f, -0.084589f,
+          0.3127f, 0.329f},
+         NULL, 0, 10.0f, 0.224282f, 0.0f, 155.975327f,
+         0.01f * 155.975327f + 1.0f, -0.01f, 0, 0.0f},
+        {"PANASONIC_VLOG-VGAMUT_to_ACES2065-1",
+         {0.730f, 0.280f, 0.165f, 0.840f, 0.100f, -0.030f, 0.3127f, 0.329f},
+         NULL, 0, 10.0f, 0.241514f, 0.598206f, 1.0f, 0.00873f, 0.01f, 0, 0.0f},
+    };
+    size_t i;
+    for (i = 0; i < sizeof(C) / sizeof(C[0]); ++i) {
+        if (strcmp(style, C[i].name) != 0) continue;
+        if (!push_camera_logcam(list, C[i].base, C[i].ls, C[i].lo, C[i].ns,
+                                C[i].no, C[i].brk, C[i].has_lslope, C[i].lslope)) {
+            *rc = TOC_ERROR_OUT_OF_MEMORY;
+            return 1;
+        }
+        if (C[i].mat) {
+            if (!push_mat3(list, C[i].mat)) *rc = TOC_ERROR_OUT_OF_MEMORY;
+        } else {
+            float M[9];
+            if (!cam_to_ap0(C[i].prim, C[i].cat02, M) || !push_mat3(list, M))
+                *rc = TOC_ERROR_OUT_OF_MEMORY;
+        }
         return 1;
     }
     return 0;
@@ -374,6 +822,9 @@ toc_result toc_builtin_expand(toc_op_list *list, const char *style, int invert) 
     size_t start = list->count;
     toc_result rc = TOC_SUCCESS;
     int matched = 1;
+    /* ACES 2.0 output transforms build their own (non-trivially-invertible)
+     * chain and must not flow through reverse_invert below. */
+    if (push_aces_output(list, style, invert, &rc)) return rc;
     if (strcmp(style, "ACEScg_to_ACES2065-1") == 0) {
         if (!push_mat3(list, AP1_TO_AP0)) rc = TOC_ERROR_OUT_OF_MEMORY;
     } else if (strcmp(style, "ACES2065-1_to_ACEScg") == 0) {
@@ -384,6 +835,39 @@ toc_result toc_builtin_expand(toc_op_list *list, const char *style, int invert) 
     } else if (strcmp(style, "ACES2065-1_to_ACEScct") == 0) {
         if (!push_mat3(list, AP0_TO_AP1) || !push_acescct_log(list, 0))
             rc = TOC_ERROR_OUT_OF_MEMORY;
+    } else if (strcmp(style, "ACEScc_to_ACES2065-1") == 0) {
+        /* Clamp the ACEScc input to its minimum ACEScc(0)=(log2(2^-16)+9.72)/
+         * 17.52. Forward this is a no-op for valid codes; when this builtin is
+         * inverted (lin->ACEScc, the config's ACEScg->ACEScc path) the clamp
+         * reverses to floor the encode output, matching OCIO for black/negatives.
+         * Exact for lin >= 2^-15; only the tiny toe (lin < 2^-15) differs. */
+        if (!push_range_clamp(list, (-16.0f + 9.72f) / 17.52f, 1e30f) ||
+            !push_acescc_log(list, 1) || !push_mat3(list, AP1_TO_AP0))
+            rc = TOC_ERROR_OUT_OF_MEMORY;
+    } else if (strcmp(style, "ACES2065-1_to_ACEScc") == 0) {
+        if (!push_mat3(list, AP0_TO_AP1) || !push_acescc_log(list, 0) ||
+            !push_range_clamp(list, (-16.0f + 9.72f) / 17.52f, 1e30f))
+            rc = TOC_ERROR_OUT_OF_MEMORY;
+    } else if (strcmp(style, "UTILITY - ACES-AP0_to_CIE-XYZ-D65_BFD") == 0) {
+        /* AP0 (D60) -> CIE-XYZ with Bradford adaptation to D65. */
+        push_cspace_named(list, "Linear-AP0", "CIE-XYZ-D65", &rc);
+    } else if (strcmp(style, "ACES-LMT - ACES 1.3 Reference Gamut Compression") == 0) {
+        /* AP0->AP1, ACES 1.3 gamut compress, AP1->AP0. */
+        toc_op *ff;
+        if (!push_mat3(list, AP0_TO_AP1)) { rc = TOC_ERROR_OUT_OF_MEMORY; }
+        else if (!(ff = toc_op_list_push(list, TOC_OP_FIXEDFUNC))) {
+            rc = TOC_ERROR_OUT_OF_MEMORY;
+        } else {
+            static const float p[7] = {1.147f, 1.264f, 1.312f,
+                                       0.815f, 0.803f, 0.880f, 1.2f};
+            int k;
+            ff->u.fixedfunc.style = TOC_FF_ACES_GAMUTCOMP13;
+            for (k = 0; k < 7; ++k) ff->u.fixedfunc.params[k] = p[k];
+            ff->u.fixedfunc.nparams = 7;
+            if (!push_mat3(list, AP1_TO_AP0)) rc = TOC_ERROR_OUT_OF_MEMORY;
+        }
+    } else if (push_camera(list, style, &rc)) {
+        /* handled: a camera-log "<X>_to_ACES2065-1" builtin */
     } else if (push_display_xform(list, style, &rc)) {
         /* handled: a composed CIE-XYZ-D65 -> display output transform */
     } else if (push_cspace_convert(list, style, &rc)) {
@@ -859,13 +1343,14 @@ static void apply_luv_to_xyz(float *px) {
 #define TOC_LN2 0.6931471805599453f
 #define TOC_LOG2E 1.4426950408889634f
 
-/* SMPTE ST 2084 (PQ). L normalized so 1.0 == 10000 cd/m^2. */
+/* SMPTE ST 2084 (PQ). Input is in nits/100 (1.0 == 100 cd/m^2, the OCIO/ACES
+ * convention); internally scaled by 0.01 so 1.0 PQ == 10000 cd/m^2. */
 static float pq_encode(float L) {
     float m1 = 0.1593017578125f, m2 = 78.84375f;
     float c1 = 0.8359375f, c2 = 18.8515625f, c3 = 18.6875f;
     float Lm;
     if (L <= 0.0f) return 0.0f;
-    Lm = toc_powf(L, m1);
+    Lm = toc_powf(L * 0.01f, m1);
     return toc_powf((c1 + c2 * Lm) / (1.0f + c3 * Lm), m2);
 }
 static float pq_decode(float N) {
@@ -878,7 +1363,7 @@ static float pq_decode(float N) {
     if (num < 0.0f) num = 0.0f;
     den = c2 - c3 * Np;
     if (den <= 0.0f) return 0.0f;
-    return toc_powf(num / den, 1.0f / m1);
+    return toc_powf(num / den, 1.0f / m1) * 100.0f;
 }
 /* Rec.2100 HLG OETF (per-channel; the OOTF/system-gamma is not applied here). */
 static float hlg_encode(float E) {

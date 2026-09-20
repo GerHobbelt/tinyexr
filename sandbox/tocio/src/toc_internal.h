@@ -234,6 +234,9 @@ const char *toc_cfg_resolve_role(const toc_config *cfg, const char *name);
 /* Find a colorspace (or display_colorspace) node by name/alias. */
 const toc_node *toc_cfg_find_colorspace(const toc_config *cfg, const char *name);
 int toc_cfg_is_data(const toc_node *cs);
+/* 1 if `name` is defined in the `display_colorspaces` section (display-referred),
+ * 0 otherwise (scene-referred / not found). Role names are resolved. */
+int toc_cfg_cs_in_display_section(const toc_config *cfg, const char *name);
 /* Pick the transform for converting to/from the reference. `want_to_ref`
  * selects to_reference (1) vs from_reference (0). *out_invert is set when the
  * chosen node must be applied inverted (only the opposite direction existed).
@@ -242,6 +245,9 @@ const toc_node *toc_cfg_cs_transform(const toc_node *cs, int want_to_ref,
                                      int *out_invert);
 /* Find a ViewTransform node by name. */
 const toc_node *toc_cfg_find_view_transform(const toc_config *cfg, const char *name);
+/* The default view transform (config `default_view_transform`, else the first),
+ * used to bridge scene<->display references in colorspace conversions. */
+const toc_node *toc_cfg_default_view_transform(const toc_config *cfg);
 /* Find a Look node by name (from the `looks` top-level seq). */
 const toc_node *toc_cfg_find_look(const toc_config *cfg, const char *name);
 /* Parse a comma-separated `looks` list from a view node. Returns count written
@@ -276,5 +282,52 @@ toc_result toc_builtin_expand(toc_op_list *list, const char *style, int invert);
 /* Lower a FixedFunctionTransform node into a TOC_OP_FIXEDFUNC (toc_builtins.c). */
 toc_result toc_lower_fixedfunc(toc_op_list *list, const toc_node *node,
                                int invert);
+
+/* ============================================================================
+ * ACES 2.0 output transform (toc_aces2.c)
+ *
+ * Reimplements the OCIO ACES2 fixed function: RGB(AP0) -> CAM16 JMh -> tonescale
+ * on J -> chroma compression -> gamut compression (hue-indexed cusp/reach tables)
+ * -> JMh -> RGB(limiting primaries). Constants/math ported verbatim from
+ * OpenColorIO src/OpenColorIO/ops/fixedfunction/ACES2/{Common.h,Transform.cpp}.
+ * ========================================================================== */
+#define TOC_ACES2_NOMINAL 360
+#define TOC_ACES2_TSIZE (TOC_ACES2_NOMINAL + 3) /* +1 lower wrap, +2 upper wrap */
+
+/* JMh (CAM16) parameters for one RGB primaries set. Matrices are row-major 3x3
+ * applied as M*v (matches OCIO mult_f3_f33). */
+typedef struct toc_jmh {
+    float rgb_to_cam[9], cam_to_rgb[9];
+    float cone_to_aab[9], aab_to_cone[9];
+    float F_L_n, cz, inv_cz, A_w_J, inv_A_w_J;
+} toc_jmh;
+
+typedef struct toc_aces2 {
+    toc_jmh in;  /* AP0 (input) */
+    toc_jmh out; /* limiting primaries (output) */
+    /* tonescale */
+    float ts_n, ts_n_r, ts_g, ts_t_1, ts_c_t, ts_s_2, ts_u_2, ts_m_2;
+    float ts_fwd_limit, ts_inv_limit, ts_log_peak;
+    /* chroma compress */
+    float cc_sat, cc_sat_thr, cc_compr, cc_scale;
+    /* shared compression */
+    float limit_J_max, model_gamma_inv;
+    /* gamut compress scalars */
+    float mid_J, focus_dist, lower_hull_gamma_inv;
+    int hue_search_lo, hue_search_hi;
+    /* hue-indexed tables (total size includes wrap entries) */
+    float reach_m[TOC_ACES2_TSIZE];
+    float hue_table[TOC_ACES2_TSIZE];
+    float cusp_J[TOC_ACES2_TSIZE], cusp_M[TOC_ACES2_TSIZE], cusp_g[TOC_ACES2_TSIZE];
+    int inverse; /* 0 forward only (inverse deferred) */
+} toc_aces2;
+
+/* Build the parameter+table blob for `peak_luminance` (nits) and limiting
+ * primaries (8 chromaticities: rx,ry,gx,gy,bx,by,wx,wy). Allocated with `a`;
+ * register it in the op list's owned[] so it is freed with the list. */
+toc_aces2 *toc_aces2_init(const toc_allocator *a, float peak_luminance,
+                          const float lim_prims[8]);
+/* Apply the forward output transform to one pixel (RGB in px[0..2]). */
+void toc_aces2_apply_pixel(const toc_op *op, float *px, int ch);
 
 #endif /* TOCIO_INTERNAL_H_ */

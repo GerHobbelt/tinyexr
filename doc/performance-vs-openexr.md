@@ -18,13 +18,16 @@ multi-threaded.
 ## TL;DR
 
 - **Single-thread decode:** TinyEXR wins big on the cheap codecs — **3.4×** on
-  uncompressed and **2.5×** on RLE. On the DEFLATE family / PIZ / HTJ2K, OpenEXR
-  leads (≈1.2× ZIP, ≈1.8× PXR24, ≈2–2.7× ZIPS/PIZ/HTJ2K) because of its
-  **libdeflate** backend and tuned PIZ/JPH.
+  uncompressed and **2.5×** on RLE. On the DEFLATE family / PIZ, OpenEXR leads
+  (≈1.2× ZIP, ≈1.8× PXR24, ≈2–2.7× ZIPS/PIZ) because of its **libdeflate**
+  backend and tuned PIZ. HTJ2K is now closer: TinyEXR is ~77% of the latest
+  same-machine OpenJPH baseline (≈1.30× decode gap).
 - **Single-thread encode:** TinyEXR ties or wins on RLE/PIZ/B44; OpenEXR is
   ≈1.5× on ZIP/ZIPS, ≈1.8× on PXR24, and ≈3× on HTJ2K.
-- **libdeflate (opt-in):** with the same backend, TinyEXR **matches or beats**
-  OpenEXR on the deflate family — e.g. **ZIP decode 1.4×** single-thread.
+- **libdeflate (default on hosted, `DEFLATE=auto`):** with the same backend
+  TinyEXR **matches or beats** OpenEXR on the deflate family — e.g. **ZIP decode
+  1.4×** single-thread — and beats its own in-tree codec by **+55–73%** on
+  natural images. Runtime-switchable via `exr_zlib_set_backend()`.
 - **Multi-threaded:** TinyEXR's opt-in parallel path scales ~5–9× to 16 threads;
   at 16T it **out-decodes OpenEXR on RLE/ZIP/ZIPS/B44** (in-tree), and with
   libdeflate it leads the whole deflate family by a wide margin.
@@ -38,9 +41,9 @@ multi-threaded.
 `none` (uncompressed) is off the chart on purpose: **TinyEXR 2699 vs OpenEXR
 789 MP/s** (~3.4×) — no thread-pool or framebuffer-copy overhead. TinyEXR also
 leads **RLE** (230 vs 93, ~2.5×). On the compressed codecs OpenEXR is ahead —
-ZIP ~1.2×, PXR24 ~1.8×, ZIPS ~2.1×, PIZ ~2.7×, HTJ2K ~2–2.4× — dominated by its
-libdeflate inflate (and tuned PIZ/JPH). A TinyEXR ZIP-decode profile is ~95 %
-inflate; the predictor and de-interleave passes are already vectorized.
+ZIP ~1.2×, PXR24 ~1.8×, ZIPS ~2.1×, PIZ ~2.7×, and HTJ2K ~1.30× — dominated by
+its libdeflate inflate (and tuned PIZ/JPH). A TinyEXR ZIP-decode profile is
+~95 % inflate; the predictor and de-interleave passes are already vectorized.
 
 ### Encode
 
@@ -60,15 +63,14 @@ materially (~16% faster all-HALF decode on the dev box). The same
 column-parallel restructuring was then applied to the **forward** 5/3 (encode,
 byte-identical output, ~7% faster htj2k256 encode) and to the **int64** inverse
 5/3 used for float/32-bit channels (AVX2 1D + vertical, ~18% faster float
-decode). The cleanup-pass entropy decoder's MagSgn reconstruction was then
-restructured to a per-quad reader (`JphQuadMs`): one bit-window read per quad
-(lazy upper half) replacing four per-sample stream fetches, ~4% faster all-HALF
-decode. The remaining gap is OpenJPH's fully-SIMD entropy coder (cleanup VLC/MEL
-+ MagSgn + per-sample mag-bit encode), which dominates both profiles; SIMD-ing
-the decode MagSgn step beyond the scalar per-quad reader was tried (1- and
-2-quad AVX2 kernels) and did not pay off on this hardware — the per-quad scalar
-path already minimizes the bit-I/O the SIMD would amortize (see
-`doc/htj2k-entropy-simd-scope.md`).
+decode). The cleanup-pass entropy decoder was then moved to an OpenJPH-style
+rolling forward MagSgn reader, with AVX2 cleanup kernels for the common 16/32-bit
+HT block paths; decode workspace reuse removed repeated scratch allocation; and
+the all-HALF inverse 5/3 postprocess gained a bounded AVX2 vertical pass. On
+this Zen2 machine, current `make bench` reports HTJ2K256 decode at **45.2 MP/s**
+and HTJ2K32 decode at **43.1 MP/s**; the latest available same-machine OpenJPH
+baseline is **58.8 / 56.2 MP/s**, so TinyEXR is ~77% of OpenJPH throughput
+(~1.30× gap). The remaining gap is mostly entropy/block decode latency.
 
 ### Compression size
 
@@ -84,14 +86,17 @@ and HTJ2K differ, from encoder *tuning* (not format):
 | zip  | 1155 | 1070 | | htj2k32  | 1160 | 1042 |
 | piz  |  742 |  742 | | | | |
 
-### Optional: the libdeflate backend
+### The libdeflate backend (default on hosted)
 
 OpenEXR's deflate speed comes from libdeflate. TinyEXR vendors **libdeflate 1.25**
-(MIT) as an **optional, off-by-default** backend for ZIP/ZIPS/PXR24 (the in-tree
-codec stays the default and the only freestanding path):
+(MIT) for ZIP/ZIPS/PXR24 and, as of `DEFLATE=auto`, makes it the **default on
+hosted builds**. Both codecs are linked; pick at runtime with the public
+`exr_zlib_set_backend()`. The in-tree pure-C codec remains the default for
+`DEFLATE=intree` and the only path for freestanding/WASM.
 
 ```sh
-make bench-compare LIBDEFLATE=1     # -DEXR_USE_LIBDEFLATE, level 4 (= OpenEXR)
+make bench-compare                  # DEFLATE=auto (libdeflate, level 4 = OpenEXR)
+make bench-compare DEFLATE=intree   # in-tree pure-C codec
 ```
 
 ![Decode with libdeflate backend, single thread](perf-libdeflate-decode.svg)
@@ -102,10 +107,36 @@ parity. Encode reaches parity too (ZIP 15.3 vs 14.0, PXR24 16.4 vs 15.8). Both
 call libdeflate's inflate; TinyEXR's edge is its SSE2/AVX2 predictor and lower
 per-block overhead.
 
+**Why it's the default.** Over the in-tree codec the lift is large on natural
+photographic data: on the `openexr-images` corpus, decode rises **ZIP 226→391
+(+73%), ZIPS 171→278 (+63%), PXR24 309→479 (+55%) Mpix/s**. The gap is
+data-dependent — the in-tree inflate is *symbol-decode-bound* and trails
+libdeflate on high-entropy natural images, but on smooth, highly-compressible
+data (long LZ matches; e.g. the ALab 4K texture pack) it is *copy-bound* and
+actually edges libdeflate by ~8%. libdeflate is the safer default for the
+diverse real-world case; the in-tree codec stays best for tiny/freestanding
+builds.
+
+![Decode: in-tree vs libdeflate on the natural-image corpus](perf-libdeflate-corpus-decode.svg)
+
+*(`doc/gen_perf_charts.py` regenerates the data-bearing SVGs.)*
+
+**PIZ decode** got a separate ~**+14%** (≈80→92 Mpix/s on the corpus) from
+inlining the Huffman literal store and restricting the canonical-code-table
+scan to the live symbol range.
+
+![PIZ decode before/after the in-tree optimization](perf-piz-decode.svg)
+
+**ZSTD** decode (vendored upstream, already SIMD-dispatched) runs ~**410–420
+Mpix/s** here — faster than the libdeflate ZIP path on identical content; there
+is no second zstd backend to dispatch against.
+
+![ZSTD vs ZIP decode on identical images](perf-zstd-decode.svg)
+
 The two charts below put **libdeflate on/off vs OpenEXR** side by side across the
 deflate family **and HTJ2K** (which has no deflate path, so only the in-tree and
-OpenEXR bars apply). The in-tree TinyEXR bars are the freestanding default; the
-green bars are the same `-DEXR_USE_LIBDEFLATE` build:
+OpenEXR bars apply). The in-tree TinyEXR bars are the `DEFLATE=intree` /
+freestanding codec; the green bars are the `DEFLATE=auto` (libdeflate) default:
 
 ![Decode: tinyexr libdeflate on/off vs OpenEXR, incl. htj2k](perf-libdeflate-htj2k-decode.png)
 
@@ -129,8 +160,13 @@ In-tree default:
 | piz   | 23.6 | 25.4 | 24.6 | 67.5 |
 | pxr24 | 9.2  | 16.4 | 48.0 | 88.0 |
 | b44   | 31.7 | 34.8 | 145  | 178 |
-| htj2k256 | 11.0 | 33.2 | 24.0 | 59.6 |
-| htj2k32  | 11.6 | 31.6 | 27.1 | 55.0 |
+| htj2k256 | 13.9 | 33.2* | 45.2 | 58.8* |
+| htj2k32  | 16.6 | 31.6* | 43.1 | 56.2* |
+
+`*` HTJ2K OpenEXR/OpenJPH values are the latest available same-machine baseline;
+that OpenJPH build has the default x86 SIMD path enabled and selects its AVX2
+codeblock decoder on this CPU. The TinyEXR HTJ2K values above were re-measured
+on 2026-06-13 with `make bench`.
 
 `LIBDEFLATE=1` (deflate family): zip 15.3/14.0/80.8/58.8, zips 16.2/14.8/61.4/46.4,
 pxr24 16.4/15.8/83.6/83.8 (tx enc / exr enc / tx dec / exr dec).
@@ -190,6 +226,87 @@ EXR_THREADS=16 ./build/bench_compare                 # 16 threads, both libs
 make bench-compare THREADS=1 LIBDEFLATE=1            # + libdeflate backend
 ```
 
+## GPU offload (CUDA backend)
+
+> **Setup & method**
+> - **GPU:** NVIDIA GeForce RTX 5060 Ti; **CPU:** same Ryzen 9 3950X as above.
+> - **Path:** the optional CUDA backend (`make CUDA=1`, runtime-loaded via cuew +
+>   NVRTC). Whole-image `exr_gpu_load_from_memory` / `exr_gpu_save_to_memory` vs
+>   the CPU `exr_load_from_memory` / `exr_save_to_memory`, fully in memory.
+> - **What runs on GPU:** the *parallel* reconstruction passes — predictor +
+>   even/odd deinterleave (ZIP/ZIPS/RLE), channel split, half↔float — plus the
+>   HTJ2K **HT block coder** (one thread per 128×32 code-block, bit-exact). The
+>   **bit-serial entropy stages stay on the CPU by necessity**: DEFLATE inflate
+>   (ZIP/ZIPS/PXR24), zstd, RLE expand, PIZ Huffman+wavelet, and the HTJ2K
+>   transform/packet assembly. So every block pays a CPU↔GPU round-trip around an
+>   inherently serial core.
+> - Output is bit-identical / pixel-identical to the CPU path; the GPU path falls
+>   back to CPU for deep parts and unsupported cases.
+> - Throughput is **MP/s** (higher is better); one-time NVRTC compile and lazy
+>   device-buffer init are warmed up and excluded. `make bench-gpu-jph`.
+
+**Headline: the hybrid GPU path is correctness-complete but does *not* beat CPU.**
+Only `htj2k256` decode edges above parity, and only on large images. This is a
+real, measured property of the design, not a tuning gap — see the analysis below.
+
+Whole-image throughput, large image (synthetic 4096², 4× HALF, 16.78 MP — the
+best case for the GPU, where there are the most blocks to amortize the launch):
+
+| codec | dec CPU | dec GPU | dec ratio | enc CPU | enc GPU | enc ratio |
+|-------|--------:|--------:|:---------:|--------:|--------:|:---------:|
+| none     | 189.3 |  70.8 | 0.37× |  76.8 |  57.4 | 0.75× |
+| rle      | 137.0 |  15.8 | 0.12× |  93.9 |  63.5 | 0.68× |
+| zips     | 100.6 |  15.1 | 0.15× |  59.9 |  45.2 | 0.75× |
+| zip      | 139.4 |  93.2 | 0.67× |  60.1 |  52.1 | 0.87× |
+| piz      |  31.5 |  29.3 | 0.93× |  34.7 |  34.5 | 0.99× |
+| pxr24    | 131.7 | 102.3 | 0.78× |  66.1 |  58.6 | 0.89× |
+| b44      |  76.5 |  65.8 | 0.86× |  50.8 |  45.8 | 0.90× |
+| zstd     | 209.8 | 151.9 | 0.72× | 565.6 | 246.6 | 0.44× |
+| htj2k256 |  33.2 | **36.9** | **1.11×** |  30.8 |  19.4 | 0.63× |
+| htj2k32  |  39.0 |  35.5 | 0.91× |  31.1 |  30.2 | 0.97× |
+
+(MP/s. On the small `asakusa` (0.29 MP) every ratio is *worse* — e.g. `none`
+decode 2437 → 19 MP/s (0.01×), `rle` decode 0.01×, `htj2k256` decode 0.80× — the
+launch + H2D/D2H overhead dwarfs the per-block work when there are few blocks.)
+
+Why the GPU loses despite a 200+ GB/s card, codec by codec:
+
+- **`none` / `rle` decode collapse (0.01–0.37×).** The CPU path here is essentially
+  a `memcpy` + deinterleave at 130–2400 MP/s; there is no compute to offload, so a
+  device round-trip is pure loss. These codecs should always stay on CPU.
+- **DEFLATE family (zip/zips/pxr24) and zstd reach 0.4–0.9×.** The entropy decode
+  (inflate / zstd) is bit-serial and *cannot* move to the GPU; the GPU only takes
+  the predictor + deinterleave + channel-split passes — which are already SSE2/AVX2
+  vectorized and memory-bandwidth-bound on the CPU. The H2D/D2H copy costs more
+  than those cheap passes save, so it nets out below 1.0×.
+- **PIZ ≈ parity (0.93–0.99×).** PIZ reconstruction is entirely CPU (the GPU does
+  only channel split + widen), so the GPU path is "CPU work + a near-free
+  round-trip" ⇒ parity, never a win.
+- **HTJ2K is the only genuinely GPU-amenable codec** — its HT block coder is heavy
+  *and* embarrassingly parallel across code-blocks. `htj2k256` decode crosses to
+  **1.11×** at 16.8 MP. Encode stays behind (0.63×): the block coder is only ~37 %
+  of encode time ([the serial MagSgn floor](htj2k-encode-bottleneck.md)), and the
+  GPU gain on that slice doesn't pay for the round-trip plus the still-CPU
+  transform + bitstream assembly.
+
+**Takeaway.** With the entropy stage pinned to the CPU and the reconstruction
+passes already cheap there, single-image hybrid offload is round-trip-bound and
+at best reaches parity. The GPU backend earns its keep in two places it is *not*
+penalised by the round-trip: (1) **HTJ2K large-image decode**, the one codec heavy
+enough to win; and (2) **chained processing** (resize / color / tonemap / transfer
+/ LUT) where the image stays resident on-device across many ops and the per-call
+copy amortizes. A whole-pipeline HTJ2K win additionally needs the transforms moved
+on-device ([GPU transform kernels](htj2k-gpu-port.md), a deferred follow-up) to
+remove the per-image coefficient copy.
+
+Reproduce (all codecs, CPU vs GPU):
+
+```sh
+make bench-gpu-jph                                   # asakusa (0.29 MP)
+EXR_BENCH_IMG=path/to/img.exr make bench-gpu-jph     # any image
+./build/bench_gpu_jph synth:4096x4096                # synthetic NxN probe
+```
+
 ## ARM64 / NEON (Apple Silicon)
 
 The same comparison on **Apple M1** (4 P-core + 4 E-core, macOS 26, Apple
@@ -213,6 +330,13 @@ NLT 8.2×, predictor 1.9×) and the full HTJ2K kernel list are in
 | b44   | 46.6 | 68.6 | **318** | 217 |
 | htj2k256 | 18.3 | 21.6 | 28.5 | 30.3 |
 | htj2k32  | 17.8 | 20.9 | 26.7 | 29.4 |
+
+![Decode throughput, single thread (Apple M1 / NEON)](perf-arm-decode.svg)
+
+![Encode throughput, single thread (Apple M1 / NEON)](perf-arm-encode.svg)
+
+(`none` is off the chart on purpose, as on x64: **decode 2456 vs 859 MP/s**
+(~2.9×), encode 1080 vs 423 (~2.6×) — it would flatten every other bar.)
 
 Same shape as x64: TinyEXR wins the cheap codecs (**none ~2.9×**, **rle ~1.8×**,
 **b44 dec ~1.5×**); OpenEXR leads the DEFLATE family / PIZ via its libdeflate
@@ -264,5 +388,6 @@ path); thread the streaming APIs; sweep larger images and channel counts.
 
 *Charts: `doc/perf-decode.svg`, `perf-encode.svg`, `perf-libdeflate-decode.svg`,
 `perf-libdeflate-htj2k-decode.png`, `perf-libdeflate-htj2k-encode.png`,
-`perf-mt-scaling.svg`, `perf-mt-compare.svg`. Harness:
+`perf-mt-scaling.svg`, `perf-mt-compare.svg`; ARM64/NEON:
+`perf-arm-decode.svg`/`.png`, `perf-arm-encode.svg`/`.png`. Harness:
 `benchmark/bench_compare.cpp` (`make bench-compare [THREADS=1] [LIBDEFLATE=1]`).*

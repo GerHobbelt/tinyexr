@@ -21,7 +21,7 @@ MINIZ_SRC = ./deps/miniz/miniz.c
 # ---- legacy v1 single-header test (unchanged) -----------------------------
 TARGET = test_tinyexr
 
-.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate examples-c bench bench-compare arm-smoke host-smoke
+.PHONY: all test clean help lib test-c test-c-threads test-c-tsan c11-gate fuzz fuzz-jph fuzz-libdeflate fuzz-corpus fuzz-corpus-asan parse-test wasm freestanding-gate freestanding-zstd-gate examples-c bench bench-compare arm-smoke host-smoke gpu-test vk-test jph-gpu-test bench-gpu-jph
 
 all: $(TARGET)
 
@@ -43,21 +43,33 @@ V3_SRC   = $(wildcard src/*.c)
 V3_OBJ   = $(patsubst src/%.c,build/%.o,$(V3_SRC))
 # Freestanding core: everything except the optional stdio layer, the spectral
 # helpers (hosted-only convenience), and the (freestanding-only) mem/str impls.
-V3_CORE_SRC = $(filter-out src/exr_stdio.c src/exr_freestanding.c src/exr_spectral.c,$(V3_SRC))
+V3_CORE_SRC = $(filter-out src/exr_stdio.c src/exr_freestanding.c src/exr_spectral.c src/exr_gpu_cuda.c src/exr_vk_vulkan.c,$(V3_SRC))
 ZSTD_SRC = deps/zstd/tinyexr_zstd.c
 ZSTD_OBJ = build/tinyexr_zstd.o
 V3_TEST_OBJ = $(patsubst src/%.c,build/test-%.o,$(V3_SRC))
 SAN      = -fsanitize=address,undefined
 
-# ---- optional libdeflate backend (default OFF; in-tree codec is the default)
-# Build any target with LIBDEFLATE=1 to route ZIP/ZIPS/PXR24 deflate through the
-# vendored libdeflate (deps/libdeflate, MIT - see deps/libdeflate/COPYING).
-# NOTE: run `make clean` when toggling LIBDEFLATE (object flags are not tracked).
-LIBDEFLATE ?= 0
+# ---- zlib (DEFLATE) backend for ZIP/ZIPS/PXR24 ----------------------------
+# DEFLATE = auto | libdeflate | intree    (default: auto)
+#   auto / libdeflate : compile the vendored libdeflate (deps/libdeflate, MIT -
+#                       see deps/libdeflate/COPYING) AND make it the runtime
+#                       default - it is faster on natural-image data. Both
+#                       codecs are linked; switch at runtime with the public
+#                       exr_zlib_set_backend(). EXR_ZLIB_DEFAULT_LIBDEFLATE=1
+#                       seeds the static default (see src/exr_codec.c).
+#   intree            : in-tree pure-C codec only, no external dependency.
+# The freestanding and wasm targets never define EXR_USE_LIBDEFLATE (their flag
+# sets / V3_CORE_SRC omit it), so they always use the in-tree codec regardless.
+# Legacy: LIBDEFLATE=1 is kept as an alias for DEFLATE=libdeflate.
+# NOTE: run `make clean` when changing DEFLATE (object flags are not tracked).
+DEFLATE ?= auto
+ifeq ($(LIBDEFLATE),1)
+  DEFLATE = libdeflate
+endif
 LD_OBJ =
 LD_TEST_OBJ =
-ifeq ($(LIBDEFLATE),1)
-  V3_DEFS += -DEXR_USE_LIBDEFLATE
+ifneq ($(DEFLATE),intree)
+  V3_DEFS += -DEXR_USE_LIBDEFLATE -DEXR_ZLIB_DEFAULT_LIBDEFLATE=1
   V3_INC  += -Ideps/libdeflate
   # Just the zlib (DEFLATE) path: no crc32/gzip. The x86/arm cpu_features files
   # self-guard by arch, so compiling both is safe everywhere.
@@ -84,8 +96,60 @@ ifeq ($(THREADS),1)
   THREAD_LIBS = -pthread          # C11 threads need pthreads on glibc < 2.34
 endif
 
+# ---- optional CUDA GPU backend (default OFF; runtime dlopen via cuew) -------
+# Build any target with CUDA=1 to compile the GPU backend (src/exr_gpu_cuda.c +
+# third_party/cuew). The CUDA driver and NVRTC are resolved at runtime via cuew
+# (dlopen) so NO CUDA SDK is needed at build time and we link only -ldl (never
+# -lcuda/-lnvrtc). Without CUDA=1 the backend compiles as inert stubs.
+# NOTE: run `make clean` when toggling CUDA (object flags are not tracked).
+CUDA ?= 0
+CUEW_OBJ =
+CUDA_LIBS =
+ifeq ($(CUDA),1)
+  V3_DEFS += -DEXR_USE_CUDA
+  V3_INC  += -Ithird_party/cuew
+  CUEW_OBJ  = build/cuew.o
+  CUDA_LIBS = -ldl
+endif
+
+# ---- optional Vulkan GPU backend (default OFF; runtime dlopen via vkew) -----
+# Build any target with VULKAN=1 to compile the Vulkan compute backend
+# (src/exr_vk_vulkan.c + third_party/vkew). libvulkan is resolved at runtime via
+# vkew (dlopen) so NO Vulkan SDK is needed at build time and we link only -ldl
+# (never -lvulkan). Compute shaders are precompiled SPIR-V embedded in
+# src/exr_vk_shaders.spv.inc. Without VULKAN=1 the backend compiles as inert
+# stubs. NOTE: run `make clean` when toggling VULKAN (object flags not tracked).
+VULKAN ?= 0
+VKEW_OBJ =
+VULKAN_LIBS =
+ifeq ($(VULKAN),1)
+  V3_DEFS += -DEXR_USE_VULKAN
+  V3_INC  += -Ithird_party/vkew
+  VKEW_OBJ    = build/vkew.o
+  VULKAN_LIBS = -ldl
+endif
+
 build:
 	@mkdir -p build
+
+# cuew (Apache-2.0, third-party: warnings off).
+build/cuew.o: third_party/cuew/cuew.c third_party/cuew/cuew.h | build
+	$(CC) -Ithird_party/cuew -O2 -g -w -c $< -o $@
+
+# vkew (Vulkan loader, third-party style: warnings off).
+build/vkew.o: third_party/vkew/vkew.c third_party/vkew/vkew.h | build
+	$(CC) -Ithird_party/vkew -O2 -g -w -c $< -o $@
+
+# GPU backend TU: extra prereqs (public header, kernels, cuew) so edits rebuild.
+build/exr_gpu_cuda.o: src/exr_gpu_cuda.c include/exr_gpu.h include/exr.h \
+                      src/exr_internal.h src/exr_gpu_kernels.cuh.inc \
+                      src/exr_gpu_jph_kernels.cuh.inc | build
+	$(CC) $(V3_CSTD) $(V3_WARN) $(V3_DEFS) $(V3_INC) -O2 -g -c $< -o $@
+
+# Vulkan backend TU: extra prereqs (public header, embedded SPIR-V, vkew).
+build/exr_vk_vulkan.o: src/exr_vk_vulkan.c include/exr_vk.h include/exr.h \
+                       src/exr_internal.h src/exr_vk_shaders.spv.inc | build
+	$(CC) $(V3_CSTD) $(V3_WARN) $(V3_DEFS) $(V3_INC) -O2 -g -c $< -o $@
 
 build/%.o: src/%.c include/exr.h src/exr_internal.h deps/zstd/tinyexr_zstd.h | build
 	$(CC) $(V3_CSTD) $(V3_WARN) $(V3_DEFS) $(V3_INC) -O2 -g -c $< -o $@
@@ -102,8 +166,42 @@ build/test-libdeflate/%.o: deps/libdeflate/%.c | build
 	@mkdir -p $(dir $@)
 	$(CC) -Ideps/libdeflate -O1 -g $(SAN) -w -c $< -o $@
 
-lib: $(V3_OBJ) $(ZSTD_OBJ) $(LD_OBJ)
-	$(AR) rcs build/libtinyexr3.a $(V3_OBJ) $(ZSTD_OBJ) $(LD_OBJ)
+lib: $(V3_OBJ) $(ZSTD_OBJ) $(LD_OBJ) $(CUEW_OBJ) $(VKEW_OBJ)
+	$(AR) rcs build/libtinyexr3.a $(V3_OBJ) $(ZSTD_OBJ) $(LD_OBJ) $(CUEW_OBJ) $(VKEW_OBJ)
+
+# GPU backend test (requires CUDA=1; skips at runtime with exit 77 if no device).
+EXR_IMAGES ?= $(HOME)/work/openexr-images
+gpu-test:
+	$(MAKE) clean            # CUDA flag is not object-tracked; rebuild from clean
+	$(MAKE) CUDA=1 lib
+	$(CC) $(V3_CSTD) -Wall -Wextra -DEXR_USE_CUDA -Iinclude -Ithird_party/cuew \
+	  -O2 -g test/gpu/test_exr_gpu.c build/libtinyexr3.a -ldl -lm \
+	  -o build/test_exr_gpu
+	./build/test_exr_gpu "$(EXR_IMAGES)"; rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "gpu-test: SKIPPED (no CUDA device)"; exit 0; \
+	  else exit $$rc; fi
+
+# HTJ2K GPU block-coder bit-exactness test (CUDA=1; exit 77 = skip, no device).
+jph-gpu-test:
+	$(MAKE) clean
+	$(MAKE) CUDA=1 lib
+	$(CC) $(V3_CSTD) -Wall -Wextra -DEXR_USE_CUDA -Iinclude -Isrc -Ideps/zstd \
+	  -Ithird_party/cuew -O2 -g test/gpu/test_exr_jph_gpu.c build/libtinyexr3.a \
+	  -ldl -lm -o build/test_exr_jph_gpu
+	./build/test_exr_jph_gpu "$(EXR_IMAGES)"; rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "jph-gpu-test: SKIPPED (no CUDA device)"; exit 0; \
+	  else exit $$rc; fi
+
+# Vulkan backend test (requires VULKAN=1; skips at runtime with exit 77 if no device).
+vk-test:
+	$(MAKE) clean            # VULKAN flag is not object-tracked; rebuild from clean
+	$(MAKE) VULKAN=1 lib
+	$(CC) $(V3_CSTD) -Wall -Wextra -DEXR_USE_VULKAN -Iinclude -Ithird_party/vkew \
+	  -O2 -g test/vk/test_exr_vk.c build/libtinyexr3.a -ldl -lm \
+	  -o build/test_exr_vk
+	./build/test_exr_vk "$(EXR_IMAGES)"; rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "vk-test: SKIPPED (no Vulkan device)"; exit 0; \
+	  else exit $$rc; fi
 
 # Strict pure-C11 gate: the rewrite must never require a C++ compiler.
 c11-gate: | build
@@ -143,6 +241,20 @@ bench: $(V3_OBJ) $(ZSTD_OBJ) $(LD_OBJ) benchmark/bench.c | build
 	  benchmark/bench.c $(V3_OBJ) $(ZSTD_OBJ) $(LD_OBJ) $(THREAD_LIBS) -lm -o build/bench
 	./build/bench
 
+# ---- HTJ2K GPU vs CPU throughput (CUDA backend) ---------------------------
+# Builds a CUDA lib and times whole-image HTJ2K decode/encode CPU vs GPU.
+# Exit 77 = skipped (no CUDA device). Override the image with EXR_BENCH_IMG=...
+EXR_BENCH_IMG ?= asakusa.exr
+bench-gpu-jph:
+	$(MAKE) clean
+	$(MAKE) CUDA=1 lib
+	$(CC) $(V3_CSTD) -Wall -Wextra -DEXR_USE_CUDA -Iinclude -Isrc -Ideps/zstd \
+	  -Ithird_party/cuew -O3 benchmark/bench_gpu_jph.c build/libtinyexr3.a \
+	  -ldl -lm -o build/bench_gpu_jph
+	./build/bench_gpu_jph "$(EXR_BENCH_IMG)"; rc=$$?; \
+	  if [ $$rc -eq 77 ]; then echo "bench-gpu-jph: SKIPPED (no CUDA device)"; exit 0; \
+	  else exit $$rc; fi
+
 # ---- tinyexr-vs-OpenEXR comparison (needs a built OpenEXR) -----------------
 # Override OPENEXR_ROOT / OPENEXR_BUILD if your tree lives elsewhere. Extra
 # files: make bench-compare ARGS="img1.exr img2.exr"
@@ -177,6 +289,19 @@ fuzz: test/fuzzer/fuzz_v3.c | build
 	clang $(V3_CSTD) $(V3_INC) -O1 -g -w -fsanitize=fuzzer,address,undefined \
 	  test/fuzzer/fuzz_v3.c $(V3_SRC) $(ZSTD_SRC) -lm -o build/fuzz_v3
 	@echo "built build/fuzz_v3 - e.g. ./build/fuzz_v3 -max_total_time=60 test/unit/regression"
+
+# Same fuzzer but with libdeflate as the default zlib backend, so the shipped
+# DEFLATE=auto decode path (ZIP/ZIPS/PXR24 -> libdeflate) is fuzzed too.
+fuzz-libdeflate: test/fuzzer/fuzz_v3.c | build
+	clang $(V3_CSTD) -DEXR_USE_LIBDEFLATE -DEXR_ZLIB_DEFAULT_LIBDEFLATE=1 \
+	  $(V3_INC) -Ideps/libdeflate -O1 -g -w -fsanitize=fuzzer,address,undefined \
+	  test/fuzzer/fuzz_v3.c $(V3_SRC) $(ZSTD_SRC) \
+	  deps/libdeflate/lib/adler32.c deps/libdeflate/lib/deflate_compress.c \
+	  deps/libdeflate/lib/deflate_decompress.c deps/libdeflate/lib/zlib_compress.c \
+	  deps/libdeflate/lib/zlib_decompress.c deps/libdeflate/lib/utils.c \
+	  deps/libdeflate/lib/x86/cpu_features.c deps/libdeflate/lib/arm/cpu_features.c \
+	  -lm -o build/fuzz_v3_libdeflate
+	@echo "built build/fuzz_v3_libdeflate (libdeflate default backend)"
 
 # HTJ2K (JPH) encode+decode+round-trip fuzzer.
 #   ./build/fuzz_jph -max_total_time=600 test/fuzzer/corpus_jph
@@ -262,20 +387,46 @@ host-smoke: test/v3/neon_smoke.c | build
 # ---- freestanding gate ----------------------------------------------------
 # Compile the core with only stdint/stddef/limits, prove there are no forbidden
 # libc dependencies (nm scan), and run a functional memory round-trip.
-FS_FLAGS = -DEXR_FREESTANDING -DEXR_NO_ZSTD -ffreestanding -fno-builtin \
+# Opt-in zstd DECODE in the freestanding build (default off). Adds the vendored
+# zstd amalgamation (~hundreds of KB) and routes decode through zstd's no-malloc
+# static-DCtx API with malloc/calloc/free stubbed out, so the forbidden-symbol
+# scan still passes. Decode-only: zstd ENCODE stays UNSUPPORTED in freestanding.
+EXR_FREESTANDING_ZSTD ?= 0
+ifeq ($(EXR_FREESTANDING_ZSTD),1)
+  FS_ZSTD_CFG  = -DEXR_ZSTD_DECODE_ONLY
+  FS_ZSTD_SKIP =
+  FS_ZSTD_OBJ  = build/fs-tinyexr_zstd.o
+  FS_SMOKE_CFG = -DEXR_FREESTANDING_ZSTD -Itest/v3
+else
+  FS_ZSTD_CFG  = -DEXR_NO_ZSTD
+  FS_ZSTD_SKIP = src/exr_zstd.c
+  FS_ZSTD_OBJ  =
+  FS_SMOKE_CFG =
+endif
+FS_FLAGS = -DEXR_FREESTANDING $(FS_ZSTD_CFG) -ffreestanding -fno-builtin \
            -fno-stack-protector $(V3_CSTD) $(V3_WARN) $(V3_INC) -O2 -g
-# Freestanding excludes the zstd glue (EXR_NO_ZSTD); the codec dispatch returns
-# UNSUPPORTED, so the vendored allocator/amalgamation is never pulled in.
-FS_CORE_SRC = $(filter-out src/exr_zstd.c,$(V3_CORE_SRC))
-FS_OBJ = $(patsubst src/%.c,build/fs-%.o,$(FS_CORE_SRC)) build/fs-exr_freestanding.o
+# Default: exclude the zstd glue (EXR_NO_ZSTD), dispatch returns UNSUPPORTED, no
+# amalgamation pulled in. EXR_FREESTANDING_ZSTD=1 includes both (decode path).
+FS_CORE_SRC = $(filter-out $(FS_ZSTD_SKIP),$(V3_CORE_SRC))
+FS_OBJ = $(patsubst src/%.c,build/fs-%.o,$(FS_CORE_SRC)) build/fs-exr_freestanding.o \
+         $(FS_ZSTD_OBJ)
 FS_FORBIDDEN = fopen|fread|fwrite|fseek|ftell|fclose|fprintf|printf|snprintf|malloc|calloc|realloc|free|abort|exit|qsort|exp|log|pow
 
 build/fs-%.o: src/%.c include/exr.h src/exr_internal.h | build
 	$(CC) $(FS_FLAGS) -c $< -o $@
 
+# Freestanding zstd amalgamation: no-malloc (static-DCtx) build with the libc
+# allocator entry points stubbed to NULL/no-op (the static decode path never
+# calls them), so the object carries no forbidden symbols.
+build/fs-tinyexr_zstd.o: deps/zstd/tinyexr_zstd.c deps/zstd/tinyexr_zstd.h | build
+	$(CC) -DEXR_FREESTANDING -ffreestanding -fno-builtin -fno-stack-protector \
+	  -DNDEBUG -DZSTD_DEPS_MALLOC -D'ZSTD_malloc(s)=((void*)0)' \
+	  -D'ZSTD_calloc(n,s)=((void*)0)' -D'ZSTD_free(p)=((void)0)' \
+	  -Ideps/zstd $(V3_CSTD) -O2 -g -w -c $< -o $@
+
 freestanding-gate: $(FS_OBJ) test/v3/freestanding_smoke.c | build
-	@echo "  scan: only exr_stdio.c may include <stdio.h>"
-	@bad=`grep -rl '<stdio.h>' src/ | grep -v 'src/exr_stdio.c' || true`; \
+	@echo "  scan: only exr_stdio.c may include <stdio.h> (GPU backends are hosted-only)"
+	@bad=`grep -rl '<stdio.h>' src/ | grep -vE 'src/(exr_stdio|exr_gpu_cuda|exr_vk_vulkan)\.c' || true`; \
 	  if [ -n "$$bad" ]; then echo "  FAIL: stdio leaked into: $$bad"; exit 1; fi
 	@echo "  scan: no forbidden libc symbols referenced by the freestanding core"
 	@for o in $(FS_OBJ); do \
@@ -283,10 +434,25 @@ freestanding-gate: $(FS_OBJ) test/v3/freestanding_smoke.c | build
 	  if [ -n "$$hit" ]; then echo "  FAIL: $$o references:" $$hit; exit 1; fi; \
 	done
 	@echo "  run: freestanding-compiled core + custom-allocator round-trip"
-	$(CC) $(V3_CSTD) -Wall -Wextra -Iinclude -Isrc -O2 \
+	$(CC) $(V3_CSTD) -Wall -Wextra $(FS_SMOKE_CFG) -Iinclude -Isrc -O2 \
 	  test/v3/freestanding_smoke.c $(FS_OBJ) -o build/fs_smoke
 	./build/fs_smoke
 	@echo "freestanding gate: OK"
+
+# Regenerate the freestanding zstd decode fixture (test/v3/fs_zstd_blob.inc).
+gen-fs-zstd-blob: lib
+	$(CC) $(V3_CSTD) -Iinclude -O2 test/v3/gen_fs_zstd_blob.c build/libtinyexr3.a \
+	  -lm -o build/gen_fs_zstd_blob
+	./build/gen_fs_zstd_blob > test/v3/fs_zstd_blob.inc
+	@echo "regenerated test/v3/fs_zstd_blob.inc"
+
+# Freestanding gate with the opt-in zstd DECODE path enabled (proves the
+# stubbed-malloc amalgamation stays forbidden-symbol-clean and decodes).
+# The fs-*.o objects are not flag-tracked, so remove any built with different
+# zstd flags (e.g. a prior `make freestanding-gate`) to force a correct rebuild.
+freestanding-zstd-gate:
+	rm -f build/fs-*.o build/fs_smoke
+	$(MAKE) freestanding-gate EXR_FREESTANDING_ZSTD=1
 
 # ---- tocio (sandbox: tiny OpenColorIO config engine + codegen) ------------
 # Pure-C11, freestanding, no external deps. Lives outside src/ so it has its own
@@ -341,6 +507,29 @@ tocio-test: | build
 	  sandbox/tocio/tests/toc_test.c $(TOC_SRC) -lm -ldl -o build/toc_test
 	ASAN_OPTIONS=detect_leaks=0 ./build/toc_test
 
+# Validate tocio against the REAL AcademySoftwareFoundation ACES OCIO configs:
+# parse each config, build every transform, and compare results to golden values
+# captured from PyOpenColorIO (the C++ reference engine). The configs live under
+# sandbox/tocio/ref (fetch them first); the golden TSV is committed.
+#   make tocio-fetch-ref    # download configs + reference repos into ref/
+#   make tocio-gen-golden   # regenerate the golden TSV (needs PyOpenColorIO)
+TOC_REFDIR    = sandbox/tocio/ref/configs
+TOC_GOLDEN    = sandbox/tocio/tests/golden/aces_golden.tsv
+.PHONY: tocio-validate tocio-fetch-ref tocio-gen-golden
+tocio-validate: | build
+	@if [ ! -d "$(TOC_REFDIR)" ]; then \
+	  echo "ref configs missing - run 'make tocio-fetch-ref' first"; exit 2; fi
+	$(CC) $(V3_CSTD) -Wall -Wextra $(TOC_INC) -O1 -g $(SAN) \
+	  sandbox/tocio/tests/toc_validate.c $(TOC_SRC) -lm -ldl -o build/toc_validate
+	ASAN_OPTIONS=detect_leaks=0 ./build/toc_validate $(TOC_GOLDEN) $(TOC_REFDIR)
+
+tocio-fetch-ref:
+	bash sandbox/tocio/scripts/fetch_ocio_ref.sh
+
+tocio-gen-golden:
+	@sp=$$(echo sandbox/tocio/ref/.pyoracle/lib/python*/site-packages); \
+	  PYTHONPATH="$$sp" python3 sandbox/tocio/scripts/gen_golden.py
+
 # Interpreter throughput benchmark (scalar vs SIMD per op). -O2, no sanitizers.
 .PHONY: tocio-bench
 tocio-bench: | build
@@ -360,12 +549,14 @@ tocio-arm-test: | build
 	$(ARM_QEMU) ./build/toc_test_arm
 
 # ---- tocio WASM (Emscripten ES6 module for the web viewer) -----------------
-TOCW_EXPORTS = ['_tocw_parse','_tocw_free_config','_tocw_processor','_tocw_processor_view','_tocw_free_ops','_tocw_apply','_tocw_emit_glsl','_tocw_emit_metal','_tocw_emit_c','_tocw_free_str','_tocw_num_colorspaces','_tocw_colorspace_name','_malloc','_free']
+TOCW_EXPORTS = ['_tocw_parse','_tocw_free_config','_tocw_processor','_tocw_processor_view','_tocw_free_ops','_tocw_apply','_tocw_emit_glsl','_tocw_jit_glsl','_tocw_emit_metal','_tocw_emit_c','_tocw_free_str','_tocw_num_colorspaces','_tocw_colorspace_name','_malloc','_free']
 TOCW_RUNTIME = ['HEAPU8','HEAPF32','HEAP32','UTF8ToString','stringToUTF8','lengthBytesUTF8']
 .PHONY: wasm-tocio wasm-tocio-test
+# toc_wasm.c references the JIT (tocw_jit_glsl); include toc_jit.c (inert stub
+# under wasm32) so the module links.
 wasm-tocio: | build
 	$(EMCC) -O3 $(TOC_INC) -w \
-	  $(TOC_CORE_SRC) sandbox/tocio/wasm/toc_wasm.c \
+	  $(TOC_CORE_SRC) sandbox/tocio/src/toc_jit.c sandbox/tocio/wasm/toc_wasm.c \
 	  -s FILESYSTEM=0 -s ALLOW_MEMORY_GROWTH=1 -s MODULARIZE=1 \
 	  -s EXPORT_ES6=1 -s ENVIRONMENT=web,node \
 	  -s "EXPORTED_FUNCTIONS=$(TOCW_EXPORTS)" \
@@ -375,6 +566,25 @@ wasm-tocio: | build
 
 wasm-tocio-test: wasm-tocio
 	node sandbox/tocio/wasm/test.mjs
+
+# ---- tocio web demo: ONE module with EXR decode + tocio + JIT(->GLSL) -------
+# Combines the v3 EXR decoder (exrw_decode_rgba) and the tocio engine (incl.
+# toc_jit.c, which compiles to its inert stub under wasm32 -> "JIT outputs GLSL")
+# into build/tocio_demo.mjs for web/tocio/. toc_stdio.c is excluded (no FS).
+TOCDEMO_SRC = $(TOC_CORE_SRC) sandbox/tocio/src/toc_jit.c sandbox/tocio/wasm/toc_wasm.c
+TOCDEMO_EXPORTS = ['_exrw_decode_rgba','_exrw_free','_tocw_parse','_tocw_free_config','_tocw_processor','_tocw_processor_view','_tocw_free_ops','_tocw_apply','_tocw_emit_glsl','_tocw_jit_glsl','_tocw_emit_c','_tocw_free_str','_tocw_num_colorspaces','_tocw_colorspace_name','_tocw_num_displays','_tocw_display_name','_tocw_num_views','_tocw_view_name','_tocw_role','_malloc','_free']
+TOCDEMO_RUNTIME = ['HEAPU8','HEAPF32','HEAP32','UTF8ToString','stringToUTF8','lengthBytesUTF8']
+.PHONY: wasm-tocio-demo
+wasm-tocio-demo: | build
+	$(EMCC) -O3 $(V3_INC) $(TOC_INC) -w \
+	  $(V3_CORE_SRC) $(ZSTD_SRC) examples/wasm/exr_wasm.c \
+	  $(TOCDEMO_SRC) \
+	  -s FILESYSTEM=0 -s ALLOW_MEMORY_GROWTH=1 -s MODULARIZE=1 \
+	  -s EXPORT_ES6=1 -s ENVIRONMENT=web,node \
+	  -s "EXPORTED_FUNCTIONS=$(TOCDEMO_EXPORTS)" \
+	  -s "EXPORTED_RUNTIME_METHODS=$(TOCDEMO_RUNTIME)" \
+	  -o web/tocio/tocio_demo.mjs
+	@echo "built web/tocio/tocio_demo.mjs + .wasm"
 
 clean:
 	rm -rf $(TARGET) miniz.o build $(PARSE_HARNESS)
@@ -398,8 +608,10 @@ help:
 	@echo "make arm-smoke - cross-build (aarch64) + run NEON SIMD smoke under qemu"
 	@echo "make host-smoke - build + run the SIMD smoke test natively"
 	@echo ""
-	@echo "Add LIBDEFLATE=1 to any target to use the optional vendored libdeflate"
-	@echo "  backend for ZIP/ZIPS/PXR24 (default: in-tree codec). Run 'make clean'"
-	@echo "  when toggling. e.g. make bench-compare LIBDEFLATE=1"
+	@echo "DEFLATE=auto|libdeflate|intree selects the ZIP/ZIPS/PXR24 zlib backend"
+	@echo "  (default: auto = vendored libdeflate, faster on natural images; both"
+	@echo "  codecs link, switch at runtime via exr_zlib_set_backend). intree =="
+	@echo "  in-tree pure-C only. Run 'make clean' when changing. LIBDEFLATE=1 is a"
+	@echo "  legacy alias for DEFLATE=libdeflate. freestanding/wasm stay in-tree."
 	@echo "Add THREADS=1 to any target for C11-threads parallel encode/decode"
 	@echo "  (default: single-threaded). Set count via exr_set_num_threads()."
