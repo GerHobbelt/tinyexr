@@ -1,5 +1,10 @@
 # Tiny EXR image library.
 
+[![GitHub Sponsors](https://img.shields.io/badge/GitHub%20Sponsors-Sponsor-ea4aaa?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/syoyo)
+
+**Pull request policy:** Only those who have made a one-time sponsorship
+contribution of US$5,000 or more are eligible to submit pull requests.
+
 ![Example](https://github.com/syoyo/tinyexr/blob/release/asakusa.png?raw=true)
 
 ### 🚀 Live demos — all run entirely in your browser
